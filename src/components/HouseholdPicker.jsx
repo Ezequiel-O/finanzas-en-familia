@@ -2,7 +2,6 @@
 import React from 'react';
 import { db } from '../firebase';
 import { collection, query, where, onSnapshot, doc, setDoc, arrayUnion, updateDoc } from 'firebase/firestore';
-import { CATEGORIES } from '../constants/categories';
 import { createHousehold, joinHousehold } from '../services/households';
 
 export default function HouseholdPicker({ user, onEnter }) {
