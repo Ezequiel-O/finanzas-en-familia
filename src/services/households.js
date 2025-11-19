@@ -10,7 +10,7 @@ import {
 } from 'firebase/firestore';
 import { CATEGORIES } from '../constants/categories';
 
-const buildBudgets = () =>
+export const createDefaultBudgets = () =>
   CATEGORIES.reduce((acc, c) => {
     acc[c] = 0;
     return acc;
@@ -26,7 +26,7 @@ export async function createHousehold(uid, displayName, householdName) {
       `Hogar de ${displayName || 'Usuario'}`,
     members: [uid],
     memberInfo: { [uid]: { name: displayName || 'Usuario' } },
-    budgets: buildBudgets(),
+    budgets: createDefaultBudgets(),
     createdAt: Date.now(),
   });
   return id;

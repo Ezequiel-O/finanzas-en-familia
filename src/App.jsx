@@ -27,7 +27,11 @@ import {
 
 import HouseholdPicker from './components/HouseholdPicker';
 import { CATEGORIES } from './constants/categories';
-import { createHousehold, joinHousehold } from './services/households';
+import {
+  createDefaultBudgets,
+  createHousehold,
+  joinHousehold,
+} from './services/households';
 
 // --- Utils ---
 function monthKey(date = new Date()) {
@@ -404,9 +408,7 @@ function useHouseholdData(householdId) {
 
     const unsubHH = onSnapshot(doc(db, 'households', householdId), (snap) => {
       const d = snap.data();
-      setBudgets(
-        d?.budgets || CATEGORIES.reduce((a, c) => ((a[c] = 0), a), {})
-      );
+      setBudgets(d?.budgets || createDefaultBudgets());
     });
 
     const unsubTx = onSnapshot(
@@ -449,8 +451,14 @@ function useHouseholdData(householdId) {
   async function setBudget(cat, value) {
     const ref = doc(db, 'households', householdId);
     const snap = await getDoc(ref);
-    const b = snap.data().budgets || {};
-    await updateDoc(ref, { budgets: { ...b, [cat]: Number(value || 0) } });
+    const b = snap.data().budgets || createDefaultBudgets();
+    await updateDoc(ref, {
+      budgets: {
+        ...createDefaultBudgets(),
+        ...b,
+        [cat]: Number(value || 0),
+      },
+    });
   }
   async function addTransaction(tx) {
     await addDoc(collection(db, 'households', householdId, 'transactions'), tx);
