@@ -23,28 +23,17 @@ import {
   collection,
   addDoc,
   deleteDoc,
-  query,
-  where,
 } from 'firebase/firestore';
 
 import HouseholdPicker from './components/HouseholdPicker';
+import { CATEGORIES } from './constants/categories';
+import {
+  createDefaultBudgets,
+  createHousehold,
+  joinHousehold,
+} from './services/households';
 
 // --- Utils ---
-const CATEGORIES = [
-  'Hogar',
-  'Alimentación',
-  'Transporte',
-  'Salud',
-  'Servicios (luz/agua/internet)',
-  'Educación',
-  'Entretenimiento',
-  'Vestuario',
-  'Otros',
-];
-
-function uid() {
-  return Math.random().toString(36).slice(2) + Date.now().toString(36);
-}
 function monthKey(date = new Date()) {
   return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(
     2,
@@ -88,36 +77,6 @@ function SectionTitle({ children, right }) {
       {right}
     </div>
   );
-}
-
-// --- Household helpers ---
-async function createHousehold(uid, displayName) {
-  const id = uid.slice(0, 6) + Math.random().toString(36).slice(2, 5);
-  const ref = doc(db, 'households', id);
-  await setDoc(ref, {
-    id,
-    members: [uid],
-    memberInfo: { [uid]: { name: displayName || 'Usuario' } },
-    budgets: CATEGORIES.reduce((acc, c) => ((acc[c] = 0), acc), {}),
-    createdAt: Date.now(),
-  });
-  return id;
-}
-async function joinHousehold(uid, code, displayName) {
-  const ref = doc(db, 'households', code);
-  const snap = await getDoc(ref);
-  if (!snap.exists()) throw new Error('Código de hogar inválido');
-  const data = snap.data();
-  if (!data.members.includes(uid)) {
-    await updateDoc(ref, {
-      members: arrayUnion(uid),
-      memberInfo: {
-        ...(data.memberInfo || {}),
-        [uid]: { name: displayName || 'Usuario' },
-      },
-    });
-  }
-  return code;
 }
 
 function Header({ currentTab, setTab, user, onLogout, householdId }) {
@@ -175,7 +134,6 @@ function Header({ currentTab, setTab, user, onLogout, householdId }) {
 function AuthGate({ onReady }) {
   const [phase, setPhase] = useState('loading'); // loading | auth | household | ready
   const [user, setUser] = useState(null);
-  const [activeHousehold, setActiveHousehold] = useState(null);
   const [email, setEmail] = useState('');
   const [pass, setPass] = useState('');
   const [isRegister, setIsRegister] = useState(false);
@@ -450,9 +408,7 @@ function useHouseholdData(householdId) {
 
     const unsubHH = onSnapshot(doc(db, 'households', householdId), (snap) => {
       const d = snap.data();
-      setBudgets(
-        d?.budgets || CATEGORIES.reduce((a, c) => ((a[c] = 0), a), {})
-      );
+      setBudgets({ ...createDefaultBudgets(), ...(d?.budgets || {}) });
     });
 
     const unsubTx = onSnapshot(
@@ -495,8 +451,8 @@ function useHouseholdData(householdId) {
   async function setBudget(cat, value) {
     const ref = doc(db, 'households', householdId);
     const snap = await getDoc(ref);
-    const b = snap.data().budgets || {};
-    await updateDoc(ref, { budgets: { ...b, [cat]: Number(value || 0) } });
+    const current = { ...createDefaultBudgets(), ...(snap.data().budgets || {}) };
+    await updateDoc(ref, { budgets: { ...current, [cat]: Number(value || 0) } });
   }
   async function addTransaction(tx) {
     await addDoc(collection(db, 'households', householdId, 'transactions'), tx);
@@ -1376,7 +1332,7 @@ function Investments({ data, actions }) {
   );
 }
 
-function Settings({ data, actions, householdId }) {
+function Settings({ data, householdId }) {
   function exportJSON() {
     const blob = new Blob([JSON.stringify(data, null, 2)], {
       type: 'application/json',
@@ -1563,20 +1519,19 @@ export default function App() {
             actions={actions}
           />
         )}
-        {tab === 'settings' && (
-          <Settings
-            data={{
-              budgets: data.budgets,
-              transactions: data.transactions,
-              debts: data.debts,
-              savings: data.savings,
-              investments: data.investments,
-            }}
-            actions={actions}
-            householdId={selectedHid}
-          />
-        )}
-      </main>
+          {tab === 'settings' && (
+            <Settings
+              data={{
+                budgets: data.budgets,
+                transactions: data.transactions,
+                debts: data.debts,
+                savings: data.savings,
+                investments: data.investments,
+              }}
+              householdId={selectedHid}
+            />
+          )}
+        </main>
       <footer className="text-center text-xs text-gray-500 p-4">
         V2 · Firebase/Firestore en tiempo real
       </footer>
