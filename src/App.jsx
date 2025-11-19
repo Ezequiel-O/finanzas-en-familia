@@ -34,6 +34,7 @@ import {
 } from './services/households';
 
 // --- Utils ---
+
 function monthKey(date = new Date()) {
   return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(
     2,
