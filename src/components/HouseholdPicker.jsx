@@ -1,64 +1,9 @@
 // src/components/HouseholdPicker.jsx
 import React from 'react';
 import { db } from '../firebase';
-import {
-  collection,
-  query,
-  where,
-  onSnapshot,
-  doc,
-  getDoc,
-  setDoc,
-  updateDoc,
-  arrayUnion,
-} from 'firebase/firestore';
-
-// Categorías por defecto para iniciar budgets en 0
-const CATEGORIES = [
-  'Hogar',
-  'Alimentación',
-  'Transporte',
-  'Salud',
-  'Servicios (luz/agua/internet)',
-  'Educación',
-  'Entretenimiento',
-  'Vestuario',
-  'Otros',
-];
-
-// Helpers locales
-async function createHousehold(uid, displayName, householdName) {
-  const id = uid.slice(0, 6) + Math.random().toString(36).slice(2, 5);
-  const ref = doc(db, 'households', id);
-  await setDoc(ref, {
-    id,
-    name:
-      (householdName && householdName.trim()) ||
-      `Hogar de ${displayName || 'Usuario'}`,
-    members: [uid],
-    memberInfo: { [uid]: { name: displayName || 'Usuario' } },
-    budgets: CATEGORIES.reduce((acc, c) => ((acc[c] = 0), acc), {}),
-    createdAt: Date.now(),
-  });
-  return id;
-}
-
-async function joinHousehold(uid, code, displayName) {
-  const ref = doc(db, 'households', code.trim());
-  const snap = await getDoc(ref);
-  if (!snap.exists()) throw new Error('Código de hogar inválido');
-  const data = snap.data();
-  if (!data.members.includes(uid)) {
-    await updateDoc(ref, {
-      members: arrayUnion(uid),
-      memberInfo: {
-        ...(data.memberInfo || {}),
-        [uid]: { name: displayName || 'Usuario' },
-      },
-    });
-  }
-  return code.trim();
-}
+import { collection, query, where, onSnapshot, doc, setDoc, arrayUnion, updateDoc } from 'firebase/firestore';
+import { CATEGORIES } from '../constants/categories';
+import { createHousehold, joinHousehold } from '../services/households';
 
 export default function HouseholdPicker({ user, onEnter }) {
   const [list, setList] = React.useState([]);
@@ -68,6 +13,7 @@ export default function HouseholdPicker({ user, onEnter }) {
   const [householdName, setHouseholdName] = React.useState('');
   const [code, setCode] = React.useState('');
   const [tip, setTip] = React.useState('');
+  const [busy, setBusy] = React.useState(false);
 
   // Carga hogares donde participa el usuario
   React.useEffect(() => {
@@ -92,6 +38,7 @@ export default function HouseholdPicker({ user, onEnter }) {
 
   async function handleCreate() {
     try {
+      setBusy(true);
       const hid = await createHousehold(
         user.uid,
         displayName || user.email,
@@ -100,12 +47,19 @@ export default function HouseholdPicker({ user, onEnter }) {
       await setDefault(hid);
       onEnter(hid);
     } catch (e) {
-      setTip(e.message || 'No se pudo crear el hogar.');
+      console.error(e);
+      setTip(
+        e?.code === 'permission-denied'
+          ? 'Tu sesión está activa, pero Firestore bloqueó la creación. Revisa las reglas de seguridad.'
+          : e.message || 'No se pudo crear el hogar.'
+      );
     }
+    setBusy(false);
   }
 
   async function handleJoin() {
     try {
+      setBusy(true);
       const hid = await joinHousehold(
         user.uid,
         code,
@@ -114,8 +68,14 @@ export default function HouseholdPicker({ user, onEnter }) {
       await setDefault(hid);
       onEnter(hid);
     } catch (e) {
-      setTip(e.message || 'Código inválido');
+      console.error(e);
+      setTip(
+        e?.code === 'permission-denied'
+          ? 'Tu sesión está activa, pero Firestore bloqueó la operación. Verifica las reglas o la conexión.'
+          : e.message || 'Código inválido'
+      );
     }
+    setBusy(false);
   }
 
   async function renameHousehold(hid) {
@@ -251,10 +211,11 @@ export default function HouseholdPicker({ user, onEnter }) {
             placeholder="p. ej. Familia Ortiz"
           />
           <button
-            onClick={handleCreate}
-            className="mt-2 w-full px-3 py-2 rounded-lg bg-gray-900 text-white hover:bg-gray-800"
+            onClick={busy ? undefined : handleCreate}
+            className="mt-2 w-full px-3 py-2 rounded-lg bg-gray-900 text-white hover:bg-gray-800 disabled:opacity-60"
+            disabled={busy}
           >
-            Crear hogar
+            {busy ? 'Guardando…' : 'Crear hogar'}
           </button>
         </div>
 
@@ -268,10 +229,11 @@ export default function HouseholdPicker({ user, onEnter }) {
             placeholder="p. ej. a1b2c3d"
           />
           <button
-            onClick={handleJoin}
-            className="w-full px-3 py-2 rounded-lg border hover:bg-gray-50"
+            onClick={busy ? undefined : handleJoin}
+            className="w-full px-3 py-2 rounded-lg border hover:bg-gray-50 disabled:opacity-60"
+            disabled={busy}
           >
-            Unirme
+            {busy ? 'Guardando…' : 'Unirme'}
           </button>
         </div>
 
