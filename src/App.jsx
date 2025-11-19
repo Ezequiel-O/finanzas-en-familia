@@ -23,8 +23,6 @@ import {
   collection,
   addDoc,
   deleteDoc,
-  query,
-  where,
 } from 'firebase/firestore';
 
 import HouseholdPicker from './components/HouseholdPicker';
@@ -41,10 +39,6 @@ const CATEGORIES = [
   'Vestuario',
   'Otros',
 ];
-
-function uid() {
-  return Math.random().toString(36).slice(2) + Date.now().toString(36);
-}
 function monthKey(date = new Date()) {
   return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(
     2,
@@ -175,7 +169,6 @@ function Header({ currentTab, setTab, user, onLogout, householdId }) {
 function AuthGate({ onReady }) {
   const [phase, setPhase] = useState('loading'); // loading | auth | household | ready
   const [user, setUser] = useState(null);
-  const [activeHousehold, setActiveHousehold] = useState(null);
   const [email, setEmail] = useState('');
   const [pass, setPass] = useState('');
   const [isRegister, setIsRegister] = useState(false);
@@ -1376,7 +1369,7 @@ function Investments({ data, actions }) {
   );
 }
 
-function Settings({ data, actions, householdId }) {
+function Settings({ data, householdId }) {
   function exportJSON() {
     const blob = new Blob([JSON.stringify(data, null, 2)], {
       type: 'application/json',
@@ -1563,20 +1556,19 @@ export default function App() {
             actions={actions}
           />
         )}
-        {tab === 'settings' && (
-          <Settings
-            data={{
-              budgets: data.budgets,
-              transactions: data.transactions,
-              debts: data.debts,
-              savings: data.savings,
-              investments: data.investments,
-            }}
-            actions={actions}
-            householdId={selectedHid}
-          />
-        )}
-      </main>
+          {tab === 'settings' && (
+            <Settings
+              data={{
+                budgets: data.budgets,
+                transactions: data.transactions,
+                debts: data.debts,
+                savings: data.savings,
+                investments: data.investments,
+              }}
+              householdId={selectedHid}
+            />
+          )}
+        </main>
       <footer className="text-center text-xs text-gray-500 p-4">
         V2 · Firebase/Firestore en tiempo real
       </footer>
