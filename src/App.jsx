@@ -13,6 +13,8 @@ import {
   createUserWithEmailAndPassword,
   signOut,
 } from 'firebase/auth';
+
+
 import {
   doc,
   setDoc,
@@ -20,10 +22,16 @@ import {
   onSnapshot,
   updateDoc,
   arrayUnion,
+  arrayRemove,
   collection,
   addDoc,
   deleteDoc,
+  getDocs,
+  query,
+  where,
 } from 'firebase/firestore';
+
+
 
 import HouseholdPicker from './components/HouseholdPicker';
 
@@ -88,15 +96,19 @@ function SectionTitle({ children, right }) {
 async function createHousehold(uid, displayName) {
   const id = uid.slice(0, 6) + Math.random().toString(36).slice(2, 5);
   const ref = doc(db, 'households', id);
+  const categories = [...CATEGORIES]; // categorías iniciales por defecto
+  const budgets = categories.reduce((acc, c) => ((acc[c] = 0), acc), {});
   await setDoc(ref, {
     id,
     members: [uid],
     memberInfo: { [uid]: { name: displayName || 'Usuario' } },
-    budgets: CATEGORIES.reduce((acc, c) => ((acc[c] = 0), acc), {}),
+    categories,
+    budgets,
     createdAt: Date.now(),
   });
   return id;
 }
+
 async function joinHousehold(uid, code, displayName) {
   const ref = doc(db, 'households', code);
   const snap = await getDoc(ref);
@@ -131,12 +143,6 @@ function Header({ currentTab, setTab, user, onLogout, householdId }) {
   return (
     <div className="flex flex-wrap items-center gap-2 p-3 bg-white/70 backdrop-blur sticky top-0 z-10 border-b">
       <div className="text-2xl font-bold">Finanzas en Familia</div>
-
-      {householdId && (
-        <div className="text-xs border rounded-full px-2 py-1 bg-gray-50">
-          Código hogar: {householdId}
-        </div>
-      )}
 
       <div className="flex flex-wrap gap-2 ml-auto">
         {showTabs &&
@@ -432,6 +438,7 @@ function AuthGate({ onReady }) {
 
 // --- Hooks de datos (Firestore) ---
 function useHouseholdData(householdId) {
+  const [categories, setCategories] = useState(CATEGORIES);
   const [budgets, setBudgets] = useState(null);
   const [transactions, setTransactions] = useState([]);
   const [debts, setDebts] = useState([]);
@@ -442,11 +449,19 @@ function useHouseholdData(householdId) {
     if (!householdId) return;
 
     const unsubHH = onSnapshot(doc(db, 'households', householdId), (snap) => {
-      const d = snap.data();
-      setBudgets(
-        d?.budgets || CATEGORIES.reduce((a, c) => ((a[c] = 0), a), {})
-      );
+      const d = snap.data() || {};
+      const cats = d.categories && Array.isArray(d.categories)
+        ? d.categories
+        : [...CATEGORIES];
+      setCategories(cats);
+    
+      const initialBudgets = cats.reduce((a, c) => {
+        a[c] = d.budgets?.[c] ?? 0;
+        return a;
+      }, {});
+      setBudgets(initialBudgets);
     });
+    
 
     const unsubTx = onSnapshot(
       collection(db, 'households', householdId, 'transactions'),
@@ -492,8 +507,17 @@ function useHouseholdData(householdId) {
     await updateDoc(ref, { budgets: { ...b, [cat]: Number(value || 0) } });
   }
   async function addTransaction(tx) {
-    await addDoc(collection(db, 'households', householdId, 'transactions'), tx);
+    try {
+      await addDoc(
+        collection(db, 'households', householdId, 'transactions'),
+        tx
+      );
+    } catch (e) {
+      console.error('Error al guardar transacción:', e);
+      alert('No se pudo guardar el movimiento. Revisa la consola.');
+    }
   }
+  
   async function removeTransaction(id) {
     await deleteDoc(doc(db, 'households', householdId, 'transactions', id));
   }
@@ -528,7 +552,101 @@ function useHouseholdData(householdId) {
     await deleteDoc(doc(db, 'households', householdId, 'investments', id));
   }
 
+  async function addCategory(name) {
+    const trimmed = String(name || '').trim();
+    if (!trimmed) return;
+
+    const ref = doc(db, 'households', householdId);
+    const snap = await getDoc(ref);
+    const data = snap.data() || {};
+
+    const currentCats = Array.isArray(data.categories)
+      ? data.categories
+      : [...CATEGORIES];
+
+    if (currentCats.includes(trimmed)) return; // ya existe
+
+    const newCats = [...currentCats, trimmed];
+    const currentBudgets = data.budgets || {};
+    const newBudgets = { ...currentBudgets, [trimmed]: 0 };
+
+    await updateDoc(ref, {
+      categories: newCats,
+      budgets: newBudgets,
+    });
+  }
+
+  async function removeCategory(name) {
+    const trimmed = String(name || '').trim();
+    if (!trimmed) return;
+
+    const ref = doc(db, 'households', householdId);
+    const snap = await getDoc(ref);
+    const data = snap.data() || {};
+
+    const currentCats = Array.isArray(data.categories)
+      ? data.categories
+      : [...CATEGORIES];
+
+    const newCats = currentCats.filter((c) => c !== trimmed);
+    const currentBudgets = data.budgets || {};
+    const newBudgets = { ...currentBudgets };
+    delete newBudgets[trimmed];
+
+    await updateDoc(ref, {
+      categories: newCats,
+      budgets: newBudgets,
+    });
+  }
+
+  // Renombrar categoría en budgets + transactions
+  async function renameCategory(oldName, newName) {
+    const from = String(oldName || '').trim();
+    const to = String(newName || '').trim();
+    if (!from || !to || from === to) return;
+
+    const hhRef = doc(db, 'households', householdId);
+    const snap = await getDoc(hhRef);
+    const data = snap.data() || {};
+
+    const currentCats = Array.isArray(data.categories)
+      ? data.categories
+      : [...CATEGORIES];
+
+    if (!currentCats.includes(from)) return;
+    if (currentCats.includes(to)) return; // ya existe una con ese nombre
+
+    // 1) Actualizar lista de categorías
+    const newCats = currentCats.map((c) => (c === from ? to : c));
+
+    // 2) Mover presupuesto
+    const currentBudgets = data.budgets || {};
+    const newBudgets = { ...currentBudgets };
+    newBudgets[to] = currentBudgets[from] ?? 0;
+    delete newBudgets[from];
+
+    await updateDoc(hhRef, {
+      categories: newCats,
+      budgets: newBudgets,
+    });
+
+    // 3) Actualizar todas las transactions con esa categoría
+    const txCol = collection(db, 'households', householdId, 'transactions');
+    const q = query(txCol, where('category', '==', from));
+    const txSnap = await getDocs(q);
+
+    const updates = txSnap.docs.map((d) =>
+      updateDoc(doc(db, 'households', householdId, 'transactions', d.id), {
+        category: to,
+      })
+    );
+    await Promise.all(updates);
+  }
+
+
+
   return {
+    categories,
     budgets,
     transactions,
     debts,
@@ -546,12 +664,20 @@ function useHouseholdData(householdId) {
     addInvestment,
     updateInvestment,
     removeInvestment,
+    addCategory,
+    removeCategory,
+    renameCategory,
   };
 }
 
+
+
 // --- Vistas ---
 function Dashboard({ data }) {
-  const mk = monthKey();
+  const mk = monthKey();  
+  const cats = data.categories && data.categories.length
+  ? data.categories
+  : CATEGORIES;
   const monthTx = data.transactions.filter((t) =>
     (t.date || '').startsWith(mk)
   );
@@ -562,7 +688,7 @@ function Dashboard({ data }) {
     .filter((t) => t.type === 'gasto')
     .reduce((a, b) => a + Number(b.amount || 0), 0);
   const balance = totalIngresos - totalGastos;
-  const catSpend = CATEGORIES.reduce((acc, c) => {
+  const catSpend = cats.reduce((acc, c) => {
     const spent = monthTx
       .filter((t) => t.type === 'gasto' && t.category === c)
       .reduce((a, b) => a + Number(b.amount || 0), 0);
@@ -691,7 +817,7 @@ function Dashboard({ data }) {
       <Card className="md:col-span-2 lg:col-span-3">
         <SectionTitle>Presupuestos (progreso por categoría)</SectionTitle>
         <div className="grid gap-3 md:grid-cols-2 lg:grid-cols-3">
-          {CATEGORIES.map((c) => (
+          {cats.map((c) => (
             <div key={c} className="border rounded-xl p-3">
               <div className="flex justify-between text-sm mb-1">
                 <span className="font-medium">{c}</span>
@@ -734,7 +860,24 @@ function Dashboard({ data }) {
   );
 }
 
+function formatAmountCLP(raw) {
+  const digits = String(raw).replace(/\D/g, ''); // dejar solo números
+  if (!digits) return '';
+  const n = Number(digits);
+  return n.toLocaleString('es-CL', { minimumFractionDigits: 0 });
+}
+
+function parseAmountCLP(formatted) {
+  const digits = String(formatted).replace(/\D/g, '');
+  return Number(digits || 0);
+}
+
+
 function Transactions({ data, actions, user }) {
+  const cats = data.categories && data.categories.length
+  ? data.categories
+  : CATEGORIES;
+
   const [form, setForm] = useState({
     date: new Date().toISOString().slice(0, 10),
     type: 'gasto',
@@ -752,7 +895,7 @@ function Transactions({ data, actions, user }) {
     e.preventDefault();
     const tx = {
       ...form,
-      amount: Number(form.amount || 0),
+      amount: parseAmountCLP(form.amount),
       createdAt: Date.now(),
     };
     await actions.addTransaction(tx);
@@ -802,7 +945,7 @@ function Transactions({ data, actions, user }) {
                 value={form.category}
                 onChange={(e) => setForm({ ...form, category: e.target.value })}
               >
-                {CATEGORIES.map((c) => (
+                {cats.map((c) => (
                   <option key={c} value={c}>
                     {c}
                   </option>
@@ -811,17 +954,21 @@ function Transactions({ data, actions, user }) {
             </div>
           )}
           <div className="grid gap-1">
-            <label className="text-sm">Monto (CLP)</label>
-            <input
-              type="number"
-              className="border rounded-lg p-2"
-              value={form.amount}
-              onChange={(e) => setForm({ ...form, amount: e.target.value })}
-              required
-              min={0}
-              step="1"
-            />
-          </div>
+  <label className="text-sm">Monto (CLP)</label>
+  <input
+    type="text"
+    className="border rounded-lg p-2"
+    value={form.amount}
+    onChange={(e) =>
+      setForm({
+        ...form,
+        amount: formatAmountCLP(e.target.value),
+      })
+    }
+    required
+  />
+</div>
+
           <div className="grid gap-1">
             <label className="text-sm">Persona</label>
             <input
@@ -923,11 +1070,15 @@ function Transactions({ data, actions, user }) {
 }
 
 function Budgets({ data, actions }) {
+  const cats = data.categories && data.categories.length
+  ? data.categories
+  : CATEGORIES;
+
   const mk = monthKey();
   const monthTx = data.transactions.filter((t) =>
     (t.date || '').startsWith(mk)
   );
-  const rows = CATEGORIES.map((c) => {
+  const rows = cats.map((c) => {
     const spent = monthTx
       .filter((t) => t.type === 'gasto' && t.category === c)
       .reduce((a, b) => a + Number(b.amount || 0), 0);
@@ -1369,45 +1520,254 @@ function Investments({ data, actions }) {
   );
 }
 
-function Settings({ data, householdId }) {
-  function exportJSON() {
-    const blob = new Blob([JSON.stringify(data, null, 2)], {
-      type: 'application/json',
-    });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement('a');
-    a.href = url;
-    a.download = `finanzas-familiares-${new Date()
-      .toISOString()
-      .slice(0, 10)}.json`;
-    a.click();
-    URL.revokeObjectURL(url);
+function Settings({ data, householdId, user, categories, actions }) {
+  const [households, setHouseholds] = useState([]);
+  const [loading, setLoading] = useState(false);
+  const [selectedId, setSelectedId] = useState(householdId || null);
+  const [newCategory, setNewCategory] = useState('');
+
+
+
+  useEffect(() => {
+    async function loadHouseholds() {
+      if (!user) return;
+      setLoading(true);
+      try {
+        // leer perfil del usuario
+        const profRef = doc(db, 'profiles', user.uid);
+        const profSnap = await getDoc(profRef);
+        const hIds = profSnap.exists()
+          ? profSnap.data().householdIds || []
+          : [];
+
+        if (!hIds.length) {
+          setHouseholds([]);
+          setLoading(false);
+          return;
+        }
+
+        // leer cada household
+        const snaps = await Promise.all(
+          hIds.map((id) => getDoc(doc(db, 'households', id)))
+        );
+
+        const list = snaps
+          .filter((s) => s.exists())
+          .map((s) => ({
+            id: s.id,
+            ...s.data(),
+          }));
+
+        setHouseholds(list);
+
+        // si no hay seleccionado aún, usar el actual
+        if (!selectedId && householdId) setSelectedId(householdId);
+      } catch (e) {
+        console.error('Error cargando hogares:', e);
+      } finally {
+        setLoading(false);
+      }
+    }
+
+    loadHouseholds();
+  }, [user, householdId, selectedId]);
+
+  const selectedHousehold = households.find((h) => h.id === selectedId) || null;
+
+  async function handleDeleteHousehold(id) {
+    if (!user) return;
+  
+    const ok = window.confirm(
+      '¿Seguro que quieres eliminar este hogar? Esta acción no se puede deshacer.'
+    );
+    if (!ok) return;
+  
+    try {
+      const hhRef = doc(db, 'households', id);
+  
+      // 1) Intentar borrar el hogar
+      try {
+        await deleteDoc(hhRef);
+      } catch (e) {
+        console.error('Error al borrar doc households:', e);
+        // si es problema de permisos, igual seguimos y al menos lo sacamos del perfil
+      }
+  
+      // 2) Quitar referencia del perfil (si existe)
+      const profRef = doc(db, 'profiles', user.uid);
+      try {
+        await updateDoc(profRef, {
+          householdIds: arrayRemove(id),
+        });
+      } catch (e) {
+        console.error('Error al actualizar perfil:', e);
+        // si falla updateDoc porque no existe, usamos setDoc merge
+        await setDoc(
+          profRef,
+          {
+            householdIds: [],
+          },
+          { merge: true }
+        );
+      }
+  
+      // 3) Actualizar estado local
+      setHouseholds((prev) => prev.filter((h) => h.id !== id));
+      if (selectedId === id) setSelectedId(null);
+    } catch (e) {
+      console.error('Error eliminando hogar:', e);
+      alert('No se pudo eliminar el hogar. Revisa la consola.');
+    }
   }
+  
+  const cats = categories && categories.length ? categories : CATEGORIES;
+
   return (
     <div className="grid gap-4 md:grid-cols-2">
       <Card>
-        <SectionTitle>Datos</SectionTitle>
-        <div className="flex flex-col gap-2">
-          <button className="px-3 py-2 rounded-xl border" onClick={exportJSON}>
-            Exportar JSON (respaldo local)
-          </button>
+        <SectionTitle>Hogares vinculados a tu cuenta</SectionTitle>
+        {loading && <div className="text-sm text-gray-600">Cargando…</div>}
+        {!loading && households.length === 0 && (
           <div className="text-sm text-gray-600">
-            Código del hogar para compartir con tu familia:{' '}
-            <strong>{householdId}</strong>
+            No tienes hogares registrados aún.
           </div>
-        </div>
+        )}
+        {!loading && households.length > 0 && (
+          <div className="flex flex-col gap-2">
+            <div className="text-sm text-gray-600">
+              Selecciona un hogar para ver sus montos:
+            </div>
+            <select
+              className="border rounded-lg p-2"
+              value={selectedId || ''}
+              onChange={(e) => setSelectedId(e.target.value || null)}
+            >
+              <option value="">— Selecciona un hogar —</option>
+              {households.map((h) => (
+                <option key={h.id} value={h.id}>
+                  {h.id}{' '}
+                  {h.memberInfo
+                    ? `· ${Object.values(h.memberInfo)
+                        .map((m) => m.name)
+                        .join(', ')}`
+                    : ''}
+                </option>
+              ))}
+            </select>
+
+            {selectedHousehold && (
+              <div className="mt-3 border rounded-xl p-3 text-sm">
+                <div className="font-medium mb-1">
+                  Código hogar: {selectedHousehold.id}
+                </div>
+                <div className="text-gray-700 mb-2">
+                  <div className="font-semibold mb-1">
+                    Presupuestos por categoría:
+                  </div>
+                  <ul className="list-disc pl-5">
+                    {Object.entries(
+                      selectedHousehold.budgets || {}
+                    ).map(([cat, val]) => (
+                      <li key={cat}>
+                        {cat}: <Money n={val} />
+                      </li>
+                    ))}
+                    {(!selectedHousehold.budgets ||
+                      Object.keys(selectedHousehold.budgets).length === 0) && (
+                      <li className="text-gray-500">
+                        Sin presupuestos configurados.
+                      </li>
+                    )}
+                  </ul>
+                </div>
+                <button
+                  className="px-3 py-2 rounded-xl border border-red-500 text-red-600 text-sm"
+                  onClick={() => handleDeleteHousehold(selectedHousehold.id)}
+                >
+                  Eliminar este hogar
+                </button>
+              </div>
+            )}
+          </div>
+        )}
       </Card>
+
       <Card>
         <SectionTitle>Categorías</SectionTitle>
-        <ul className="list-disc pl-6 mt-2 text-sm">
-          {CATEGORIES.map((c) => (
-            <li key={c}>{c}</li>
+
+        {/* Formulario para agregar categoría */}
+        <form
+          className="flex gap-2 mt-2"
+          onSubmit={async (e) => {
+            e.preventDefault();
+            const name = newCategory.trim();
+            if (!name) return;
+            await actions.addCategory(name);
+            setNewCategory('');
+          }}
+        >
+          <input
+            className="border rounded-lg p-2 flex-1"
+            placeholder="Nueva categoría (ej. Mascotas)"
+            value={newCategory}
+            onChange={(e) => setNewCategory(e.target.value)}
+          />
+          <button
+            type="submit"
+            className="px-3 py-2 rounded-xl border bg-gray-900 text-white text-sm"
+          >
+            Agregar
+          </button>
+        </form>
+
+
+        {/* Listado con opción de eliminar */}
+                {/* Listado con opción de eliminar */}
+                <ul className="list-disc pl-6 mt-4 text-sm space-y-2">
+          {cats.map((c) => (
+            <li
+              key={c}
+              className="flex items-center justify-between gap-2"
+            >
+              <span>{c}</span>
+              <div className="flex flex-col gap-1 sm:flex-row">
+                <button
+                  type="button"
+                  className="text-xs text-blue-600"
+                  onClick={async () => {
+                    const nuevo = window.prompt(
+                      `Nuevo nombre para la categoría "${c}"`,
+                      c
+                    );
+                    if (!nuevo) return;
+                    await actions.renameCategory(c, nuevo);
+                  }}
+                >
+                  Renombrar
+                </button>
+                <button
+                  type="button"
+                  className="text-xs text-red-600"
+                  onClick={async () => {
+                    const ok = window.confirm(
+                      `¿Eliminar la categoría "${c}"? Los presupuestos de esa categoría se perderán.`
+                    );
+                    if (!ok) return;
+                    await actions.removeCategory(c);
+                  }}
+                >
+                  Eliminar
+                </button>
+              </div>
+            </li>
           ))}
         </ul>
+
       </Card>
     </div>
   );
 }
+
 
 export default function App() {
   const [tab, setTab] = useState('dashboard');
@@ -1487,12 +1847,14 @@ export default function App() {
   }
 
   const data = {
+    categories: h.categories,
     budgets: h.budgets,
     transactions: h.transactions,
     debts: h.debts,
     savings: h.savings,
     investments: h.investments,
   };
+
 
   const actions = {
     setBudget: h.setBudget,
@@ -1507,7 +1869,12 @@ export default function App() {
     addInvestment: h.addInvestment,
     updateInvestment: h.updateInvestment,
     removeInvestment: h.removeInvestment,
+    addCategory: h.addCategory,
+    removeCategory: h.removeCategory,
+    renameCategory: h.renameCategory,
   };
+
+
 
   return (
     <div className="min-h-screen bg-gray-50">
@@ -1520,9 +1887,10 @@ export default function App() {
       />
 
       <main className="max-w-6xl mx-auto p-4 grid gap-4">
-        {tab === 'dashboard' && (
+      {tab === 'dashboard' && (
           <Dashboard
             data={{
+              categories: data.categories,
               budgets: data.budgets,
               transactions: data.transactions,
               debts: data.debts,
@@ -1531,19 +1899,26 @@ export default function App() {
             }}
           />
         )}
-        {tab === 'transactions' && (
+
+{tab === 'transactions' && (
           <Transactions
-            data={{ transactions: data.transactions }}
+            data={{ transactions: data.transactions, categories: data.categories }}
             actions={actions}
             user={ctx.user}
           />
         )}
-        {tab === 'budgets' && (
+
+{tab === 'budgets' && (
           <Budgets
-            data={{ budgets: data.budgets, transactions: data.transactions }}
+            data={{
+              budgets: data.budgets,
+              transactions: data.transactions,
+              categories: data.categories,
+            }}
             actions={actions}
           />
         )}
+
         {tab === 'debts' && (
           <Debts data={{ debts: data.debts }} actions={actions} />
         )}
@@ -1556,18 +1931,23 @@ export default function App() {
             actions={actions}
           />
         )}
-          {tab === 'settings' && (
-            <Settings
-              data={{
-                budgets: data.budgets,
-                transactions: data.transactions,
-                debts: data.debts,
-                savings: data.savings,
-                investments: data.investments,
-              }}
-              householdId={selectedHid}
-            />
-          )}
+                {tab === 'settings' && (
+          <Settings
+            data={{
+              budgets: data.budgets,
+              transactions: data.transactions,
+              debts: data.debts,
+              savings: data.savings,
+              investments: data.investments,
+            }}
+            householdId={selectedHid}
+            user={ctx.user}
+            categories={data.categories}
+            actions={actions}
+          />
+        )}
+
+
         </main>
       <footer className="text-center text-xs text-gray-500 p-4">
         V2 · Firebase/Firestore en tiempo real
