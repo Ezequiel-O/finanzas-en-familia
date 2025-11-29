@@ -127,7 +127,7 @@ export default function HouseholdPicker({ user, onEnter }) {
   return (
     <div className="max-w-6xl mx-auto grid gap-6 md:grid-cols-3">
       {/* Columna 1-2: Tus hogares */}
-      <section className="md:col-span-2 bg-white border rounded-2xl shadow-sm p-5">
+      <section className="md:col-span-2 bg-white dark:bg-gray-800 border rounded-2xl shadow-sm dark:shadow-none p-5">
         <header className="flex items-center justify-between mb-4">
           <h2 className="text-xl font-semibold flex items-center gap-2">
             <span aria-hidden>🏠</span> Tus hogares
@@ -176,7 +176,7 @@ export default function HouseholdPicker({ user, onEnter }) {
             {list.map((h) => (
               <li
                 key={h.id}
-                className="border rounded-xl p-4 flex items-start gap-3 hover:shadow-sm transition"
+                className="border rounded-xl p-4 flex items-start gap-3 hover:shadow-sm dark:shadow-none transition"
               >
                 <div className="text-2xl" aria-hidden>
                   🏡
@@ -208,14 +208,14 @@ export default function HouseholdPicker({ user, onEnter }) {
                     </button>
                     <button
                       onClick={() => setDefault(h.id)}
-                      className="px-3 py-1.5 rounded-lg text-sm border hover:bg-gray-50"
+                      className="px-3 py-1.5 rounded-lg text-sm border hover:bg-gray-50 dark:bg-gray-900"
                       title="Marcar como predeterminado"
                     >
                       Predeterminado
                     </button>
                     <button
                       onClick={() => renameHousehold(h.id)}
-                      className="px-3 py-1.5 rounded-lg text-sm border hover:bg-gray-50"
+                      className="px-3 py-1.5 rounded-lg text-sm border hover:bg-gray-50 dark:bg-gray-900"
                       title="Renombrar hogar"
                     >
                       Renombrar
@@ -229,7 +229,7 @@ export default function HouseholdPicker({ user, onEnter }) {
       </section>
 
       {/* Columna 3: Crear / Unirse */}
-      <section className="bg-white border rounded-2xl shadow-sm p-5">
+      <section className="bg-white dark:bg-gray-800 border rounded-2xl shadow-sm dark:shadow-none p-5">
         <h3 className="text-lg font-semibold mb-3">Crear / Unirse</h3>
 
         {/* Crear */}
@@ -269,7 +269,7 @@ export default function HouseholdPicker({ user, onEnter }) {
           />
           <button
             onClick={handleJoin}
-            className="w-full px-3 py-2 rounded-lg border hover:bg-gray-50"
+            className="w-full px-3 py-2 rounded-lg border hover:bg-gray-50 dark:bg-gray-900"
           >
             Unirme
           </button>

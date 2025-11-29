@@ -22,11 +22,20 @@
     </script>
 
     <!-- Estilos rápidos con Tailwind (CDN) + fuente Inter -->
-    <script src="https://cdn.tailwindcss.com"></script>
-    <link
-      href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&display=swap"
-      rel="stylesheet"
-    />
+<script src="https://cdn.tailwindcss.com"></script>
+<script>
+  tailwind.config = {
+    darkMode: 'class',
+    theme: {
+      extend: {},
+    },
+  };
+</script>
+<link
+  href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&display=swap"
+  rel="stylesheet"
+/>
+
 
     <style>
       html,
@@ -35,11 +44,11 @@
         height: 100%;
       }
       body {
-        margin: 0;
-        font-family: Inter, system-ui, -apple-system, 'Segoe UI', Roboto, Arial,
-          'Noto Sans', 'Apple Color Emoji', 'Segoe UI Emoji';
-        background: #f8fafc; /* gris clarito */
-      }
+  margin: 0;
+  font-family: Inter, system-ui, -apple-system, 'Segoe UI', Roboto, Arial,
+    'Noto Sans', 'Apple Color Emoji', 'Segoe UI Emoji';
+}
+
       button,
       input,
       select {
@@ -47,7 +56,7 @@
       }
     </style>
   </head>
-  <body class="bg-gray-50">
+  <body>
     <div id="root"></div>
     <script type="module" src="/src/main.jsx"></script>
   </body>
