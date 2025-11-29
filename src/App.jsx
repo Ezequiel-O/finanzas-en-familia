@@ -12,7 +12,11 @@ import {
   signInWithEmailAndPassword,
   createUserWithEmailAndPassword,
   signOut,
+  sendPasswordResetEmail,
+  reauthenticateWithCredential,
+  EmailAuthProvider,
 } from 'firebase/auth';
+
 
 
 import {
@@ -22,7 +26,6 @@ import {
   onSnapshot,
   updateDoc,
   arrayUnion,
-  arrayRemove,
   collection,
   addDoc,
   deleteDoc,
@@ -30,10 +33,6 @@ import {
   query,
   where,
 } from 'firebase/firestore';
-
-
-
-import HouseholdPicker from './components/HouseholdPicker';
 
 // --- Utils ---
 const CATEGORIES = [
@@ -47,12 +46,62 @@ const CATEGORIES = [
   'Vestuario',
   'Otros',
 ];
+
 function monthKey(date = new Date()) {
-  return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(
-    2,
-    '0'
-  )}`;
+  return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}`;
 }
+
+function shiftMonth(key, delta) {
+  const [y, m] = key.split('-').map(Number);
+  const date = new Date(y, m - 1 + delta, 1);
+  return monthKey(date);
+}
+
+function formatMonthLabel(key) {
+  const [y, m] = key.split('-').map(Number);
+  const date = new Date(y, m - 1, 1);
+  return date.toLocaleDateString('es-CL', {
+    month: 'long',
+    year: 'numeric',
+  });
+}
+
+// periodo de presupuesto según día de corte
+function getBudgetPeriod(monthKeyStr, cutDay = 1) {
+  const [y, m] = monthKeyStr.split('-').map(Number);
+  const day = Math.max(1, Math.min(28, Number(cutDay) || 1)); // limitar 1–28
+  const start = new Date(y, m - 1, day);
+  const end = new Date(y, m, day); // siguiente mes mismo día
+
+  const startStr = start.toISOString().slice(0, 10);
+  const endStr = end.toISOString().slice(0, 10);
+
+  return { start: startStr, end: endStr };
+}
+
+// etiqueta legible del periodo según día de corte (ej: "28-nov al 27-dic")
+function formatBudgetPeriodLabel(monthKeyStr, cutDay = 1) {
+  const { start, end } = getBudgetPeriod(monthKeyStr, cutDay);
+
+  // start y end vienen como "YYYY-MM-DD"
+  const startDate = new Date(start + 'T00:00:00');
+  const endExclusive = new Date(end + 'T00:00:00');
+
+  // el periodo real llega hasta el día anterior a end (end es exclusivo)
+  endExclusive.setDate(endExclusive.getDate() - 1);
+
+  const fmt = (d) =>
+    d
+      .toLocaleDateString('es-CL', {
+        day: '2-digit',
+        month: 'short',
+      })
+      .replace('.', ''); // para quitar el punto de "nov."
+
+  return `${fmt(startDate)} al ${fmt(endExclusive)}`;
+}
+
+
 function Money({ n }) {
   const sign = Number(n) < 0 ? '-' : '';
   const v = Math.abs(Number(n || 0));
@@ -62,13 +111,15 @@ function Money({ n }) {
     </span>
   );
 }
+
 function Card({ children, className = '' }) {
   return (
-    <div className={`rounded-2xl shadow-sm border p-4 bg-white ${className}`}>
+    <div className={`rounded-2xl  shadow-sm dark:shadow-none border p-4 bg-white dark:bg-gray-800 ${className}`}>
       {children}
     </div>
   );
 }
+
 function Progress({ value }) {
   const v = Math.max(0, Math.min(100, Number.isFinite(value) ? value : 0));
   return (
@@ -83,6 +134,7 @@ function Progress({ value }) {
     </div>
   );
 }
+
 function SectionTitle({ children, right }) {
   return (
     <div className="flex items-center justify-between mb-3">
@@ -93,20 +145,87 @@ function SectionTitle({ children, right }) {
 }
 
 // --- Household helpers ---
-async function createHousehold(uid, displayName) {
+async function createHousehold(uid, displayName, email) {
   const id = uid.slice(0, 6) + Math.random().toString(36).slice(2, 5);
   const ref = doc(db, 'households', id);
-  const categories = [...CATEGORIES]; // categorías iniciales por defecto
+  const categories = [...CATEGORIES];
   const budgets = categories.reduce((acc, c) => ((acc[c] = 0), acc), {});
+
+  const superUser = {
+    id: 'super-admin',
+    name: '',
+    pin: '',
+    isSuperAdmin: true,
+    preferences: {
+      defaultTab: 'dashboard',
+      showOnlyMyMovements: false,
+      dashboardCards: {
+        resumenMes: true,
+        deudas: true,
+        ahorro: true,
+        inversiones: true,
+        presupuestos: true,
+      },
+      transactionsDefaults: {
+        type: 'gasto',
+        defaultCategory: categories[0],
+      },
+      ui: {
+        theme: 'light',
+        density: 'normal',
+      },
+    },
+  };
+
   await setDoc(ref, {
     id,
     members: [uid],
-    memberInfo: { [uid]: { name: displayName || 'Usuario' } },
+    memberInfo: { [uid]: { name: displayName || email || 'Administrador' } },
     categories,
     budgets,
     createdAt: Date.now(),
+    superAdminUid: uid,
+    superAdminEmail: email || null,
+    householdUsers: [superUser],
+    budgetCutDay: 1, // día de corte por defecto
   });
   return id;
+}
+
+// garantiza un solo hogar por usuario
+async function ensureSingleHouseholdForUser(user) {
+  const uid = user.uid;
+  const email = user.email || '';
+  const displayName = user.displayName || email || 'Administrador';
+
+  const profRef = doc(db, 'profiles', uid);
+  const profSnap = await getDoc(profRef);
+
+  let householdId = null;
+
+  if (profSnap.exists()) {
+    const prof = profSnap.data() || {};
+    householdId =
+      prof.householdId ||
+      prof.defaultHouseholdId ||
+      (Array.isArray(prof.householdIds) && prof.householdIds[0]) ||
+      null;
+  }
+
+  if (!householdId) {
+    householdId = await createHousehold(uid, displayName, email);
+  }
+
+  await setDoc(
+    profRef,
+    {
+      name: displayName,
+      householdId,
+    },
+    { merge: true }
+  );
+
+  return householdId;
 }
 
 async function joinHousehold(uid, code, displayName) {
@@ -127,8 +246,8 @@ async function joinHousehold(uid, code, displayName) {
 }
 
 function Header({ currentTab, setTab, user, onLogout, householdId }) {
-  const showTabs = Boolean(user && householdId); // pestañas solo “adentro”
-  const showLogout = Boolean(user); // Salir siempre si hay sesión
+  const showTabs = Boolean(user && householdId);
+  const showLogout = Boolean(user);
 
   const tabs = [
     ['dashboard', 'Dashboard'],
@@ -141,7 +260,7 @@ function Header({ currentTab, setTab, user, onLogout, householdId }) {
   ];
 
   return (
-    <div className="flex flex-wrap items-center gap-2 p-3 bg-white/70 backdrop-blur sticky top-0 z-10 border-b">
+    <div className="flex flex-wrap items-center gap-2 p-3 bg-white dark:bg-gray-800/70 backdrop-blur sticky top-0 z-10 border-b">
       <div className="text-2xl font-bold">Finanzas en Familia</div>
 
       <div className="flex flex-wrap gap-2 ml-auto">
@@ -151,7 +270,7 @@ function Header({ currentTab, setTab, user, onLogout, householdId }) {
               key={key}
               onClick={() => setTab(key)}
               className={`px-3 py-1.5 rounded-full border text-sm ${
-                currentTab === key ? 'bg-gray-900 text-white' : 'bg-white'
+                currentTab === key ? 'bg-gray-900 text-white' : 'bg-white dark:bg-gray-800'
               }`}
             >
               {label}
@@ -173,14 +292,14 @@ function Header({ currentTab, setTab, user, onLogout, householdId }) {
 
 // --- Auth + Household gate ---
 function AuthGate({ onReady }) {
-  const [phase, setPhase] = useState('loading'); // loading | auth | household | ready
+  const [phase, setPhase] = useState('loading'); // loading | auth | ready
   const [user, setUser] = useState(null);
   const [email, setEmail] = useState('');
   const [pass, setPass] = useState('');
   const [isRegister, setIsRegister] = useState(false);
-  const [joinCode, setJoinCode] = useState('');
-  const [name, setName] = useState('');
-  const [tip, setTip] = useState(''); // texto de tooltip de error
+  const [tip, setTip] = useState('');
+  const [resetMsg, setResetMsg] = useState('');
+  const [resetError, setResetError] = useState('');
 
   useEffect(() => {
     const unsub = onAuthStateChanged(auth, async (u) => {
@@ -189,22 +308,21 @@ function AuthGate({ onReady }) {
         setPhase('auth');
         return;
       }
+
       setUser(u);
       setPhase('loading');
+
       try {
-        const profSnap = await getDoc(doc(db, 'profiles', u.uid));
-        const hid = profSnap.exists() ? profSnap.data().householdId : null;
-        if (hid) {
-          setPhase('ready');
-          onReady({ user: u }); // elegiremos el hogar después
-        } else {
-          setPhase('household');
-        }
+        const hid = await ensureSingleHouseholdForUser(u);
+        setPhase('ready');
+        onReady({ user: u, householdId: hid });
       } catch (e) {
-        console.error('Error leyendo perfil:', e);
-        setPhase('household');
+        console.error('Error asegurando hogar único:', e);
+        setTip('No se pudo cargar tus datos. Intenta más tarde.');
+        setPhase('auth');
       }
     });
+
     return () => unsub();
   }, [onReady]);
 
@@ -225,13 +343,12 @@ function AuthGate({ onReady }) {
       return 'API key inválida en la configuración de Firebase.';
     if (code.includes('domain-config-required'))
       return 'Agrega este dominio a “Authorized domains” en Firebase.';
-    // fallback: muestra el code para depurar
     return `No se pudo iniciar sesión (${code}).`;
   }
 
   async function handleLogin(e) {
     e.preventDefault();
-    // Validación: campos vacíos
+
     if (!email?.trim() || !pass?.trim()) {
       setTip('Ingresa un email y contraseña válidos');
       return;
@@ -241,58 +358,44 @@ function AuthGate({ onReady }) {
     try {
       if (isRegister) {
         const cred = await createUserWithEmailAndPassword(auth, email, pass);
-        // crea perfil mínimo para evitar estado huérfano
-        await setDoc(doc(db, 'profiles', cred.user.uid), {
-          householdId: null,
-          name: name || email,
-        });
+        const hid = await ensureSingleHouseholdForUser(cred.user);
         setUser(cred.user);
-        setPhase('household');
+        setPhase('ready');
+        onReady({ user: cred.user, householdId: hid });
       } else {
         await signInWithEmailAndPassword(auth, email, pass);
       }
     } catch (err) {
+      console.error(err);
       setTip(mapAuthError(err));
     }
   }
 
-  async function handleCreateHousehold() {
-    if (!user) return;
-    const hid = await createHousehold(user.uid, name || user.email);
-    await setDoc(
-      doc(db, 'profiles', user.uid),
-      {
-        name: name || user.email,
-        householdIds: arrayUnion(hid),
-        defaultHouseholdId: hid, // opcional: último usado por defecto
-      },
-      { merge: true }
-    );
-    setPhase('ready');
-    onReady({ user });
-  }
+  async function handleResetPassword() {
+    setResetMsg('');
+    setResetError('');
 
-  async function handleJoinHousehold() {
-    if (!user) return;
+    const mail = (email || '').trim();
+    if (!mail) {
+      setResetError('Escribe tu email para enviarte el enlace de recuperación.');
+      return;
+    }
+
     try {
-      const hid = await joinHousehold(
-        user.uid,
-        joinCode.trim(),
-        name || user.email
+      await sendPasswordResetEmail(auth, mail);
+      setResetMsg(
+        'Te enviamos un correo con el enlace para restablecer tu contraseña. Revisa también tu carpeta de Spam o Correos no deseados.'
       );
-      await setDoc(
-        doc(db, 'profiles', user.uid),
-        {
-          name: name || user.email,
-          householdIds: arrayUnion(hid),
-          defaultHouseholdId: hid,
-        },
-        { merge: true }
-      );
-      setPhase('ready');
-      onReady({ user });
-    } catch (e) {
-      setTip(e.message || 'Código inválido');
+    } catch (err) {
+      console.error('Error reset password:', err);
+      const code = String(err?.code || '');
+      if (code.includes('user-not-found')) {
+        setResetError('No existe un usuario registrado con ese email.');
+      } else if (code.includes('invalid-email')) {
+        setResetError('El email no es válido.');
+      } else {
+        setResetError('No se pudo enviar el correo de recuperación. Intenta más tarde.');
+      }
     }
   }
 
@@ -302,7 +405,6 @@ function AuthGate({ onReady }) {
   if (phase === 'auth')
     return (
       <div className="max-w-6xl mx-auto grid md:grid-cols-2 items-start gap-10 py-8 px-4">
-        {/* Columna izquierda: login/registro */}
         <Card className="w-full max-w-xl mx-auto md:mx-0">
           <h1 className="text-2xl font-bold mb-4">Inicia sesión</h1>
           <form onSubmit={handleLogin} className="grid gap-3 relative">
@@ -325,14 +427,29 @@ function AuthGate({ onReady }) {
             <button className="px-3 py-2 rounded-xl border bg-gray-900 text-white">
               {isRegister ? 'Crear cuenta' : 'Entrar'}
             </button>
+
             {tip && (
-              <div className="absolute -bottom-10 left-0 bg-red-50 text-red-700 border border-red-200 rounded-md px-3 py-2 text-sm shadow-sm">
+              <div className="absolute -bottom-10 left-0 bg-red-50 text-red-700 border border-red-200 rounded-md px-3 py-2 text-sm shadow-sm dark:shadow-none">
                 {tip}
               </div>
             )}
           </form>
+
+          <div className="mt-3 flex flex-col gap-1 text-sm">
+            <button
+              type="button"
+              className="text-blue-600 text-left"
+              onClick={handleResetPassword}
+            >
+              ¿Olvidaste tu contraseña?
+            </button>
+
+            {resetMsg && <div className="text-xs text-green-700">{resetMsg}</div>}
+            {resetError && <div className="text-xs text-red-600">{resetError}</div>}
+          </div>
+
           <button
-            className="text-sm mt-6"
+            className="text-sm mt-4"
             onClick={() => setIsRegister(!isRegister)}
           >
             {isRegister
@@ -341,10 +458,9 @@ function AuthGate({ onReady }) {
           </button>
         </Card>
 
-        {/* Columna derecha: beneficios/ayuda */}
         <Card>
           <h3 className="text-lg font-semibold mb-3">Tu centro de control</h3>
-          <ul className="space-y-2 text-sm text-gray-800">
+          <ul className="space-y-2 text-sm ext-gray-900 dark:text-gray-100">
             <li>✅ Presupuestos por categoría con % de avance</li>
             <li>✅ Movimientos y conciliación rápida</li>
             <li>✅ Deudas, ahorro e inversiones</li>
@@ -354,86 +470,7 @@ function AuthGate({ onReady }) {
       </div>
     );
 
-  // Configuración de hogar
-  if (phase === 'household')
-    return (
-      <div className="min-h-[calc(100vh-120px)] px-4">
-        <div className="max-w-6xl mx-auto grid md:grid-cols-2 items-start gap-10 py-8">
-          {/* Acciones */}
-          <div className="w-full max-w-xl mx-auto md:mx-0 grid gap-6">
-            <h2 className="text-xl font-semibold text-center md:text-left">
-              Configura tu hogar compartido
-            </h2>
-            <input
-              className="border rounded-lg p-2 w-full"
-              placeholder="Tu nombre para mostrar"
-              value={name}
-              onChange={(e) => setName(e.target.value)}
-            />
-            <Card>
-              <SectionTitle>Crear nuevo hogar</SectionTitle>
-              <button
-                className="w-full px-3 py-2 rounded-xl border bg-gray-900 text-white"
-                onClick={handleCreateHousehold}
-              >
-                Crear
-              </button>
-            </Card>
-            <Card>
-              <SectionTitle>Unirme a un hogar</SectionTitle>
-              <div className="flex flex-col md:flex-row gap-2">
-                <input
-                  className="border rounded-lg p-2 flex-1 w-full"
-                  placeholder="Código de hogar"
-                  value={joinCode}
-                  onChange={(e) => setJoinCode(e.target.value)}
-                />
-                <button
-                  className="px-3 py-2 rounded-xl border w-full md:w-auto"
-                  onClick={handleJoinHousehold}
-                >
-                  Unirme
-                </button>
-              </div>
-              {tip && (
-                <div className="mt-3 text-sm text-red-700 bg-red-50 border border-red-200 rounded-md px-3 py-2">
-                  {tip}
-                </div>
-              )}
-            </Card>
-          </div>
-
-          {/* Ayuda */}
-          <div className="hidden md:block">
-            <div className="bg-white rounded-2xl border shadow-sm p-6">
-              <h3 className="text-lg font-semibold mb-3">
-                🏡 ¿Qué es un “hogar”?
-              </h3>
-              <p className="text-gray-700 mb-4">
-                Es tu espacio compartido: invita a tu pareja o familia para{' '}
-                <strong>ver y editar el mismo presupuesto</strong> en tiempo
-                real. 👨‍👩‍👧‍👦⚡
-              </p>
-              <ol className="list-decimal pl-5 space-y-2 text-gray-700">
-                <li>
-                  🆕 <strong>Crea un hogar</strong> o ingresa el{' '}
-                  <strong>código</strong> para unirte.
-                </li>
-                <li>
-                  🔗 <strong>Comparte el código</strong> con tu familia.
-                </li>
-                <li>
-                  ⚡ <strong>Listo:</strong> todos verán y editarán los datos{' '}
-                  <strong>en tiempo real</strong>.
-                </li>
-              </ol>
-            </div>
-          </div>
-        </div>
-      </div>
-    );
-
-  return null; // ready handled por App
+  return null;
 }
 
 // --- Hooks de datos (Firestore) ---
@@ -444,24 +481,67 @@ function useHouseholdData(householdId) {
   const [debts, setDebts] = useState([]);
   const [savings, setSavings] = useState([]);
   const [investments, setInvestments] = useState([]);
+  const [householdUsers, setHouseholdUsers] = useState([]);
+  const [superAdminEmail, setSuperAdminEmail] = useState(null);
+  const [budgetCutDay, setBudgetCutDayState] = useState(1);
 
   useEffect(() => {
     if (!householdId) return;
 
     const unsubHH = onSnapshot(doc(db, 'households', householdId), (snap) => {
       const d = snap.data() || {};
-      const cats = d.categories && Array.isArray(d.categories)
-        ? d.categories
-        : [...CATEGORIES];
+      const cats =
+        d.categories && Array.isArray(d.categories)
+          ? d.categories
+          : [...CATEGORIES];
       setCategories(cats);
-    
+
       const initialBudgets = cats.reduce((a, c) => {
         a[c] = d.budgets?.[c] ?? 0;
         return a;
       }, {});
       setBudgets(initialBudgets);
+
+      let rawUsers = Array.isArray(d.householdUsers) ? d.householdUsers : [];
+      const hasSuper = rawUsers.some((u) => u.isSuperAdmin);
+
+      if (!hasSuper && d.superAdminEmail) {
+        const superUser = {
+          id: 'super-admin',
+          name: '',
+          pin: '',
+          isSuperAdmin: true,
+          preferences: {
+            defaultTab: 'dashboard',
+            showOnlyMyMovements: false,
+            dashboardCards: {
+              resumenMes: true,
+              deudas: true,
+              ahorro: true,
+              inversiones: true,
+              presupuestos: true,
+            },
+            transactionsDefaults: {
+              type: 'gasto',
+              defaultCategory: cats[0] || CATEGORIES[0],
+            },
+            ui: {
+              theme: 'light',
+              density: 'normal',
+            },
+          },
+        };
+        rawUsers = [...rawUsers, superUser];
+
+        updateDoc(doc(db, 'households', householdId), {
+          householdUsers: rawUsers,
+        }).catch((err) => console.error('Error auto-creando super admin:', err));
+      }
+
+      setHouseholdUsers(rawUsers);
+      setSuperAdminEmail(d.superAdminEmail || null);
+      setBudgetCutDayState(d.budgetCutDay || 1);
     });
-    
 
     const unsubTx = onSnapshot(
       collection(db, 'households', householdId, 'transactions'),
@@ -506,48 +586,52 @@ function useHouseholdData(householdId) {
     const b = snap.data().budgets || {};
     await updateDoc(ref, { budgets: { ...b, [cat]: Number(value || 0) } });
   }
+
   async function addTransaction(tx) {
     try {
-      await addDoc(
-        collection(db, 'households', householdId, 'transactions'),
-        tx
-      );
+      await addDoc(collection(db, 'households', householdId, 'transactions'), tx);
     } catch (e) {
       console.error('Error al guardar transacción:', e);
       alert('No se pudo guardar el movimiento. Revisa la consola.');
     }
   }
-  
+
   async function removeTransaction(id) {
     await deleteDoc(doc(db, 'households', householdId, 'transactions', id));
   }
+
   async function addDebt(d) {
     await addDoc(collection(db, 'households', householdId, 'debts'), d);
   }
+
   async function updateDebt(id, patch) {
     await updateDoc(doc(db, 'households', householdId, 'debts', id), patch);
   }
+
   async function removeDebt(id) {
     await deleteDoc(doc(db, 'households', householdId, 'debts', id));
   }
+
   async function addSaving(s) {
     await addDoc(collection(db, 'households', householdId, 'savings'), s);
   }
+
   async function updateSaving(id, patch) {
     await updateDoc(doc(db, 'households', householdId, 'savings', id), patch);
   }
+
   async function removeSaving(id) {
     await deleteDoc(doc(db, 'households', householdId, 'savings', id));
   }
+
   async function addInvestment(i) {
     await addDoc(collection(db, 'households', householdId, 'investments'), i);
   }
+
   async function updateInvestment(id, patch) {
-    await updateDoc(
-      doc(db, 'households', householdId, 'investments', id),
-      patch
-    );
+    await updateDoc(doc(db, 'households', householdId, 'investments', id), patch);
   }
+
   async function removeInvestment(id) {
     await deleteDoc(doc(db, 'households', householdId, 'investments', id));
   }
@@ -564,7 +648,7 @@ function useHouseholdData(householdId) {
       ? data.categories
       : [...CATEGORIES];
 
-    if (currentCats.includes(trimmed)) return; // ya existe
+    if (currentCats.includes(trimmed)) return;
 
     const newCats = [...currentCats, trimmed];
     const currentBudgets = data.budgets || {};
@@ -599,7 +683,6 @@ function useHouseholdData(householdId) {
     });
   }
 
-  // Renombrar categoría en budgets + transactions
   async function renameCategory(oldName, newName) {
     const from = String(oldName || '').trim();
     const to = String(newName || '').trim();
@@ -614,12 +697,10 @@ function useHouseholdData(householdId) {
       : [...CATEGORIES];
 
     if (!currentCats.includes(from)) return;
-    if (currentCats.includes(to)) return; // ya existe una con ese nombre
+    if (currentCats.includes(to)) return;
 
-    // 1) Actualizar lista de categorías
     const newCats = currentCats.map((c) => (c === from ? to : c));
 
-    // 2) Mover presupuesto
     const currentBudgets = data.budgets || {};
     const newBudgets = { ...currentBudgets };
     newBudgets[to] = currentBudgets[from] ?? 0;
@@ -630,7 +711,6 @@ function useHouseholdData(householdId) {
       budgets: newBudgets,
     });
 
-    // 3) Actualizar todas las transactions con esa categoría
     const txCol = collection(db, 'households', householdId, 'transactions');
     const q = query(txCol, where('category', '==', from));
     const txSnap = await getDocs(q);
@@ -643,7 +723,67 @@ function useHouseholdData(householdId) {
     await Promise.all(updates);
   }
 
+  async function saveHouseholdUsers(nextUsers) {
+    if (!householdId) return;
+    const ref = doc(db, 'households', householdId);
+    await updateDoc(ref, { householdUsers: nextUsers });
+  }
 
+  async function addHouseholdUser(user) {
+    const base = Array.isArray(householdUsers) ? householdUsers : [];
+    const newUser = {
+      id: user.id || Math.random().toString(36).slice(2, 10),
+      name: user.name || 'Usuario',
+      pin: user.pin || '',
+      isSuperAdmin: !!user.isSuperAdmin,
+      preferences: user.preferences || {
+        defaultTab: 'dashboard',
+        showOnlyMyMovements: false,
+        dashboardCards: {
+          resumenMes: true,
+          deudas: true,
+          ahorro: true,
+          inversiones: true,
+          presupuestos: true,
+        },
+        transactionsDefaults: {
+          type: 'gasto',
+          defaultCategory: categories[0] || CATEGORIES[0],
+        },
+        ui: {
+          theme: 'light',
+          density: 'normal',
+        },
+      },
+    };
+    const next = [...base, newUser];
+    setHouseholdUsers(next);
+    await saveHouseholdUsers(next);
+  }
+
+  async function updateHouseholdUser(id, patch) {
+    const base = Array.isArray(householdUsers) ? householdUsers : [];
+    const next = base.map((u) => (u.id === id ? { ...u, ...patch } : u));
+    setHouseholdUsers(next);
+    await saveHouseholdUsers(next);
+  }
+
+  async function removeHouseholdUser(id) {
+    const base = Array.isArray(householdUsers) ? householdUsers : [];
+    const target = base.find((u) => u.id === id);
+    if (target?.isSuperAdmin) return;
+
+    const next = base.filter((u) => u.id !== id);
+    setHouseholdUsers(next);
+    await saveHouseholdUsers(next);
+  }
+
+  async function setBudgetCutDay(day) {
+    const n = Math.max(1, Math.min(28, Number(day) || 1));
+    const ref = doc(db, 'households', householdId);
+    await updateDoc(ref, { budgetCutDay: n });
+    setBudgetCutDayState(n);
+  }
 
   return {
     categories,
@@ -652,6 +792,9 @@ function useHouseholdData(householdId) {
     debts,
     savings,
     investments,
+    householdUsers,
+    superAdminEmail,
+    budgetCutDay,
     setBudget,
     addTransaction,
     removeTransaction,
@@ -667,20 +810,25 @@ function useHouseholdData(householdId) {
     addCategory,
     removeCategory,
     renameCategory,
+    addHouseholdUser,
+    updateHouseholdUser,
+    removeHouseholdUser,
+    setBudgetCutDay,
   };
 }
 
-
-
 // --- Vistas ---
-function Dashboard({ data }) {
-  const mk = monthKey();  
-  const cats = data.categories && data.categories.length
-  ? data.categories
-  : CATEGORIES;
-  const monthTx = data.transactions.filter((t) =>
-    (t.date || '').startsWith(mk)
-  );
+function Dashboard({ data, monthKeyStr }) {
+  const mk = monthKeyStr;
+  const cats =
+    data.categories && data.categories.length ? data.categories : CATEGORIES;
+
+  const { start, end } = getBudgetPeriod(mk, data.budgetCutDay || 1);
+  const monthTx = data.transactions.filter((t) => {
+    const d = t.date || '';
+    return d >= start && d < end;
+  });
+
   const totalIngresos = monthTx
     .filter((t) => t.type === 'ingreso')
     .reduce((a, b) => a + Number(b.amount || 0), 0);
@@ -688,6 +836,7 @@ function Dashboard({ data }) {
     .filter((t) => t.type === 'gasto')
     .reduce((a, b) => a + Number(b.amount || 0), 0);
   const balance = totalIngresos - totalGastos;
+
   const catSpend = cats.reduce((acc, c) => {
     const spent = monthTx
       .filter((t) => t.type === 'gasto' && t.category === c)
@@ -696,8 +845,10 @@ function Dashboard({ data }) {
     acc[c] = { spent, budget, pct: budget > 0 ? (spent / budget) * 100 : 0 };
     return acc;
   }, {});
+
   const pctIngresosVsGastos =
     totalIngresos > 0 ? (totalGastos / totalIngresos) * 100 : 0;
+
   const debtTotals = data.debts.reduce(
     (acc, d) => (
       (acc.original += Number(d.original || 0)),
@@ -711,6 +862,7 @@ function Dashboard({ data }) {
       ? ((debtTotals.original - debtTotals.remaining) / debtTotals.original) *
         100
       : 0;
+
   const savingsTotals = data.savings.reduce(
     (acc, s) => (
       (acc.goal += Number(s.goal || 0)),
@@ -720,9 +872,8 @@ function Dashboard({ data }) {
     { goal: 0, saved: 0 }
   );
   const savingsProgress =
-    savingsTotals.goal > 0
-      ? (savingsTotals.saved / savingsTotals.goal) * 100
-      : 0;
+    savingsTotals.goal > 0 ? (savingsTotals.saved / savingsTotals.goal) * 100 : 0;
+
   const invTotals = data.investments.reduce(
     (acc, i) => (
       (acc.contrib += Number(i.contributed || 0)),
@@ -736,132 +887,158 @@ function Dashboard({ data }) {
       ? ((invTotals.current - invTotals.contrib) / invTotals.contrib) * 100
       : 0;
 
+      const invProgress =
+  invTotals.contrib > 0
+    ? Math.max(0, Math.min(100, invROI))
+    : 0;
+
+
+  const cardsPrefs = data.activeUserPreferences?.dashboardCards || {};
+  const showResumenMes = cardsPrefs.resumenMes ?? true;
+  const showDeudas = cardsPrefs.deudas ?? true;
+  const showAhorro = cardsPrefs.ahorro ?? true;
+  const showInversiones = cardsPrefs.inversiones ?? true;
+  const showPresupuestos = cardsPrefs.presupuestos ?? true;
+
   return (
     <div className="grid gap-4 md:grid-cols-2 lg:grid-cols-3">
-      <Card>
-        <SectionTitle>Resumen del mes</SectionTitle>
-        <div className="space-y-2">
-          <div className="flex justify-between">
-            <span>Ingresos</span>
-            <strong>
-              <Money n={totalIngresos} />
-            </strong>
+      {showResumenMes && (
+        <Card>
+          <SectionTitle>Resumen del mes</SectionTitle>
+          <div className="space-y-2">
+            <div className="flex justify-between">
+              <span>Ingresos</span>
+              <strong>
+                <Money n={totalIngresos} />
+              </strong>
+            </div>
+            <div className="flex justify-between">
+              <span>Gastos</span>
+              <strong>
+                <Money n={totalGastos} />
+              </strong>
+            </div>
+            <div
+              className={`flex justify-between ${
+                balance >= 0 ? 'text-green-700' : 'text-red-600'
+              }`}
+            >
+              <span>Balance</span>
+              <strong>
+                <Money n={balance} />
+              </strong>
+            </div>
+            <div>
+              <div className="text-sm mb-1">% Gastado sobre ingresos</div>
+              <Progress value={pctIngresosVsGastos} />
+            </div>
+            <div className="text-xs text-gray-500">
+              Día de corte del mes: {data.budgetCutDay}
+            </div>
           </div>
-          <div className="flex justify-between">
-            <span>Gastos</span>
-            <strong>
-              <Money n={totalGastos} />
-            </strong>
-          </div>
-          <div
-            className={`flex justify-between ${
-              balance >= 0 ? 'text-green-700' : 'text-red-600'
-            }`}
-          >
-            <span>Balance</span>
-            <strong>
-              <Money n={balance} />
-            </strong>
-          </div>
-          <div>
-            <div className="text-sm mb-1">% Gastado sobre ingresos</div>
-            <Progress value={pctIngresosVsGastos} />
-          </div>
-        </div>
-      </Card>
+        </Card>
+      )}
 
-      <Card>
-        <SectionTitle>Progreso de deudas</SectionTitle>
-        <div className="space-y-2">
-          <div className="flex justify-between">
-            <span>Total original</span>
-            <strong>
-              <Money n={debtTotals.original} />
-            </strong>
+      {showDeudas && (
+        <Card>
+          <SectionTitle>Progreso de deudas</SectionTitle>
+          <div className="space-y-2">
+            <div className="flex justify-between">
+              <span>Total original</span>
+              <strong>
+                <Money n={debtTotals.original} />
+              </strong>
+            </div>
+            <div className="flex justify-between">
+              <span>Saldo pendiente</span>
+              <strong>
+                <Money n={debtTotals.remaining} />
+              </strong>
+            </div>
+            <div>
+              <div className="text-sm mb-1">% pagado</div>
+              <Progress value={debtProgress} />
+            </div>
           </div>
-          <div className="flex justify-between">
-            <span>Saldo pendiente</span>
-            <strong>
-              <Money n={debtTotals.remaining} />
-            </strong>
-          </div>
-          <div>
-            <div className="text-sm mb-1">% pagado</div>
-            <Progress value={debtProgress} />
-          </div>
-        </div>
-      </Card>
+        </Card>
+      )}
 
-      <Card>
-        <SectionTitle>Ahorro</SectionTitle>
-        <div className="space-y-2">
-          <div className="flex justify-between">
-            <span>Meta total</span>
-            <strong>
-              <Money n={savingsTotals.goal} />
-            </strong>
+      {showAhorro && (
+        <Card>
+          <SectionTitle>Ahorro</SectionTitle>
+          <div className="space-y-2">
+            <div className="flex justify-between">
+              <span>Meta total</span>
+              <strong>
+                <Money n={savingsTotals.goal} />
+              </strong>
+            </div>
+            <div className="flex justify-between">
+              <span>Ahorro actual</span>
+              <strong>
+                <Money n={savingsTotals.saved} />
+              </strong>
+            </div>
+            <div>
+              <div className="text-sm mb-1">% de meta alcanzada</div>
+              <Progress value={savingsProgress} />
+            </div>
           </div>
-          <div className="flex justify-between">
-            <span>Ahorro actual</span>
-            <strong>
-              <Money n={savingsTotals.saved} />
-            </strong>
-          </div>
-          <div>
-            <div className="text-sm mb-1">% de meta alcanzada</div>
-            <Progress value={savingsProgress} />
-          </div>
-        </div>
-      </Card>
+        </Card>
+      )}
 
-      <Card className="md:col-span-2 lg:col-span-3">
-        <SectionTitle>Presupuestos (progreso por categoría)</SectionTitle>
-        <div className="grid gap-3 md:grid-cols-2 lg:grid-cols-3">
-          {cats.map((c) => (
-            <div key={c} className="border rounded-xl p-3">
-              <div className="flex justify-between text-sm mb-1">
-                <span className="font-medium">{c}</span>
-                <span>
-                  <Money n={catSpend[c].spent} /> /{' '}
-                  <Money n={data.budgets?.[c] || 0} />
-                </span>
+      {showPresupuestos && (
+        <Card className="md:col-span-2 lg:col-span-3">
+          <SectionTitle>Presupuestos (progreso por categoría)</SectionTitle>
+          <div className="grid gap-3 md:grid-cols-2 lg:grid-cols-3">
+            {cats.map((c) => (
+              <div key={c} className="border rounded-xl p-3">
+                <div className="flex justify-between text-sm mb-1">
+                  <span className="font-medium">{c}</span>
+                  <span>
+                    <Money n={catSpend[c].spent} /> /{' '}
+                    <Money n={data.budgets?.[c] || 0} />
+                  </span>
+                </div>
+                <Progress value={catSpend[c].pct} />
               </div>
-              <Progress value={catSpend[c].pct} />
-            </div>
-          ))}
-        </div>
-      </Card>
+            ))}
+          </div>
+        </Card>
+      )}
 
-      <Card>
-        <SectionTitle>Inversiones</SectionTitle>
-        <div className="space-y-2">
-          <div className="flex justify-between">
-            <span>Contribuido</span>
-            <strong>
-              <Money n={invTotals.contrib} />
-            </strong>
-          </div>
-          <div className="flex justify-between">
-            <span>Valor actual</span>
-            <strong>
-              <Money n={invTotals.current} />
-            </strong>
-          </div>
-          <div>
-            <div className="text-sm mb-1">ROI (%)</div>
-            <Progress value={Math.max(0, Math.min(100, invROI + 50))} />
-            <div className="text-xs text-gray-600 mt-1">
-              ROI real: {invROI.toFixed(2)}%
-            </div>
-          </div>
+{showInversiones && (
+  <Card>
+    <SectionTitle>Inversiones</SectionTitle>
+    <div className="space-y-2">
+      <div className="flex justify-between">
+        <span>Contribuido</span>
+        <strong>
+          <Money n={invTotals.contrib} />
+        </strong>
+      </div>
+      <div className="flex justify-between">
+        <span>Valor actual</span>
+        <strong>
+          <Money n={invTotals.current} />
+        </strong>
+      </div>
+      <div>
+        <div className="text-sm mb-1">ROI (%)</div>
+        <Progress value={invProgress} />
+        <div className="text-xs text-gray-600 mt-1">
+          ROI real: {invROI.toFixed(2)}%
         </div>
-      </Card>
+      </div>
+    </div>
+  </Card>
+)}
     </div>
   );
 }
 
 function formatAmountCLP(raw) {
-  const digits = String(raw).replace(/\D/g, ''); // dejar solo números
+  const digits = String(raw).replace(/\D/g, '');
   if (!digits) return '';
   const n = Number(digits);
   return n.toLocaleString('es-CL', { minimumFractionDigits: 0 });
@@ -872,23 +1049,52 @@ function parseAmountCLP(formatted) {
   return Number(digits || 0);
 }
 
+function Transactions({
+  data,
+  actions,
+  activeUser,
+  monthKeyStr,
+  superAdminEmail,
+  budgetCutDay,
+}) {
+  const cats =
+    data.categories && data.categories.length ? data.categories : CATEGORIES;
 
-function Transactions({ data, actions, user }) {
-  const cats = data.categories && data.categories.length
-  ? data.categories
-  : CATEGORIES;
+  const prefs = activeUser?.preferences || {};
+  const txDefaults = prefs.transactionsDefaults || {};
 
   const [form, setForm] = useState({
     date: new Date().toISOString().slice(0, 10),
-    type: 'gasto',
+    type: txDefaults.type || 'gasto',
     amount: '',
-    category: CATEGORIES[0],
+    category: txDefaults.defaultCategory || CATEGORIES[0],
     note: '',
-    user: user?.email || 'Usuario',
+    user: activeUser?.name || superAdminEmail || 'Usuario',
   });
-  const mk = monthKey();
+
+  useEffect(() => {
+    const newPrefs = activeUser?.preferences || {};
+    const newDefaults = newPrefs.transactionsDefaults || {};
+    setForm((prev) => ({
+      ...prev,
+      type: newDefaults.type || 'gasto',
+      category: newDefaults.defaultCategory || cats[0] || CATEGORIES[0],
+      user:
+        activeUser?.name ||
+        superAdminEmail ||
+        prev.user ||
+        'Usuario',
+    }));
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeUser?.id, superAdminEmail, cats]);
+
+  const mk = monthKeyStr;
+  const { start, end } = getBudgetPeriod(mk, budgetCutDay || 1);
   const monthTx = [...data.transactions]
-    .filter((t) => (t.date || '').startsWith(mk))
+    .filter((t) => {
+      const d = t.date || '';
+      return d >= start && d < end;
+    })
     .sort((a, b) => (b.date || '').localeCompare(a.date || ''));
 
   async function addTx(e) {
@@ -899,7 +1105,7 @@ function Transactions({ data, actions, user }) {
       createdAt: Date.now(),
     };
     await actions.addTransaction(tx);
-    setForm({ ...form, amount: '', note: '' });
+    setForm((prev) => ({ ...prev, amount: '', note: '' }));
   }
 
   const totals = useMemo(() => {
@@ -954,28 +1160,26 @@ function Transactions({ data, actions, user }) {
             </div>
           )}
           <div className="grid gap-1">
-  <label className="text-sm">Monto (CLP)</label>
-  <input
-    type="text"
-    className="border rounded-lg p-2"
-    value={form.amount}
-    onChange={(e) =>
-      setForm({
-        ...form,
-        amount: formatAmountCLP(e.target.value),
-      })
-    }
-    required
-  />
-</div>
+            <label className="text-sm">Monto (CLP)</label>
+            <input
+              type="text"
+              className="border rounded-lg p-2"
+              value={form.amount}
+              onChange={(e) =>
+                setForm({
+                  ...form,
+                  amount: formatAmountCLP(e.target.value),
+                })
+              }
+              required
+            />
+          </div>
 
           <div className="grid gap-1">
             <label className="text-sm">Persona</label>
-            <input
-              className="border rounded-lg p-2"
-              value={form.user}
-              onChange={(e) => setForm({ ...form, user: e.target.value })}
-            />
+            <div className="border rounded-lg p-2 bg-gray-50 dark:bg-gray-900 text-sm">
+              {form.user}
+            </div>
           </div>
           <div className="grid gap-1">
             <label className="text-sm">Nota (opcional)</label>
@@ -992,13 +1196,13 @@ function Transactions({ data, actions, user }) {
 
         <div className="mt-4 text-sm space-y-1">
           <div className="flex justify-between">
-            <span>Ingresos del mes</span>
+            <span>Ingresos del periodo</span>
             <strong>
               <Money n={totals.ing} />
             </strong>
           </div>
           <div className="flex justify-between">
-            <span>Gastos del mes</span>
+            <span>Gastos del periodo</span>
             <strong>
               <Money n={totals.gas} />
             </strong>
@@ -1013,14 +1217,17 @@ function Transactions({ data, actions, user }) {
               <Money n={totals.bal} />
             </strong>
           </div>
+          <div className="text-xs text-gray-500">
+  Período: {formatBudgetPeriodLabel(mk, budgetCutDay || 1)} (día de corte {budgetCutDay})
+</div>
         </div>
       </Card>
 
       <Card className="lg:col-span-2">
-        <SectionTitle>Movimientos del mes</SectionTitle>
+        <SectionTitle>Movimientos del periodo</SectionTitle>
         <div className="overflow-auto max-h-[60vh]">
           <table className="w-full text-sm">
-            <thead className="sticky top-0 bg-white">
+            <thead className="sticky top-0 bg-white dark:bg-gray-800">
               <tr>
                 <th className="text-left p-2">Fecha</th>
                 <th className="text-left p-2">Tipo</th>
@@ -1057,7 +1264,7 @@ function Transactions({ data, actions, user }) {
               {monthTx.length === 0 && (
                 <tr>
                   <td colSpan={7} className="p-4 text-center text-gray-500">
-                    Sin movimientos este mes.
+                    Sin movimientos en este periodo.
                   </td>
                 </tr>
               )}
@@ -1069,23 +1276,31 @@ function Transactions({ data, actions, user }) {
   );
 }
 
-function Budgets({ data, actions }) {
-  const cats = data.categories && data.categories.length
-  ? data.categories
-  : CATEGORIES;
+function Budgets({ data, actions, monthKeyStr }) {
+  const cats =
+    data.categories && data.categories.length ? data.categories : CATEGORIES;
 
-  const mk = monthKey();
-  const monthTx = data.transactions.filter((t) =>
-    (t.date || '').startsWith(mk)
-  );
+  const mk = monthKeyStr;
+  const { start, end } = getBudgetPeriod(mk, data.budgetCutDay || 1);
+
+  const [viewMode, setViewMode] = useState('amount');
+
+  const monthTx = data.transactions.filter((t) => {
+    const d = t.date || '';
+    return d >= start && d < end;
+  });
+
   const rows = cats.map((c) => {
     const spent = monthTx
       .filter((t) => t.type === 'gasto' && t.category === c)
       .reduce((a, b) => a + Number(b.amount || 0), 0);
     const budget = data.budgets?.[c] || 0;
+    const remaining = budget - spent;
     const pct = budget > 0 ? (spent / budget) * 100 : 0;
-    return { c, spent, budget, pct };
+    const pctRemaining = budget > 0 ? Math.max(0, 100 - pct) : 0;
+    return { c, spent, budget, remaining, pct, pctRemaining };
   });
+
   const totalBudget = rows.reduce((a, r) => a + r.budget, 0);
   const totalSpent = rows.reduce((a, r) => a + r.spent, 0);
   const totalPct = totalBudget > 0 ? (totalSpent / totalBudget) * 100 : 0;
@@ -1093,7 +1308,21 @@ function Budgets({ data, actions }) {
   return (
     <div className="grid gap-4 lg:grid-cols-3">
       <Card className="lg:col-span-2">
-        <SectionTitle>Presupuestos por categoría</SectionTitle>
+        <SectionTitle
+          right={
+            <button
+              className="px-3 py-1.5 rounded-full border text-sm"
+              onClick={() =>
+                setViewMode(viewMode === 'amount' ? 'percent' : 'amount')
+              }
+            >
+              {viewMode === 'amount' ? 'Ver porcentaje' : 'Ver cantidad'}
+            </button>
+          }
+        >
+          Presupuestos por categoría
+        </SectionTitle>
+
         <div className="space-y-3">
           {rows.map((r) => (
             <div key={r.c} className="border rounded-xl p-3">
@@ -1102,7 +1331,16 @@ function Budgets({ data, actions }) {
                   <div className="flex justify-between text-sm mb-1">
                     <span className="font-medium">{r.c}</span>
                     <span>
-                      <Money n={r.spent} /> / <Money n={r.budget} />
+                      {viewMode === 'amount' ? (
+                        <>
+                          <Money n={r.spent} /> / <Money n={r.remaining} />
+                        </>
+                      ) : (
+                        <>
+                          {r.budget > 0 ? r.pct.toFixed(0) : 0}% /{' '}
+                          {r.budget > 0 ? r.pctRemaining.toFixed(0) : 0}%
+                        </>
+                      )}
                     </span>
                   </div>
                   <Progress value={r.pct} />
@@ -1142,6 +1380,9 @@ function Budgets({ data, actions }) {
           <div>
             <div className="text-sm mb-1">% total usado</div>
             <Progress value={totalPct} />
+          </div>
+          <div className="text-xs text-gray-500">
+            Día de corte del mes: {data.budgetCutDay}
           </div>
         </div>
       </Card>
@@ -1298,6 +1539,7 @@ function Debts({ data, actions }) {
 
 function Savings({ data, actions }) {
   const [form, setForm] = useState({ name: '', goal: '', saved: '' });
+
   async function addSaving(e) {
     e.preventDefault();
     const s = {
@@ -1309,6 +1551,7 @@ function Savings({ data, actions }) {
     await actions.addSaving(s);
     setForm({ name: '', goal: '', saved: '' });
   }
+
   return (
     <div className="grid gap-4 lg:grid-cols-3">
       <Card>
@@ -1412,6 +1655,7 @@ function Savings({ data, actions }) {
 
 function Investments({ data, actions }) {
   const [form, setForm] = useState({ name: '', contributed: '', current: '' });
+
   async function addInv(e) {
     e.preventDefault();
     const i = {
@@ -1423,6 +1667,7 @@ function Investments({ data, actions }) {
     await actions.addInvestment(i);
     setForm({ name: '', contributed: '', current: '' });
   }
+
   return (
     <div className="grid gap-4 lg:grid-cols-3">
       <Card>
@@ -1520,270 +1765,704 @@ function Investments({ data, actions }) {
   );
 }
 
-function Settings({ data, householdId, user, categories, actions }) {
-  const [households, setHouseholds] = useState([]);
-  const [loading, setLoading] = useState(false);
-  const [selectedId, setSelectedId] = useState(householdId || null);
+function Settings({
+  data,
+  householdId,
+  user,
+  categories,
+  actions,
+  activeHouseholdUser,
+}) {
   const [newCategory, setNewCategory] = useState('');
+  const [showUserModal, setShowUserModal] = useState(false);
+  const [userForm, setUserForm] = useState({
+    id: null,
+    name: '',
+    pin: '',
+    isSuperAdmin: false,
+    adminPin: '',
+  });
+
+  const cats = categories && categories.length ? categories : CATEGORIES;
+const users = Array.isArray(data.householdUsers) ? data.householdUsers : [];
+
+// Solo es super admin si el usuario de la casa seleccionado tiene isSuperAdmin = true
+const isSuperAdmin = !!activeHouseholdUser?.isSuperAdmin;
 
 
+  const superAdminUser = users.find((u) => u.isSuperAdmin) || null;
+  const familyUsers = users.filter((u) => !u.isSuperAdmin);
+
+  function displayName(u) {
+    if (u.name && u.name.trim()) return u.name.trim();
+    if (u.isSuperAdmin && data.superAdminEmail) return data.superAdminEmail;
+    return u.isSuperAdmin ? 'Administrador' : 'Usuario';
+  }
+
+  function startCreateUser() {
+    setUserForm({
+      id: null,
+      name: '',
+      pin: '',
+      isSuperAdmin: false,
+      adminPin: '',
+    });
+    setShowUserModal(true);
+  }
+
+  function startEditUser(u) {
+    setUserForm({
+      id: u.id,
+      name: u.name || '',
+      pin: u.pin || '',
+      isSuperAdmin: !!u.isSuperAdmin,
+      adminPin: '',
+    });
+    setShowUserModal(true);
+  }
+
+  async function handleSaveUser(e) {
+    e.preventDefault();
+    const trimmedName = userForm.name.trim();
+    const pin = (userForm.pin || '').trim();
+
+    if (!trimmedName && !userForm.isSuperAdmin) return;
+
+    const currentSuper = superAdminUser;
+    const hasFamily = familyUsers.length > 0;
+
+    if (userForm.isSuperAdmin) {
+      if (!currentSuper) {
+        alert(
+          'No se encontró al administrador del hogar. Revisa tus datos en Firestore.'
+        );
+        return;
+      }
+
+      if (hasFamily && !pin) {
+        alert(
+          'Hay usuarios familiares configurados. El administrador debe tener un PIN y no puede dejarlo en blanco.'
+        );
+        return;
+      }
+
+      await actions.updateHouseholdUser(userForm.id, {
+        name: trimmedName,
+        pin,
+      });
+
+      setShowUserModal(false);
+      setUserForm({
+        id: null,
+        name: '',
+        pin: '',
+        isSuperAdmin: false,
+        adminPin: '',
+      });
+
+      return;
+    }
+
+    const isNew = !userForm.id;
+
+    if (!currentSuper) {
+      alert(
+        'No se puede crear un usuario familiar porque no existe un administrador definido.'
+      );
+      return;
+    }
+
+    if (isNew && !currentSuper.pin) {
+      alert(
+        'Antes de crear el primer usuario familiar debes definir un PIN para el administrador.'
+      );
+      setShowUserModal(false);
+      setTimeout(() => {
+        setUserForm({
+          id: currentSuper.id,
+          name: currentSuper.name || '',
+          pin: '',
+          isSuperAdmin: true,
+          adminPin: '',
+        });
+        setShowUserModal(true);
+      }, 0);
+      return;
+    }
+
+    if (isNew) {
+      const adminPinInput = (userForm.adminPin || '').trim();
+
+      if (!adminPinInput) {
+        alert(
+          'Debes ingresar el PIN del administrador para crear un usuario familiar.'
+        );
+        return;
+      }
+
+      if (adminPinInput !== currentSuper.pin) {
+        alert('PIN de administrador incorrecto. No se creó el usuario.');
+        return;
+      }
+
+      await actions.addHouseholdUser({
+        name: trimmedName,
+        pin,
+        isSuperAdmin: false,
+      });
+    } else {
+      await actions.updateHouseholdUser(userForm.id, {
+        name: trimmedName,
+        pin,
+      });
+    }
+
+    setShowUserModal(false);
+    setUserForm({
+      id: null,
+      name: '',
+      pin: '',
+      isSuperAdmin: false,
+      adminPin: '',
+    });
+  }
+
+  // --- Preferencias personales por usuario de la casa ---
+  const [prefs, setPrefs] = useState(() => {
+    const base = activeHouseholdUser?.preferences || {};
+    return {
+      defaultTab: base.defaultTab || 'dashboard',
+      showOnlyMyMovements: false,
+    dashboardCards: {
+      resumenMes: base.dashboardCards?.resumenMes ?? true,
+      deudas: base.dashboardCards?.deudas ?? true,
+      ahorro: base.dashboardCards?.ahorro ?? true,
+      inversiones: base.dashboardCards?.inversiones ?? true,
+      presupuestos: base.dashboardCards?.presupuestos ?? true,
+    },
+      transactionsDefaults: {
+        type: base.transactionsDefaults?.type || 'gasto',
+        defaultCategory:
+          base.transactionsDefaults?.defaultCategory || cats[0] || CATEGORIES[0],
+      },
+      ui: {
+        theme: base.ui?.theme || 'light',
+        density: base.ui?.density || 'normal',
+      },
+    };
+  });
 
   useEffect(() => {
-    async function loadHouseholds() {
-      if (!user) return;
-      setLoading(true);
-      try {
-        // leer perfil del usuario
-        const profRef = doc(db, 'profiles', user.uid);
-        const profSnap = await getDoc(profRef);
-        const hIds = profSnap.exists()
-          ? profSnap.data().householdIds || []
-          : [];
+    const base = activeHouseholdUser?.preferences || {};
+    setPrefs({
+      defaultTab: base.defaultTab || 'dashboard',
+    showOnlyMyMovements: false,
+    dashboardCards: {
+      resumenMes: base.dashboardCards?.resumenMes ?? true,
+      deudas: base.dashboardCards?.deudas ?? true,
+      ahorro: base.dashboardCards?.ahorro ?? true,
+      inversiones: base.dashboardCards?.inversiones ?? true,
+      presupuestos: base.dashboardCards?.presupuestos ?? true,
+    },
+      transactionsDefaults: {
+        type: base.transactionsDefaults?.type || 'gasto',
+        defaultCategory:
+          base.transactionsDefaults?.defaultCategory || cats[0] || CATEGORIES[0],
+      },
+      ui: {
+        theme: base.ui?.theme || 'light',
+        density: base.ui?.density || 'normal',
+      },
+    });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeHouseholdUser?.id, cats.join('|')]);
 
-        if (!hIds.length) {
-          setHouseholds([]);
-          setLoading(false);
-          return;
-        }
-
-        // leer cada household
-        const snaps = await Promise.all(
-          hIds.map((id) => getDoc(doc(db, 'households', id)))
-        );
-
-        const list = snaps
-          .filter((s) => s.exists())
-          .map((s) => ({
-            id: s.id,
-            ...s.data(),
-          }));
-
-        setHouseholds(list);
-
-        // si no hay seleccionado aún, usar el actual
-        if (!selectedId && householdId) setSelectedId(householdId);
-      } catch (e) {
-        console.error('Error cargando hogares:', e);
-      } finally {
-        setLoading(false);
-      }
-    }
-
-    loadHouseholds();
-  }, [user, householdId, selectedId]);
-
-  const selectedHousehold = households.find((h) => h.id === selectedId) || null;
-
-  async function handleDeleteHousehold(id) {
-    if (!user) return;
-  
-    const ok = window.confirm(
-      '¿Seguro que quieres eliminar este hogar? Esta acción no se puede deshacer.'
-    );
-    if (!ok) return;
-  
-    try {
-      const hhRef = doc(db, 'households', id);
-  
-      // 1) Intentar borrar el hogar
-      try {
-        await deleteDoc(hhRef);
-      } catch (e) {
-        console.error('Error al borrar doc households:', e);
-        // si es problema de permisos, igual seguimos y al menos lo sacamos del perfil
-      }
-  
-      // 2) Quitar referencia del perfil (si existe)
-      const profRef = doc(db, 'profiles', user.uid);
-      try {
-        await updateDoc(profRef, {
-          householdIds: arrayRemove(id),
-        });
-      } catch (e) {
-        console.error('Error al actualizar perfil:', e);
-        // si falla updateDoc porque no existe, usamos setDoc merge
-        await setDoc(
-          profRef,
-          {
-            householdIds: [],
-          },
-          { merge: true }
-        );
-      }
-  
-      // 3) Actualizar estado local
-      setHouseholds((prev) => prev.filter((h) => h.id !== id));
-      if (selectedId === id) setSelectedId(null);
-    } catch (e) {
-      console.error('Error eliminando hogar:', e);
-      alert('No se pudo eliminar el hogar. Revisa la consola.');
-    }
+  async function handleSavePreferences(e) {
+    e.preventDefault();
+    if (!activeHouseholdUser) return;
+    await actions.updateHouseholdUser(activeHouseholdUser.id, {
+      preferences: prefs,
+    });
+    alert('Preferencias guardadas.');
   }
-  
-  const cats = categories && categories.length ? categories : CATEGORIES;
 
   return (
-    <div className="grid gap-4 md:grid-cols-2">
-      <Card>
-        <SectionTitle>Hogares vinculados a tu cuenta</SectionTitle>
-        {loading && <div className="text-sm text-gray-600">Cargando…</div>}
-        {!loading && households.length === 0 && (
-          <div className="text-sm text-gray-600">
-            No tienes hogares registrados aún.
-          </div>
-        )}
-        {!loading && households.length > 0 && (
-          <div className="flex flex-col gap-2">
-            <div className="text-sm text-gray-600">
-              Selecciona un hogar para ver sus montos:
-            </div>
-            <select
-              className="border rounded-lg p-2"
-              value={selectedId || ''}
-              onChange={(e) => setSelectedId(e.target.value || null)}
-            >
-              <option value="">— Selecciona un hogar —</option>
-              {households.map((h) => (
-                <option key={h.id} value={h.id}>
-                  {h.id}{' '}
-                  {h.memberInfo
-                    ? `· ${Object.values(h.memberInfo)
-                        .map((m) => m.name)
-                        .join(', ')}`
-                    : ''}
-                </option>
-              ))}
-            </select>
+    <>
+      <div className="grid gap-4 md:grid-cols-2">
+        {/* Columna izquierda: sólo super admin ve Usuarios y Día de corte */}
+        <div className="space-y-4">
+          {isSuperAdmin && (
+            <Card>
+              <SectionTitle
+                right={
+                  isSuperAdmin && (
+                    <button
+                      className="px-3 py-1.5 rounded-full border text-sm"
+                      onClick={startCreateUser}
+                    >
+                      + Agregar
+                    </button>
+                  )
+                }
+              >
+                Usuarios de la casa
+              </SectionTitle>
 
-            {selectedHousehold && (
-              <div className="mt-3 border rounded-xl p-3 text-sm">
-                <div className="font-medium mb-1">
-                  Código hogar: {selectedHousehold.id}
+              {users.length === 0 && (
+                <div className="text-sm text-gray-600">
+                  Aún no hay usuarios configurados. Usa “Agregar” para crear los
+                  integrantes de la casa.
                 </div>
-                <div className="text-gray-700 mb-2">
-                  <div className="font-semibold mb-1">
-                    Presupuestos por categoría:
-                  </div>
-                  <ul className="list-disc pl-5">
-                    {Object.entries(
-                      selectedHousehold.budgets || {}
-                    ).map(([cat, val]) => (
-                      <li key={cat}>
-                        {cat}: <Money n={val} />
-                      </li>
-                    ))}
-                    {(!selectedHousehold.budgets ||
-                      Object.keys(selectedHousehold.budgets).length === 0) && (
-                      <li className="text-gray-500">
-                        Sin presupuestos configurados.
-                      </li>
-                    )}
-                  </ul>
+              )}
+
+              {users.length > 0 && (
+                <ul className="mt-3 space-y-2 text-sm">
+                  {users.map((u) => (
+                    <li
+                      key={u.id}
+                      className="flex items-center justify-between border rounded-lg px-3 py-2"
+                    >
+                      <div>
+                        <div className="font-medium">
+                          {displayName(u)}{' '}
+                          {u.isSuperAdmin && (
+                            <span className="text-xs text-gray-500">
+                              (Admin)
+                            </span>
+                          )}
+                        </div>
+                        <div className="text-xs text-gray-500">
+                          {u.isSuperAdmin && data.superAdminEmail && (
+                            <span className="block">
+                              Correo: {data.superAdminEmail}
+                            </span>
+                          )}
+                          PIN:{' '}
+                          {u.pin
+                            ? '••••'
+                            : u.isSuperAdmin
+                            ? 'Sin PIN (debes configurarlo si hay familiares)'
+                            : 'Sin PIN (entra solo seleccionando el usuario)'}
+                        </div>
+                      </div>
+                      <div className="flex gap-2">
+                        <button
+                          type="button"
+                          className="text-xs text-blue-600"
+                          onClick={() => startEditUser(u)}
+                        >
+                          Editar
+                        </button>
+                        {!u.isSuperAdmin && (
+                          <button
+                            type="button"
+                            className="text-xs text-red-600"
+                            onClick={async () => {
+                              const ok = window.confirm(
+                                `¿Eliminar al usuario "${displayName(u)}"?`
+                              );
+                              if (!ok) return;
+                              await actions.removeHouseholdUser(u.id);
+                            }}
+                          >
+                            Eliminar
+                          </button>
+                        )}
+                      </div>
+                    </li>
+                  ))}
+                </ul>
+              )}
+            </Card>
+          )}
+
+          {isSuperAdmin && (
+            <Card>
+              <SectionTitle>Día de corte del mes</SectionTitle>
+              <form
+                className="grid gap-3"
+                onSubmit={async (e) => {
+                  e.preventDefault();
+                  const formData = new FormData(e.currentTarget);
+                  const day = formData.get('cut-day') || data.budgetCutDay || 1;
+                  await actions.setBudgetCutDay(day);
+                  alert('Día de corte actualizado.');
+                }}
+              >
+                <div className="grid gap-1">
+                  <label className="text-sm">
+                    Día (1 al 28 recomendado por meses cortos)
+                  </label>
+                  <input
+                    type="number"
+                    name="cut-day"
+                    min={1}
+                    max={28}
+                    defaultValue={data.budgetCutDay || 1}
+                    className="border rounded-lg p-2 w-32"
+                  />
+                  <p className="text-xs text-gray-500">
+                    El presupuesto se calculará desde ese día de un mes hasta el
+                    día anterior del mes siguiente.
+                  </p>
                 </div>
-                <button
-                  className="px-3 py-2 rounded-xl border border-red-500 text-red-600 text-sm"
-                  onClick={() => handleDeleteHousehold(selectedHousehold.id)}
-                >
-                  Eliminar este hogar
+                <button className="px-3 py-2 rounded-xl border bg-gray-900 text-white text-sm">
+                  Guardar día de corte
                 </button>
-              </div>
+              </form>
+            </Card>
+          )}
+
+          <Card>
+            <SectionTitle>Preferencias personales</SectionTitle>
+            {!activeHouseholdUser && (
+              <p className="text-sm text-gray-600">
+                Primero selecciona quién está usando la app para configurar sus
+                preferencias.
+              </p>
             )}
-          </div>
-        )}
-      </Card>
 
-      <Card>
-        <SectionTitle>Categorías</SectionTitle>
+            {activeHouseholdUser && (
+              <form
+                className="grid gap-3 mt-2"
+                onSubmit={handleSavePreferences}
+                autoComplete="off"
+              >
+                <div className="grid gap-1">
+                  <label className="text-sm">Configurando a</label>
+                  <div className="border rounded-lg p-2 bg-gray-50 dark:bg-gray-900 text-sm">
+                    {displayName(activeHouseholdUser)}
+                  </div>
+                </div>
 
-        {/* Formulario para agregar categoría */}
-        <form
-          className="flex gap-2 mt-2"
-          onSubmit={async (e) => {
-            e.preventDefault();
-            const name = newCategory.trim();
-            if (!name) return;
-            await actions.addCategory(name);
-            setNewCategory('');
-          }}
-        >
-          <input
-            className="border rounded-lg p-2 flex-1"
-            placeholder="Nueva categoría (ej. Mascotas)"
-            value={newCategory}
-            onChange={(e) => setNewCategory(e.target.value)}
-          />
-          <button
-            type="submit"
-            className="px-3 py-2 rounded-xl border bg-gray-900 text-white text-sm"
+                <div className="border rounded-xl p-3">
+                  <div className="font-medium text-sm mb-2">
+                    Valores por defecto al crear movimiento
+                  </div>
+                  <div className="grid gap-2 text-sm">
+                    <div className="grid gap-1">
+                      <label>Tipo por defecto</label>
+                      <select
+                        className="border rounded-lg p-2"
+                        value={prefs.transactionsDefaults.type}
+                        onChange={(e) =>
+                          setPrefs((prev) => ({
+                            ...prev,
+                            transactionsDefaults: {
+                              ...prev.transactionsDefaults,
+                              type: e.target.value,
+                            },
+                          }))
+                        }
+                      >
+                        <option value="gasto">Gasto</option>
+                        <option value="ingreso">Ingreso</option>
+                      </select>
+                    </div>
+                    <div className="grid gap-1">
+                      <label>Categoría por defecto (para gasto)</label>
+                      <select
+                        className="border rounded-lg p-2"
+                        value={prefs.transactionsDefaults.defaultCategory}
+                        onChange={(e) =>
+                          setPrefs((prev) => ({
+                            ...prev,
+                            transactionsDefaults: {
+                              ...prev.transactionsDefaults,
+                              defaultCategory: e.target.value,
+                            },
+                          }))
+                        }
+                      >
+                        {cats.map((c) => (
+                          <option key={c} value={c}>
+                            {c}
+                          </option>
+                        ))}
+                      </select>
+                    </div>
+                  </div>
+                </div>
+
+                <div className="border rounded-xl p-3">
+                  <div className="font-medium text-sm mb-2">Aspecto</div>
+                  <div className="grid gap-2 text-sm">
+                    <div className="grid gap-1">
+                      <label>Tema</label>
+                      <select
+                        className="border rounded-lg p-2"
+                        value={prefs.ui.theme}
+                        onChange={(e) =>
+                          setPrefs((prev) => ({
+                            ...prev,
+                            ui: { ...prev.ui, theme: e.target.value },
+                          }))
+                        }
+                      >
+                        <option value="light">Claro</option>
+                        <option value="dark">Oscuro</option>
+                      </select>
+                    </div>
+                    <div className="grid gap-1">
+                      <label>Densidad</label>
+                      <select
+                        className="border rounded-lg p-2"
+                        value={prefs.ui.density}
+                        onChange={(e) =>
+                          setPrefs((prev) => ({
+                            ...prev,
+                            ui: { ...prev.ui, density: e.target.value },
+                          }))
+                        }
+                      >
+                        <option value="normal">Normal</option>
+                        <option value="compact">Compacta (más filas)</option>
+                      </select>
+                    </div>
+                  </div>
+                </div>
+
+                <div className="flex justify-end gap-2 mt-2">
+                  <button
+                    type="submit"
+                    className="px-3 py-1.5 text-sm border rounded-lg bg-gray-900 text-white"
+                  >
+                    Guardar preferencias
+                  </button>
+                </div>
+              </form>
+            )}
+          </Card>
+        </div>
+
+        {/* Columna derecha: categorías (visible para todos) */}
+        <Card>
+          <SectionTitle>Categorías</SectionTitle>
+
+          <form
+            className="flex gap-2 mt-2"
+            onSubmit={async (e) => {
+              e.preventDefault();
+              const name = newCategory.trim();
+              if (!name) return;
+              await actions.addCategory(name);
+              setNewCategory('');
+            }}
           >
-            Agregar
-          </button>
-        </form>
-
-
-        {/* Listado con opción de eliminar */}
-                {/* Listado con opción de eliminar */}
-                <ul className="list-disc pl-6 mt-4 text-sm space-y-2">
-          {cats.map((c) => (
-            <li
-              key={c}
-              className="flex items-center justify-between gap-2"
+            <input
+              className="border rounded-lg p-2 flex-1"
+              placeholder="Nueva categoría (ej. Mascotas)"
+              value={newCategory}
+              onChange={(e) => setNewCategory(e.target.value)}
+            />
+            <button
+              type="submit"
+              className="px-3 py-2 rounded-xl border bg-gray-900 text-white text-sm"
             >
-              <span>{c}</span>
-              <div className="flex flex-col gap-1 sm:flex-row">
+              Agregar
+            </button>
+          </form>
+
+          <ul className="list-disc pl-6 mt-4 text-sm space-y-2">
+            {cats.map((c) => (
+              <li
+                key={c}
+                className="flex items-center justify-between gap-2"
+              >
+                <span>{c}</span>
+                <div className="flex flex-col gap-1 sm:flex-row">
+                  <button
+                    type="button"
+                    className="text-xs text-blue-600"
+                    onClick={async () => {
+                      const nuevo = window.prompt(
+                        `Nuevo nombre para la categoría "${c}"`,
+                        c
+                      );
+                      if (!nuevo) return;
+                      await actions.renameCategory(c, nuevo);
+                    }}
+                  >
+                    Renombrar
+                  </button>
+                  <button
+                    type="button"
+                    className="text-xs text-red-600"
+                    onClick={async () => {
+                      const ok = window.confirm(
+                        `¿Eliminar la categoría "${c}"? Los presupuestos de esa categoría se perderán.`
+                      );
+                      if (!ok) return;
+                      await actions.removeCategory(c);
+                    }}
+                  >
+                    Eliminar
+                  </button>
+                </div>
+              </li>
+            ))}
+          </ul>
+        </Card>
+      </div>
+
+      {/* Modal flotante para crear/editar usuario */}
+      {isSuperAdmin && showUserModal && (
+        <div className="fixed inset-0 z-30 flex items-center justify-center bg-black/40">
+          <div className="bg-white dark:bg-gray-800 rounded-2xl shadow-lg p-6 w-full max-w-md">
+            <h3 className="text-lg font-semibold mb-3">
+              {userForm.isSuperAdmin
+                ? 'Editar administrador'
+                : userForm.id
+                ? 'Editar usuario'
+                : 'Nuevo usuario'}
+            </h3>
+            <form
+              className="grid gap-3"
+              onSubmit={handleSaveUser}
+              autoComplete="off"
+            >
+              {userForm.isSuperAdmin && (
+                <div className="grid gap-1">
+                  <label className="text-sm">Correo (no editable)</label>
+                  <input
+                    className="border rounded-lg p-2 bg-gray-100 dark:bg-gray-900 text-gray-600"
+                    value={data.superAdminEmail || ''}
+                    readOnly
+                  />
+                </div>
+              )}
+
+              <div className="grid gap-1">
+                <label className="text-sm">
+                  {userForm.isSuperAdmin ? 'Nombre (opcional)' : 'Nombre'}
+                </label>
+                <input
+                  className="border rounded-lg p-2"
+                  value={userForm.name}
+                  onChange={(e) =>
+                    setUserForm((prev) => ({
+                      ...prev,
+                      name: e.target.value,
+                    }))
+                  }
+                  required={!userForm.isSuperAdmin}
+                />
+              </div>
+
+              <div className="grid gap-1">
+                <label className="text-sm">
+                  PIN{' '}
+                  {userForm.isSuperAdmin && familyUsers.length > 0 && '(obligatorio)'}
+                </label>
+                <input
+  className="border rounded-lg p-2"
+  type="text"
+  inputMode="numeric"
+  pattern="\d*"
+  name="household-pin"
+  autoComplete="off"
+  data-lpignore="true"
+  data-form-type="other"
+  style={{ WebkitTextSecurity: 'disc' }}
+  value={userForm.pin}
+  onChange={(e) =>
+    setUserForm((prev) => ({
+      ...prev,
+      pin: e.target.value,
+    }))
+  }
+/>
+
+                <p className="text-xs text-gray-500">
+                  {userForm.isSuperAdmin
+                    ? 'El PIN del administrador se usará para autorizar la creación de usuarios familiares y para bloquear el acceso si no se elige editor.'
+                    : 'PIN opcional para este usuario. Si tiene PIN, se pedirá al entrar como este usuario.'}
+                </p>
+              </div>
+
+              {!userForm.isSuperAdmin &&
+                !userForm.id &&
+                superAdminUser &&
+                superAdminUser.pin && (
+                  <div className="grid gap-1">
+                    <label className="text-sm">
+                      PIN del administrador (para autorizar)
+                    </label>
+                    <input
+  className="border rounded-lg p-2"
+  type="text"
+  inputMode="numeric"
+  pattern="\d*"
+  name="admin-authorization-pin"
+  autoComplete="off"
+  data-lpignore="true"
+  data-form-type="other"
+  style={{ WebkitTextSecurity: 'disc' }}
+  value={userForm.adminPin}
+  onChange={(e) =>
+    setUserForm((prev) => ({
+      ...prev,
+      adminPin: e.target.value,
+    }))
+  }
+  required
+/>
+
+                    <p className="text-xs text-gray-500">
+                      Escribe el PIN del administrador del hogar para confirmar la
+                      creación de este usuario familiar.
+                    </p>
+                  </div>
+                )}
+
+              <div className="flex justify-end gap-2 mt-2">
                 <button
                   type="button"
-                  className="text-xs text-blue-600"
-                  onClick={async () => {
-                    const nuevo = window.prompt(
-                      `Nuevo nombre para la categoría "${c}"`,
-                      c
-                    );
-                    if (!nuevo) return;
-                    await actions.renameCategory(c, nuevo);
-                  }}
+                  className="px-3 py-1.5 text-sm border rounded-lg"
+                  onClick={() => setShowUserModal(false)}
                 >
-                  Renombrar
+                  Cancelar
                 </button>
                 <button
-                  type="button"
-                  className="text-xs text-red-600"
-                  onClick={async () => {
-                    const ok = window.confirm(
-                      `¿Eliminar la categoría "${c}"? Los presupuestos de esa categoría se perderán.`
-                    );
-                    if (!ok) return;
-                    await actions.removeCategory(c);
-                  }}
+                  type="submit"
+                  className="px-3 py-1.5 text-sm border rounded-lg bg-gray-900 text-white"
                 >
-                  Eliminar
+                  Guardar
                 </button>
               </div>
-            </li>
-          ))}
-        </ul>
-
-      </Card>
-    </div>
+            </form>
+          </div>
+        </div>
+      )}
+    </>
   );
 }
 
-
 export default function App() {
   const [tab, setTab] = useState('dashboard');
-  const [ctx, setCtx] = useState(null); // { user, householdId }
-  const [selectedHid, setSelectedHid] = useState(null);
+  const [ctx, setCtx] = useState(null);
+  const [selectedMonth, setSelectedMonth] = useState(monthKey());
 
-  // Restaurar hogar previo (si existe)
-  useEffect(() => {
-    const last = localStorage.getItem('lastHouseholdId');
-    if (!selectedHid && last) setSelectedHid(last);
-  }, [selectedHid]);
+  const [selectedHouseholdUserId, setSelectedHouseholdUserId] = useState(
+    () => localStorage.getItem('activeHouseholdUserId') || null
+  );
+  const [showUserSelector, setShowUserSelector] = useState(false);
+  const [loginUserId, setLoginUserId] = useState('');
+  const [loginPin, setLoginPin] = useState('');
+  const [loginError, setLoginError] = useState('');
+  const [useAccountPassword, setUseAccountPassword] = useState(false);
+  const [accountPassword, setAccountPassword] = useState('');
+  const [hasForcedUserSelection, setHasForcedUserSelection] = useState(false);
 
-  // Guardar cuando se seleccione/cambie
+  const selectedHid = ctx?.householdId || null;
+
   useEffect(() => {
-    if (selectedHid) localStorage.setItem('lastHouseholdId', selectedHid);
-  }, [selectedHid]);
+    if (selectedHouseholdUserId) {
+      localStorage.setItem('activeHouseholdUserId', selectedHouseholdUserId);
+    } else {
+      localStorage.removeItem('activeHouseholdUserId');
+    }
+  }, [selectedHouseholdUserId]);
 
   const [authedUser, setAuthedUser] = useState(null);
 
@@ -1792,69 +2471,193 @@ export default function App() {
     return () => unsub();
   }, []);
 
-  // Hook a nivel superior (si no hay householdId, sólo no suscribe)
   const h = useHouseholdData(selectedHid);
+
+  const householdUsers = h.householdUsers || [];
+  const activeUser =
+    householdUsers.find((u) => u.id === selectedHouseholdUserId) || null;
+
+  useEffect(() => {
+    if (!selectedHid) return;
+
+    if (!householdUsers.length) {
+      setShowUserSelector(false);
+      setSelectedHouseholdUserId(null);
+      return;
+    }
+
+    const superAdmin = householdUsers.find((u) => u.isSuperAdmin);
+    const superHasPin =
+      !!(superAdmin && superAdmin.pin && superAdmin.pin.trim());
+
+    if (!superHasPin) {
+      setShowUserSelector(false);
+      const exists = householdUsers.find(
+        (u) => u.id === selectedHouseholdUserId
+      );
+      if (!exists) {
+        setSelectedHouseholdUserId(householdUsers[0].id);
+      }
+      return;
+    }
+
+    if (hasForcedUserSelection) {
+      const exists = householdUsers.find(
+        (u) => u.id === selectedHouseholdUserId
+      );
+      if (!exists) {
+        setShowUserSelector(true);
+        setLoginUserId(
+          (superAdmin && superAdmin.id) || householdUsers[0].id
+        );
+        setLoginPin('');
+        setLoginError('');
+      }
+      return;
+    }
+
+    setShowUserSelector(true);
+    setHasForcedUserSelection(true);
+    setSelectedHouseholdUserId(null);
+    setLoginUserId(
+      (superAdmin && superAdmin.id) || householdUsers[0].id
+    );
+    setLoginPin('');
+    setLoginError('');
+  }, [
+    selectedHid,
+    householdUsers,
+    selectedHouseholdUserId,
+    hasForcedUserSelection,
+  ]);
+
+  async function handleUserLogin(e) {
+    e.preventDefault();
+    setLoginError('');
+  
+    const user = householdUsers.find((u) => u.id === loginUserId);
+    if (!user) {
+      setLoginError('Usuario inválido');
+      return;
+    }
+  
+    // MODO NORMAL: validar PIN
+    if (!useAccountPassword) {
+      if (user.pin && user.pin !== loginPin) {
+        setLoginError('PIN incorrecto');
+        return;
+      }
+    } else {
+      // MODO RECUPERAR PIN (solo super admin, usando contraseña de la cuenta)
+      if (!user.isSuperAdmin) {
+        setLoginError('Solo el administrador puede usar la contraseña de la cuenta.');
+        return;
+      }
+  
+      const current = auth.currentUser;
+      if (!current || !current.email) {
+        setLoginError(
+          'No se pudo validar tu cuenta. Vuelve a iniciar sesión e inténtalo de nuevo.'
+        );
+        return;
+      }
+  
+      if (!accountPassword.trim()) {
+        setLoginError('Escribe la contraseña de tu cuenta.');
+        return;
+      }
+  
+      try {
+        const cred = EmailAuthProvider.credential(
+          current.email,
+          accountPassword.trim()
+        );
+        await reauthenticateWithCredential(current, cred);
+        // Si no lanza error, la contraseña es correcta.
+      } catch (err) {
+        console.error('Error reautenticando:', err);
+        setLoginError('Contraseña de la cuenta incorrecta.');
+        return;
+      }
+    }
+  
+    // Si llegó aquí, pasó la validación (PIN o contraseña)
+    setSelectedHouseholdUserId(user.id);
+    setShowUserSelector(false);
+    setLoginPin('');
+    setAccountPassword('');
+    setUseAccountPassword(false);
+    setLoginError('');
+  }
+  
+
+  async function handleAdminLoginWithPassword(password) {
+    // Usuario actualmente autenticado en Firebase (email/contraseña)
+    if (!authedUser || !authedUser.email) {
+      setLoginError(
+        'Primero debes iniciar sesión con tu email y contraseña.'
+      );
+      return;
+    }
+
+    // Usuario de la casa que es Admin
+    const adminUser = householdUsers.find((u) => u.isSuperAdmin);
+    if (!adminUser) {
+      setLoginError('No hay un administrador configurado en este hogar.');
+      return;
+    }
+
+    try {
+      // Reautenticar con la contraseña de la cuenta
+      const cred = EmailAuthProvider.credential(authedUser.email, password);
+      await reauthenticateWithCredential(authedUser, cred);
+
+      // Si la contraseña es correcta, entramos como Admin ignorando el PIN
+      setSelectedHouseholdUserId(adminUser.id);
+      setShowUserSelector(false);
+      setLoginPin('');
+      setLoginError('');
+    } catch (err) {
+      console.error('Error reautenticando admin:', err);
+      setLoginError('Contraseña incorrecta.');
+    }
+  }
+
+
 
   const handleLogout = async () => {
     await signOut(auth);
     setCtx(null);
-    setSelectedHid(null); // <- importante
+    setSelectedHouseholdUserId(null);
+    setHasForcedUserSelection(false);
     setTab('dashboard');
   };
 
-  if (!ctx)
-    return (
-      <div className="min-h-screen bg-gray-50">
-        <Header
-          currentTab={tab}
-          setTab={setTab}
-          user={authedUser}
-          onLogout={handleLogout}
-          householdId={null}
-        />
-        <AuthGate onReady={(c) => setCtx(c)} />
-        <footer className="text-center text-xs text-gray-500 p-4">
-          V2 · Firebase · Diseñado por un padre de familia
-        </footer>
-      </div>
-    );
+  useEffect(() => {
+    setHasForcedUserSelection(false);
+  }, [selectedHid]);
 
-  // Si hay sesión pero aún no se eligió hogar, muestra el selector
-  if (ctx && !selectedHid) {
-    return (
-      <div className="min-h-screen bg-gray-50">
-        <Header
-          currentTab={'dashboard'}
-          setTab={() => {}}
-          user={ctx.user}
-          onLogout={handleLogout}
-          householdId={null}
-        />
-        <main className="max-w-5xl mx-auto p-4 grid gap-4">
-          <HouseholdPicker
-            user={ctx.user}
-            onEnter={(hid) => {
-              setSelectedHid(hid);
-              setTab('dashboard');
-            }}
-          />
-        </main>
-        <footer className="text-center text-xs text-gray-500 p-4">
-          V2 · Firebase/Firestore en tiempo real
-        </footer>
-      </div>
-    );
-  }
+  const userPrefs = activeUser?.preferences || {};
+  const theme = userPrefs.ui?.theme || 'light';
+  const density = userPrefs.ui?.density || 'normal';
+  const showOnlyMyMovements = !!userPrefs.showOnlyMyMovements;
+
+  const filteredTransactions = useMemo(() => {
+    if (!showOnlyMyMovements || !activeUser?.name) return h.transactions;
+    return h.transactions.filter((t) => t.user === activeUser.name);
+  }, [h.transactions, showOnlyMyMovements, activeUser?.name]);
 
   const data = {
     categories: h.categories,
     budgets: h.budgets,
-    transactions: h.transactions,
+    transactions: filteredTransactions,
     debts: h.debts,
     savings: h.savings,
     investments: h.investments,
+    householdUsers: h.householdUsers,
+    superAdminEmail: h.superAdminEmail,
+    budgetCutDay: h.budgetCutDay,
   };
-
 
   const actions = {
     setBudget: h.setBudget,
@@ -1872,86 +2675,319 @@ export default function App() {
     addCategory: h.addCategory,
     removeCategory: h.removeCategory,
     renameCategory: h.renameCategory,
+    addHouseholdUser: h.addHouseholdUser,
+    updateHouseholdUser: h.updateHouseholdUser,
+    removeHouseholdUser: h.removeHouseholdUser,
+    setBudgetCutDay: h.setBudgetCutDay,
   };
 
+  const superAdminUser =
+    householdUsers.find((u) => u.isSuperAdmin) || null;
+  const superAdminHasPin =
+    !!(superAdminUser && superAdminUser.pin && superAdminUser.pin.trim());
 
+  const hasCtx = !!ctx;
+
+  const headerUser = hasCtx ? ctx.user : authedUser;
+  const headerHouseholdId = hasCtx ? selectedHid : null;
 
   return (
-    <div className="min-h-screen bg-gray-50">
+    <div
+      className={
+        theme === 'dark'
+          ? 'min-h-screen bg-gray-900 text-gray-100'
+          : 'min-h-screen bg-gray-50 dark:bg-gray-900 text-gray-900 dark:text-gray-100'
+      }
+    >
       <Header
         currentTab={tab}
         setTab={setTab}
-        user={ctx.user}
+        user={headerUser}
         onLogout={handleLogout}
-        householdId={selectedHid}
+        householdId={headerHouseholdId}
       />
 
-      <main className="max-w-6xl mx-auto p-4 grid gap-4">
-      {tab === 'dashboard' && (
-          <Dashboard
-            data={{
-              categories: data.categories,
-              budgets: data.budgets,
-              transactions: data.transactions,
-              debts: data.debts,
-              savings: data.savings,
-              investments: data.investments,
-            }}
-          />
-        )}
+      {hasCtx && showUserSelector && (
+        <div className="fixed inset-0 z-20 flex items-center justify-center bg-black/50">
+          <div className="bg-white dark:bg-gray-800 rounded-2xl shadow-lg p-6 w-full max-w-md text-gray-900 dark:text-gray-100">
+            <h2 className="text-lg font-semibold mb-3">
+              ¿Quién está usando la app?
+            </h2>
+            {householdUsers.length === 0 ? (
+              <p className="text-sm text-gray-600">
+                No hay usuarios configurados aún. Ve a Ajustes &gt; Usuarios de la
+                casa para crearlos.
+              </p>
+            ) : (
+              <form
+                className="grid gap-3"
+                onSubmit={handleUserLogin}
+                autoComplete="off"
+              >
 
-{tab === 'transactions' && (
-          <Transactions
-            data={{ transactions: data.transactions, categories: data.categories }}
-            actions={actions}
-            user={ctx.user}
-          />
-        )}
+<div className="grid gap-1">
+                <label className="text-sm">Usuario</label>
+                <select
+                  className="border rounded-lg p-2"
+                  value={loginUserId}
+                  onChange={(e) => {
+                    setLoginUserId(e.target.value);
+                    setLoginError('');
+                    setUseAccountPassword(false);
+                    setAccountPassword('');
+                    setLoginPin('');
+                  }}
+                >
+                  {householdUsers.map((u) => (
+                    <option key={u.id} value={u.id}>
+                      {u.name} {u.isSuperAdmin ? '(Admin)' : ''}
+                    </option>
+                  ))}
+                </select>
+              </div>
 
-{tab === 'budgets' && (
-          <Budgets
-            data={{
-              budgets: data.budgets,
-              transactions: data.transactions,
-              categories: data.categories,
-            }}
-            actions={actions}
-          />
-        )}
-
-        {tab === 'debts' && (
-          <Debts data={{ debts: data.debts }} actions={actions} />
-        )}
-        {tab === 'savings' && (
-          <Savings data={{ savings: data.savings }} actions={actions} />
-        )}
-        {tab === 'investments' && (
-          <Investments
-            data={{ investments: data.investments }}
-            actions={actions}
-          />
-        )}
-                {tab === 'settings' && (
-          <Settings
-            data={{
-              budgets: data.budgets,
-              transactions: data.transactions,
-              debts: data.debts,
-              savings: data.savings,
-              investments: data.investments,
-            }}
-            householdId={selectedHid}
-            user={ctx.user}
-            categories={data.categories}
-            actions={actions}
-          />
-        )}
+              
 
 
+                <div className="grid gap-2">
+  {/* Campo PIN (solo cuando NO usamos contraseña de la cuenta) */}
+  {!useAccountPassword && (
+    <div className="grid gap-1">
+      <label className="text-sm">
+        PIN (si el usuario no tiene PIN, deja en blanco)
+      </label>
+      <input
+  type="text"                // <-- ya no es password
+  inputMode="numeric"
+  pattern="\d*"
+  name="household-pin-login"
+  autoComplete="off"
+  data-lpignore="true"
+  data-form-type="other"
+  className="border rounded-lg p-2"
+  value={loginPin}
+  onChange={(e) => setLoginPin(e.target.value)}
+  placeholder="PIN (si el usuario no tiene PIN, deja en blanco)"
+  style={{ WebkitTextSecurity: 'disc' }}  // <-- se ve como contraseña, pero no lo es
+/>
+
+
+      <p className="text-xs text-gray-500">
+        Si olvidaste tu PIN, pídele ayuda al administrador del hogar.
+      </p>
+    </div>
+  )}
+
+  {/* Modo recuperación: contraseña de la cuenta del admin */}
+  {useAccountPassword && (
+    <div className="grid gap-1">
+      <label className="text-sm">Contraseña de tu cuenta (no el PIN)</label>
+      <input
+        type="password"
+        name="admin-account-password"
+        autoComplete="current-password"
+        className="border rounded-lg p-2"
+        value={accountPassword}
+        onChange={(e) => setAccountPassword(e.target.value)}
+        placeholder="Escribe la contraseña de tu cuenta"
+      />
+      <p className="text-xs text-gray-500">
+        Usaremos tu contraseña de Firebase para confirmar que eres el
+        administrador y dejarte entrar aunque no recuerdes el PIN.
+      </p>
+    </div>
+  )}
+
+  {/* Toggle entre PIN y contraseña de cuenta (solo si el usuario elegido es admin) */}
+  {(() => {
+    const selectedUser = householdUsers.find((u) => u.id === loginUserId);
+    if (!selectedUser || !selectedUser.isSuperAdmin) return null;
+    return (
+      <button
+        type="button"
+        className="text-xs text-blue-600 underline text-left"
+        onClick={() => {
+          setUseAccountPassword((prev) => !prev);
+          setLoginError('');
+        }}
+      >
+        {useAccountPassword
+          ? 'Volver a usar el PIN del admin'
+          : '¿Olvidaste tu PIN de admin? Entra usando tu contraseña de la cuenta.'}
+      </button>
+    );
+  })()}
+</div>
+
+
+                {loginError && (
+                  <div className="text-xs text-red-600">{loginError}</div>
+                )}
+                <div className="flex justify-end gap-2 mt-2">
+                  {superAdminHasPin ? (
+                    <button
+                      type="button"
+                      className="px-3 py-1.5 text-sm border rounded-lg"
+                      onClick={handleLogout}
+                    >
+                      Cerrar sesión
+                    </button>
+                  ) : (
+                    <button
+                      type="button"
+                      className="px-3 py-1.5 text-sm border rounded-lg"
+                      onClick={() => {
+                        setShowUserSelector(false);
+                        setLoginError('');
+                      }}
+                    >
+                      Cancelar
+                    </button>
+                  )}
+                  <button
+                    type="submit"
+                    className="px-3 py-1.5 text-sm border rounded-lg bg-gray-900 text-white"
+                  >
+                    Entrar
+                  </button>
+                </div>
+              </form>
+            )}
+          </div>
+        </div>
+      )}
+
+      <div
+        className={
+          hasCtx && showUserSelector ? 'filter blur-sm pointer-events-none' : ''
+        }
+      >
+{hasCtx && tab !== 'settings' && (
+  <div
+    className={`max-w-6xl mx-auto px-4 mt-2 mb-1 flex items-center justify-between text-sm ${
+      theme === 'dark' ? 'text-gray-100' : 'text-gray-900 dark:text-gray-100'
+    }`}
+  >
+    <div className="flex items-center gap-2">
+      <button
+        className="px-2 py-1 border rounded-lg"
+        onClick={() => setSelectedMonth((prev) => shiftMonth(prev, -1))}
+      >
+        ◀
+      </button>
+      <span className="font-medium">
+        {formatBudgetPeriodLabel(selectedMonth, data.budgetCutDay || 1)}
+      </span>
+      <button
+        className="px-2 py-1 border rounded-lg"
+        onClick={() => setSelectedMonth((prev) => shiftMonth(prev, 1))}
+      >
+        ▶
+      </button>
+    </div>
+    <div className="flex items-center gap-2">
+      <button
+        className="px-2 py-1 border rounded-lg"
+        onClick={() => setSelectedMonth(monthKey())}
+      >
+        Ir a mes actual
+      </button>
+    </div>
+  </div>
+)}
+
+        <main
+          className={`max-w-6xl mx-auto p-4 grid gap-4 ${
+            density === 'compact' ? 'text-xs' : 'text-sm'
+          }`}
+        >
+          {!hasCtx && (
+            <AuthGate onReady={(c) => setCtx(c)} />
+          )}
+
+          {hasCtx && tab === 'dashboard' && (
+            <Dashboard
+              data={{
+                categories: data.categories,
+                budgets: data.budgets,
+                transactions: data.transactions,
+                debts: data.debts,
+                savings: data.savings,
+                investments: data.investments,
+                budgetCutDay: data.budgetCutDay,
+                activeUserPreferences: userPrefs,
+              }}
+              monthKeyStr={selectedMonth}
+            />
+          )}
+
+          {hasCtx && tab === 'transactions' && (
+            <Transactions
+              data={{
+                transactions: data.transactions,
+                categories: data.categories,
+              }}
+              actions={actions}
+              activeUser={activeUser}
+              monthKeyStr={selectedMonth}
+              superAdminEmail={data.superAdminEmail || ctx.user?.email || null}
+              budgetCutDay={data.budgetCutDay}
+            />
+          )}
+
+          {hasCtx && tab === 'budgets' && (
+            <Budgets
+              data={{
+                budgets: data.budgets,
+                transactions: data.transactions,
+                categories: data.categories,
+                budgetCutDay: data.budgetCutDay,
+              }}
+              actions={actions}
+              monthKeyStr={selectedMonth}
+            />
+          )}
+
+          {hasCtx && tab === 'debts' && (
+            <Debts data={{ debts: data.debts }} actions={actions} />
+          )}
+
+          {hasCtx && tab === 'savings' && (
+            <Savings data={{ savings: data.savings }} actions={actions} />
+          )}
+
+          {hasCtx && tab === 'investments' && (
+            <Investments
+              data={{ investments: data.investments }}
+              actions={actions}
+            />
+          )}
+
+          {hasCtx && tab === 'settings' && (
+            <Settings
+              data={{
+                budgets: data.budgets,
+                transactions: data.transactions,
+                debts: data.debts,
+                savings: data.savings,
+                investments: data.investments,
+                householdUsers: data.householdUsers,
+                superAdminEmail: data.superAdminEmail,
+                budgetCutDay: data.budgetCutDay,
+              }}
+              householdId={selectedHid}
+              user={ctx.user}
+              categories={data.categories}
+              actions={actions}
+              activeHouseholdUser={activeUser}
+            />
+          )}
         </main>
-      <footer className="text-center text-xs text-gray-500 p-4">
-        V2 · Firebase/Firestore en tiempo real
-      </footer>
+
+        <footer className="text-center text-xs text-gray-500 p-4">
+          V2 · Firebase/Firestore en tiempo real
+        </footer>
+      </div>
     </div>
   );
 }
