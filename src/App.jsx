@@ -149,7 +149,11 @@ async function createHousehold(uid, displayName, email) {
   const id = uid.slice(0, 6) + Math.random().toString(36).slice(2, 5);
   const ref = doc(db, 'households', id);
   const categories = [...CATEGORIES];
-  const budgets = categories.reduce((acc, c) => ((acc[c] = 0), acc), {});
+  const budgets = categories.reduce((acc, c) => {
+    acc[c] = { plan: 0, funded: 0 };
+    return acc;
+  }, {});
+  
 
   const superUser = {
     id: 'super-admin',
@@ -496,11 +500,26 @@ function useHouseholdData(householdId) {
           : [...CATEGORIES];
       setCategories(cats);
 
-      const initialBudgets = cats.reduce((a, c) => {
-        a[c] = d.budgets?.[c] ?? 0;
-        return a;
-      }, {});
-      setBudgets(initialBudgets);
+      const rawBudgets = d.budgets || {};
+const initialBudgets = cats.reduce((a, c) => {
+  const b = rawBudgets[c];
+
+  if (typeof b === 'number') {
+    // Esquema viejo: interpretamos como plan=funded=valor
+    a[c] = { plan: Number(b || 0), funded: Number(b || 0) };
+  } else if (b && typeof b === 'object') {
+    const plan = Number(b.plan || 0);
+    const funded = Number(
+      b.funded !== undefined ? b.funded : (b.plan || 0)
+    );
+    a[c] = { plan, funded };
+  } else {
+    a[c] = { plan: 0, funded: 0 };
+  }
+  return a;
+}, {});
+setBudgets(initialBudgets);
+
 
       let rawUsers = Array.isArray(d.householdUsers) ? d.householdUsers : [];
       const hasSuper = rawUsers.some((u) => u.isSuperAdmin);
@@ -580,12 +599,53 @@ function useHouseholdData(householdId) {
     };
   }, [householdId]);
 
-  async function setBudget(cat, value) {
-    const ref = doc(db, 'households', householdId);
-    const snap = await getDoc(ref);
-    const b = snap.data().budgets || {};
-    await updateDoc(ref, { budgets: { ...b, [cat]: Number(value || 0) } });
+  // Helpers internos para no repetir lógica
+function normalizeBudgetEntry(entry) {
+  if (typeof entry === 'number') {
+    const n = Number(entry || 0);
+    return { plan: n, funded: n };
   }
+  if (entry && typeof entry === 'object') {
+    const plan = Number(entry.plan || 0);
+    const funded = Number(
+      entry.funded !== undefined ? entry.funded : (entry.plan || 0)
+    );
+    return { plan, funded };
+  }
+  return { plan: 0, funded: 0 };
+}
+
+async function setBudget(cat, value) {
+  // Compatibilidad: setea plan y funded al mismo valor
+  const n = Number(value || 0);
+  const ref = doc(db, 'households', householdId);
+  const snap = await getDoc(ref);
+  const b = snap.data().budgets || {};
+  const prev = normalizeBudgetEntry(b[cat]);
+  const next = { ...b, [cat]: { ...prev, plan: n, funded: n } };
+  await updateDoc(ref, { budgets: next });
+}
+
+async function setBudgetPlan(cat, value) {
+  const n = Number(value || 0);
+  const ref = doc(db, 'households', householdId);
+  const snap = await getDoc(ref);
+  const b = snap.data().budgets || {};
+  const prev = normalizeBudgetEntry(b[cat]);
+  const next = { ...b, [cat]: { ...prev, plan: n } };
+  await updateDoc(ref, { budgets: next });
+}
+
+async function setBudgetFunded(cat, value) {
+  const n = Number(value || 0);
+  const ref = doc(db, 'households', householdId);
+  const snap = await getDoc(ref);
+  const b = snap.data().budgets || {};
+  const prev = normalizeBudgetEntry(b[cat]);
+  const next = { ...b, [cat]: { ...prev, funded: n } };
+  await updateDoc(ref, { budgets: next });
+}
+
 
   async function addTransaction(tx) {
     try {
@@ -652,7 +712,11 @@ function useHouseholdData(householdId) {
 
     const newCats = [...currentCats, trimmed];
     const currentBudgets = data.budgets || {};
-    const newBudgets = { ...currentBudgets, [trimmed]: 0 };
+    const newBudgets = {
+      ...currentBudgets,
+      [trimmed]: { plan: 0, funded: 0 },
+    };
+    
 
     await updateDoc(ref, {
       categories: newCats,
@@ -703,8 +767,10 @@ function useHouseholdData(householdId) {
 
     const currentBudgets = data.budgets || {};
     const newBudgets = { ...currentBudgets };
-    newBudgets[to] = currentBudgets[from] ?? 0;
+    const prev = normalizeBudgetEntry(currentBudgets[from]);
+    newBudgets[to] = prev;
     delete newBudgets[from];
+
 
     await updateDoc(hhRef, {
       categories: newCats,
@@ -796,6 +862,8 @@ function useHouseholdData(householdId) {
     superAdminEmail,
     budgetCutDay,
     setBudget,
+    setBudgetPlan,
+    setBudgetFunded,
     addTransaction,
     removeTransaction,
     addDebt,
@@ -841,10 +909,26 @@ function Dashboard({ data, monthKeyStr }) {
     const spent = monthTx
       .filter((t) => t.type === 'gasto' && t.category === c)
       .reduce((a, b) => a + Number(b.amount || 0), 0);
-    const budget = data.budgets?.[c] || 0;
-    acc[c] = { spent, budget, pct: budget > 0 ? (spent / budget) * 100 : 0 };
+  
+    const b = data.budgets?.[c];
+    let plan = 0;
+    let funded = 0;
+  
+    if (typeof b === 'number') {
+      plan = funded = Number(b || 0);
+    } else if (b && typeof b === 'object') {
+      plan = Number(b.plan || 0);
+      funded = Number(
+        b.funded !== undefined ? b.funded : (b.plan || 0)
+      );
+    }
+  
+    const pctFundedUsed = funded > 0 ? (spent / funded) * 100 : 0;
+  
+    acc[c] = { spent, plan, funded, pctFundedUsed };
     return acc;
   }, {});
+  
 
   const pctIngresosVsGastos =
     totalIngresos > 0 ? (totalGastos / totalIngresos) * 100 : 0;
@@ -987,25 +1071,30 @@ function Dashboard({ data, monthKeyStr }) {
         </Card>
       )}
 
-      {showPresupuestos && (
-        <Card className="md:col-span-2 lg:col-span-3">
-          <SectionTitle>Presupuestos (progreso por categoría)</SectionTitle>
-          <div className="grid gap-3 md:grid-cols-2 lg:grid-cols-3">
-            {cats.map((c) => (
-              <div key={c} className="border rounded-xl p-3">
-                <div className="flex justify-between text-sm mb-1">
-                  <span className="font-medium">{c}</span>
-                  <span>
-                    <Money n={catSpend[c].spent} /> /{' '}
-                    <Money n={data.budgets?.[c] || 0} />
-                  </span>
-                </div>
-                <Progress value={catSpend[c].pct} />
-              </div>
-            ))}
+{showPresupuestos && (
+  <Card className="md:col-span-2 lg:col-span-3">
+    <SectionTitle>Presupuestos (progreso por categoría)</SectionTitle>
+    <div className="grid gap-3 md:grid-cols-2 lg:grid-cols-3">
+      {cats.map((c) => (
+        <div key={c} className="border rounded-xl p-3">
+          <div className="flex justify-between text-sm mb-1">
+            <span className="font-medium">{c}</span>
+            <span>
+  <Money n={catSpend[c].spent} /> /{' '}
+  <Money n={catSpend[c].funded} />{' '}
+  <span className="text-xs text-gray-500">
+    (Objetivo: <Money n={catSpend[c].plan} />)
+  </span>
+</span>
+
           </div>
-        </Card>
-      )}
+          <Progress value={catSpend[c].pctFundedUsed} />
+        </div>
+      ))}
+    </div>
+  </Card>
+)}
+
 
 {showInversiones && (
   <Card>
@@ -1281,7 +1370,11 @@ function Budgets({ data, actions, monthKeyStr }) {
     data.categories && data.categories.length ? data.categories : CATEGORIES;
 
   const mk = monthKeyStr;
-  const { start, end } = getBudgetPeriod(mk, data.budgetCutDay || 1);
+  const cutDay = data.budgetCutDay || 1;
+
+  const { start, end } = getBudgetPeriod(mk, cutDay);
+  const prevMk = shiftMonth(mk, -1);
+  const { start: prevStart, end: prevEnd } = getBudgetPeriod(prevMk, cutDay);
 
   const [viewMode, setViewMode] = useState('amount');
 
@@ -1290,23 +1383,66 @@ function Budgets({ data, actions, monthKeyStr }) {
     return d >= start && d < end;
   });
 
+  const prevMonthTx = data.transactions.filter((t) => {
+    const d = t.date || '';
+    return d >= prevStart && d < prevEnd;
+  });
+
+  // --- ROLLOVER ---
+  const ingresosPrev = prevMonthTx
+    .filter((t) => t.type === 'ingreso')
+    .reduce((a, b) => a + Number(b.amount || 0), 0);
+  const gastosPrev = prevMonthTx
+    .filter((t) => t.type === 'gasto')
+    .reduce((a, b) => a + Number(b.amount || 0), 0);
+  const saldoAnterior = ingresosPrev - gastosPrev; // puede ser + o -
+
+  const ingresosPeriodo = monthTx
+    .filter((t) => t.type === 'ingreso')
+    .reduce((a, b) => a + Number(b.amount || 0), 0);
+  const gastosPeriodo = monthTx
+    .filter((t) => t.type === 'gasto')
+    .reduce((a, b) => a + Number(b.amount || 0), 0);
+
+  const disponible = saldoAnterior + ingresosPeriodo;
+  const balanceFinal = disponible - gastosPeriodo;
+
+  // --- FILAS POR CATEGORÍA ---
   const rows = cats.map((c) => {
     const spent = monthTx
       .filter((t) => t.type === 'gasto' && t.category === c)
       .reduce((a, b) => a + Number(b.amount || 0), 0);
-    const budget = data.budgets?.[c] || 0;
-    const remaining = budget - spent;
-    const pct = budget > 0 ? (spent / budget) * 100 : 0;
-    const pctRemaining = budget > 0 ? Math.max(0, 100 - pct) : 0;
-    return { c, spent, budget, remaining, pct, pctRemaining };
+
+    const b = data.budgets?.[c];
+    let plan = 0;
+    let funded = 0;
+
+    if (typeof b === 'number') {
+      plan = funded = Number(b || 0);
+    } else if (b && typeof b === 'object') {
+      plan = Number(b.plan || 0);
+      funded = Number(
+        b.funded !== undefined ? b.funded : (b.plan || 0)
+      );
+    }
+
+    const pctFundedUsed = funded > 0 ? (spent / funded) * 100 : 0;
+    const pctPlanFunded = plan > 0 ? (funded / plan) * 100 : 0;
+
+    return { c, spent, plan, funded, pctFundedUsed, pctPlanFunded };
   });
 
-  const totalBudget = rows.reduce((a, r) => a + r.budget, 0);
+  const totalPlan = rows.reduce((a, r) => a + r.plan, 0);
+  const totalFunded = rows.reduce((a, r) => a + r.funded, 0);
   const totalSpent = rows.reduce((a, r) => a + r.spent, 0);
-  const totalPct = totalBudget > 0 ? (totalSpent / totalBudget) * 100 : 0;
+
+  const restanteSinAsignar = disponible - totalFunded;
+  const pctUsadoSobreFunded =
+    totalFunded > 0 ? (totalSpent / totalFunded) * 100 : 0;
 
   return (
     <div className="grid gap-4 lg:grid-cols-3">
+      {/* IZQUIERDA: categorías */}
       <Card className="lg:col-span-2">
         <SectionTitle
           right={
@@ -1316,7 +1452,7 @@ function Budgets({ data, actions, monthKeyStr }) {
                 setViewMode(viewMode === 'amount' ? 'percent' : 'amount')
               }
             >
-              {viewMode === 'amount' ? 'Ver porcentaje' : 'Ver cantidad'}
+              {viewMode === 'amount' ? 'Ver porcentaje' : 'Ver montos'}
             </button>
           }
         >
@@ -1331,56 +1467,139 @@ function Budgets({ data, actions, monthKeyStr }) {
                   <div className="flex justify-between text-sm mb-1">
                     <span className="font-medium">{r.c}</span>
                     <span>
-                      {viewMode === 'amount' ? (
-                        <>
-                          <Money n={r.spent} /> / <Money n={r.remaining} />
-                        </>
-                      ) : (
-                        <>
-                          {r.budget > 0 ? r.pct.toFixed(0) : 0}% /{' '}
-                          {r.budget > 0 ? r.pctRemaining.toFixed(0) : 0}%
-                        </>
-                      )}
-                    </span>
+  {viewMode === 'amount' ? (
+    <>
+      <Money n={r.spent} /> / <Money n={r.funded} />{' '}
+      <span className="text-xs text-gray-500">
+        (Objetivo: <Money n={r.plan} />)
+      </span>
+    </>
+  ) : (
+    <>
+      Usado:{' '}
+      {r.funded > 0 ? r.pctFundedUsed.toFixed(0) : 0}% ·
+      Asignado sobre objetivo:{' '}
+      {r.plan > 0 ? r.pctPlanFunded.toFixed(0) : 0}%
+    </>
+  )}
+</span>
+
                   </div>
-                  <Progress value={r.pct} />
+                  <Progress value={r.pctFundedUsed} />
+                  <p className="text-xs text-gray-500 mt-1">
+  Asignado {r.plan > 0 ? r.pctPlanFunded.toFixed(0) : 0}% del objetivo.
+</p>
                 </div>
-                <div className="w-36">
-                  <input
-                    type="number"
-                    className="border rounded-lg p-2 w-full"
-                    value={r.budget}
-                    min={0}
-                    step="1"
-                    onChange={(e) => actions.setBudget(r.c, e.target.value)}
-                    title="Presupuesto mensual (CLP)"
-                  />
-                </div>
+
+                {/* Inputs plan / funded */}
+                <div className="w-40 flex flex-col gap-2 text-xs">
+  <label className="flex flex-col gap-1">
+    <span>Objetivo</span>
+    <input
+      type="number"
+      className="border rounded-lg p-1.5 w-full"
+      value={r.plan}
+      min={0}
+      step="1"
+      onChange={(e) => actions.setBudgetPlan(r.c, e.target.value)}
+      title="Objetivo mensual para esta categoría"
+      placeholder="Objetivo"
+    />
+  </label>
+
+  <label className="flex flex-col gap-1">
+    <span>Asignado</span>
+    <input
+      type="number"
+      className="border rounded-lg p-1.5 w-full"
+      value={r.funded}
+      min={0}
+      step="1"
+      onChange={(e) => actions.setBudgetFunded(r.c, e.target.value)}
+      title="Monto real que asignas este período"
+      placeholder="Asignado"
+    />
+  </label>
+</div>
+
               </div>
             </div>
           ))}
         </div>
       </Card>
 
+      {/* DERECHA: resumen del período con rollover */}
       <Card>
-        <SectionTitle>Resumen</SectionTitle>
+        <SectionTitle>Resumen del período</SectionTitle>
         <div className="space-y-2 text-sm">
           <div className="flex justify-between">
-            <span>Presupuesto total</span>
+            <span>Saldo anterior (rollover)</span>
             <strong>
-              <Money n={totalBudget} />
+              <Money n={saldoAnterior} />
             </strong>
           </div>
+          <div className="flex justify-between">
+            <span>Ingresos del período</span>
+            <strong>
+              <Money n={ingresosPeriodo} />
+            </strong>
+          </div>
+          <div className="flex justify-between">
+            <span>Disponible para presupuestar</span>
+            <strong>
+              <Money n={disponible} />
+            </strong>
+          </div>
+
+          <hr className="my-2" />
+
+          <div className="flex justify-between">
+            <span>Plan total</span>
+            <strong>
+              <Money n={totalPlan} />
+            </strong>
+          </div>
+          <div className="flex justify-between">
+            <span>Presupuesto financiado</span>
+            <strong>
+              <Money n={totalFunded} />
+            </strong>
+          </div>
+          <div className="flex justify-between">
+            <span>Sin asignar / sobreasignado</span>
+            <strong
+              className={
+                restanteSinAsignar < 0 ? 'text-red-600' : 'text-green-700'
+              }
+            >
+              <Money n={restanteSinAsignar} />
+            </strong>
+          </div>
+
+          <hr className="my-2" />
+
           <div className="flex justify-between">
             <span>Gastado</span>
             <strong>
-              <Money n={totalSpent} />
+              <Money n={gastosPeriodo} />
             </strong>
           </div>
-          <div>
-            <div className="text-sm mb-1">% total usado</div>
-            <Progress value={totalPct} />
+          <div className="flex justify-between">
+            <span>Balance final</span>
+            <strong
+              className={
+                balanceFinal < 0 ? 'text-red-600' : 'text-green-700'
+              }
+            >
+              <Money n={balanceFinal} />
+            </strong>
           </div>
+
+          <div>
+            <div className="text-sm mb-1">% usado sobre financiado</div>
+            <Progress value={pctUsadoSobreFunded} />
+          </div>
+
           <div className="text-xs text-gray-500">
             Día de corte del mes: {data.budgetCutDay}
           </div>
@@ -1389,6 +1608,7 @@ function Budgets({ data, actions, monthKeyStr }) {
     </div>
   );
 }
+
 
 function Debts({ data, actions }) {
   const [form, setForm] = useState({
@@ -2661,6 +2881,8 @@ export default function App() {
 
   const actions = {
     setBudget: h.setBudget,
+    setBudgetPlan: h.setBudgetPlan,
+    setBudgetFunded: h.setBudgetFunded,
     addTransaction: h.addTransaction,
     removeTransaction: h.removeTransaction,
     addDebt: h.addDebt,
