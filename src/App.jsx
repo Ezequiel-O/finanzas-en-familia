@@ -17,8 +17,6 @@ import {
   EmailAuthProvider,
 } from 'firebase/auth';
 
-
-
 import {
   doc,
   setDoc,
@@ -101,6 +99,19 @@ function formatBudgetPeriodLabel(monthKeyStr, cutDay = 1) {
   return `${fmt(startDate)} al ${fmt(endExclusive)}`;
 }
 
+// Dado un día cualquiera y el día de corte, calcula a qué "mes de presupuesto" pertenece
+function budgetMonthKeyForDate(dateStr, cutDay = 1) {
+  if (!dateStr) return monthKey(new Date());
+
+  const d = new Date(dateStr + 'T00:00:00');
+  if (Number.isNaN(d.getTime())) return monthKey(new Date());
+
+  const day = d.getDate();
+  const offset = day >= cutDay ? 0 : -1; // si el día es menor al corte, pertenece al mes "anterior" de presupuesto
+
+  const base = new Date(d.getFullYear(), d.getMonth() + offset, 1);
+  return monthKey(base);
+}
 
 function Money({ n }) {
   const sign = Number(n) < 0 ? '-' : '';
@@ -114,21 +125,36 @@ function Money({ n }) {
 
 function Card({ children, className = '' }) {
   return (
-    <div className={`rounded-2xl  shadow-sm dark:shadow-none border p-4 bg-white dark:bg-gray-800 ${className}`}>
+    <div className={`rounded-2xl shadow-sm dark:shadow-none border p-4 bg-white dark:bg-gray-800 ${className}`}>
       {children}
     </div>
   );
 }
 
-function Progress({ value }) {
-  const v = Math.max(0, Math.min(100, Number.isFinite(value) ? value : 0));
+function Progress({ value, mode = 'risk' }) {
+  const raw = Number.isFinite(Number(value)) ? Number(value) : 0;
+  const v = Math.max(0, raw);
+  const width = Math.min(100, v);
+
+  let color = 'bg-green-600';
+
+  if (mode === 'good') {
+    // Bueno cuando el porcentaje es ALTO (deudas pagadas, ahorro, ROI)
+    if (v >= 90) color = 'bg-green-600';
+    else if (v >= 60) color = 'bg-amber-500';
+    else color = 'bg-red-500';
+  } else {
+    // Riesgo: rojo solo si te pasas del 100%
+    if (v > 100) color = 'bg-red-500';
+    else if (v >= 90) color = 'bg-amber-500';
+    else color = 'bg-green-600';
+  }
+
   return (
     <div className="w-full h-3 rounded-full bg-gray-200">
       <div
-        className={`h-3 rounded-full ${
-          v >= 90 ? 'bg-red-500' : v >= 70 ? 'bg-amber-500' : 'bg-green-600'
-        }`}
-        style={{ width: `${v}%` }}
+        className={`h-3 rounded-full ${color}`}
+        style={{ width: `${width}%` }}
         title={`${v.toFixed(0)}%`}
       />
     </div>
@@ -149,11 +175,15 @@ async function createHousehold(uid, displayName, email) {
   const id = uid.slice(0, 6) + Math.random().toString(36).slice(2, 5);
   const ref = doc(db, 'households', id);
   const categories = [...CATEGORIES];
-  const budgets = categories.reduce((acc, c) => {
+const currentMonth = monthKey(); // ej: "2024-12"
+
+const budgets = {
+  [currentMonth]: categories.reduce((acc, c) => {
     acc[c] = { plan: 0, funded: 0 };
     return acc;
-  }, {});
-  
+  }, {}),
+};
+
 
   const superUser = {
     id: 'super-admin',
@@ -167,7 +197,6 @@ async function createHousehold(uid, displayName, email) {
         resumenMes: true,
         deudas: true,
         ahorro: true,
-        inversiones: true,
         presupuestos: true,
       },
       transactionsDefaults: {
@@ -259,7 +288,6 @@ function Header({ currentTab, setTab, user, onLogout, householdId }) {
     ['budgets', 'Presupuestos'],
     ['debts', 'Deudas'],
     ['savings', 'Ahorro'],
-    ['investments', 'Inversiones'],
     ['settings', 'Ajustes'],
   ];
 
@@ -467,7 +495,7 @@ function AuthGate({ onReady }) {
           <ul className="space-y-2 text-sm ext-gray-900 dark:text-gray-100">
             <li>✅ Presupuestos por categoría con % de avance</li>
             <li>✅ Movimientos y conciliación rápida</li>
-            <li>✅ Deudas, ahorro e inversiones</li>
+            <li>✅ Deudas y ahorro</li>
             <li>✅ Sesión familiar compartida</li>
           </ul>
         </Card>
@@ -484,7 +512,6 @@ function useHouseholdData(householdId) {
   const [transactions, setTransactions] = useState([]);
   const [debts, setDebts] = useState([]);
   const [savings, setSavings] = useState([]);
-  const [investments, setInvestments] = useState([]);
   const [householdUsers, setHouseholdUsers] = useState([]);
   const [superAdminEmail, setSuperAdminEmail] = useState(null);
   const [budgetCutDay, setBudgetCutDayState] = useState(1);
@@ -500,25 +527,10 @@ function useHouseholdData(householdId) {
           : [...CATEGORIES];
       setCategories(cats);
 
+      // Presupuestos por mes guardados en el campo "budgets"
       const rawBudgets = d.budgets || {};
-const initialBudgets = cats.reduce((a, c) => {
-  const b = rawBudgets[c];
+      setBudgets(rawBudgets);
 
-  if (typeof b === 'number') {
-    // Esquema viejo: interpretamos como plan=funded=valor
-    a[c] = { plan: Number(b || 0), funded: Number(b || 0) };
-  } else if (b && typeof b === 'object') {
-    const plan = Number(b.plan || 0);
-    const funded = Number(
-      b.funded !== undefined ? b.funded : (b.plan || 0)
-    );
-    a[c] = { plan, funded };
-  } else {
-    a[c] = { plan: 0, funded: 0 };
-  }
-  return a;
-}, {});
-setBudgets(initialBudgets);
 
 
       let rawUsers = Array.isArray(d.householdUsers) ? d.householdUsers : [];
@@ -537,7 +549,6 @@ setBudgets(initialBudgets);
               resumenMes: true,
               deudas: true,
               ahorro: true,
-              inversiones: true,
               presupuestos: true,
             },
             transactionsDefaults: {
@@ -583,68 +594,77 @@ setBudgets(initialBudgets);
       }
     );
 
-    const unsubInv = onSnapshot(
-      collection(db, 'households', householdId, 'investments'),
-      (snap) => {
-        setInvestments(snap.docs.map((d) => ({ ...d.data(), id: d.id })));
-      }
-    );
-
     return () => {
       unsubHH();
       unsubTx();
       unsubDebts();
       unsubSavings();
-      unsubInv();
     };
   }, [householdId]);
 
   // Helpers internos para no repetir lógica
-function normalizeBudgetEntry(entry) {
-  if (typeof entry === 'number') {
-    const n = Number(entry || 0);
-    return { plan: n, funded: n };
+  function normalizeBudgetEntry(entry) {
+    if (typeof entry === 'number') {
+      const n = Number(entry || 0);
+      return { plan: n, funded: n };
+    }
+    if (entry && typeof entry === 'object') {
+      const plan = Number(entry.plan || 0);
+      const funded = Number(
+        entry.funded !== undefined ? entry.funded : (entry.plan || 0)
+      );
+      return { plan, funded };
+    }
+    return { plan: 0, funded: 0 };
   }
-  if (entry && typeof entry === 'object') {
-    const plan = Number(entry.plan || 0);
-    const funded = Number(
-      entry.funded !== undefined ? entry.funded : (entry.plan || 0)
-    );
-    return { plan, funded };
+
+  async function setBudget(cat, value) {
+    // Compatibilidad: setea plan y funded al mismo valor
+    const n = Number(value || 0);
+    const ref = doc(db, 'households', householdId);
+    const snap = await getDoc(ref);
+    const b = snap.data().budgets || {};
+    const prev = normalizeBudgetEntry(b[cat]);
+    const next = { ...b, [cat]: { ...prev, plan: n, funded: n } };
+    await updateDoc(ref, { budgets: next });
   }
-  return { plan: 0, funded: 0 };
-}
 
-async function setBudget(cat, value) {
-  // Compatibilidad: setea plan y funded al mismo valor
+  async function setBudgetPlan(cat, value) {
+    const n = Number(value || 0);
+    const ref = doc(db, 'households', householdId);
+    const snap = await getDoc(ref);
+    const b = snap.data().budgets || {};
+    const prev = normalizeBudgetEntry(b[cat]);
+    const next = { ...b, [cat]: { ...prev, plan: n } };
+    await updateDoc(ref, { budgets: next });
+  }
+
+async function setBudgetFunded(monthKeyStr, cat, value) {
   const n = Number(value || 0);
   const ref = doc(db, 'households', householdId);
   const snap = await getDoc(ref);
-  const b = snap.data().budgets || {};
-  const prev = normalizeBudgetEntry(b[cat]);
-  const next = { ...b, [cat]: { ...prev, plan: n, funded: n } };
-  await updateDoc(ref, { budgets: next });
+  const data = snap.data() || {};
+
+  // Usamos el campo "budgets" como mapa de meses
+  const allBudgets = data.budgets || {};
+
+  const mk = monthKeyStr || monthKey(); // por si llega vacío
+  const monthBudgets = allBudgets[mk] || {};
+
+  const prev = normalizeBudgetEntry(monthBudgets[cat]);
+  const nextMonthBudgets = {
+    ...monthBudgets,
+    [cat]: { ...prev, funded: n },
+  };
+
+  const nextAllBudgets = {
+    ...allBudgets,
+    [mk]: nextMonthBudgets,
+  };
+
+  await updateDoc(ref, { budgets: nextAllBudgets });
 }
 
-async function setBudgetPlan(cat, value) {
-  const n = Number(value || 0);
-  const ref = doc(db, 'households', householdId);
-  const snap = await getDoc(ref);
-  const b = snap.data().budgets || {};
-  const prev = normalizeBudgetEntry(b[cat]);
-  const next = { ...b, [cat]: { ...prev, plan: n } };
-  await updateDoc(ref, { budgets: next });
-}
-
-async function setBudgetFunded(cat, value) {
-  const n = Number(value || 0);
-  const ref = doc(db, 'households', householdId);
-  const snap = await getDoc(ref);
-  const b = snap.data().budgets || {};
-  const prev = normalizeBudgetEntry(b[cat]);
-  const next = { ...b, [cat]: { ...prev, funded: n } };
-  await updateDoc(ref, { budgets: next });
-}
 
 
   async function addTransaction(tx) {
@@ -684,18 +704,6 @@ async function setBudgetFunded(cat, value) {
     await deleteDoc(doc(db, 'households', householdId, 'savings', id));
   }
 
-  async function addInvestment(i) {
-    await addDoc(collection(db, 'households', householdId, 'investments'), i);
-  }
-
-  async function updateInvestment(id, patch) {
-    await updateDoc(doc(db, 'households', householdId, 'investments', id), patch);
-  }
-
-  async function removeInvestment(id) {
-    await deleteDoc(doc(db, 'households', householdId, 'investments', id));
-  }
-
   async function addCategory(name) {
     const trimmed = String(name || '').trim();
     if (!trimmed) return;
@@ -716,7 +724,6 @@ async function setBudgetFunded(cat, value) {
       ...currentBudgets,
       [trimmed]: { plan: 0, funded: 0 },
     };
-    
 
     await updateDoc(ref, {
       categories: newCats,
@@ -771,7 +778,6 @@ async function setBudgetFunded(cat, value) {
     newBudgets[to] = prev;
     delete newBudgets[from];
 
-
     await updateDoc(hhRef, {
       categories: newCats,
       budgets: newBudgets,
@@ -809,7 +815,6 @@ async function setBudgetFunded(cat, value) {
           resumenMes: true,
           deudas: true,
           ahorro: true,
-          inversiones: true,
           presupuestos: true,
         },
         transactionsDefaults: {
@@ -857,7 +862,6 @@ async function setBudgetFunded(cat, value) {
     transactions,
     debts,
     savings,
-    investments,
     householdUsers,
     superAdminEmail,
     budgetCutDay,
@@ -872,9 +876,6 @@ async function setBudgetFunded(cat, value) {
     addSaving,
     updateSaving,
     removeSaving,
-    addInvestment,
-    updateInvestment,
-    removeInvestment,
     addCategory,
     removeCategory,
     renameCategory,
@@ -884,15 +885,458 @@ async function setBudgetFunded(cat, value) {
     setBudgetCutDay,
   };
 }
+function filterTransactionsByPeriodAndUser(
+  transactions,
+  monthKeyStr,
+  budgetCutDay,
+  activeUser,
+  showOnlyMine
+) {
+  if (!Array.isArray(transactions)) return [];
 
-// --- Vistas ---
+  const { start, end } = getBudgetPeriod(monthKeyStr, budgetCutDay);
+
+  return transactions.filter((tx) => {
+    const txDate = tx.date || '';
+    if (!txDate) return false;
+
+    // mismo criterio que Dashboard/Budgets: [start, end)
+    if (txDate < start || txDate >= end) return false;
+
+    if (showOnlyMine && activeUser?.id) {
+      return tx.ownerId === activeUser.id;
+    }
+
+    return true;
+  });
+}
+
+
+function Transactions({
+  data,
+  actions,
+  activeUser,
+  monthKeyStr,
+  superAdminEmail,
+  budgetCutDay,
+}) {
+  const { transactions = [], categories = [] } = data || {};
+  const { addTransaction, removeTransaction } = actions || {};
+
+  const [type, setType] = useState('gasto'); // gasto | ingreso
+  const [amount, setAmount] = useState('');
+  const [category, setCategory] = useState(categories[0] || '');
+  const [date, setDate] = useState(() => new Date().toISOString().slice(0, 10));
+  const [description, setDescription] = useState('');
+  const [showOnlyMine, setShowOnlyMine] = useState(false);
+  const [filterType, setFilterType] = useState('todos'); // todos | ingresos | gastos
+  const [filterCategory, setFilterCategory] = useState('todas');
+  const [showIngresoModal, setShowIngresoModal] = useState(false);
+  const [showGastoModal, setShowGastoModal] = useState(false);
+  const [amountFormatted, setAmountFormatted] = useState('');
+
+
+
+  const periodLabel = useMemo(
+    () => formatBudgetPeriodLabel(monthKeyStr, budgetCutDay),
+    [monthKeyStr, budgetCutDay]
+  );
+
+  const filtered = useMemo(() => {
+    let base = filterTransactionsByPeriodAndUser(
+      transactions,
+      monthKeyStr,
+      budgetCutDay,
+      activeUser,
+      showOnlyMine
+    );
+
+    if (filterType !== 'todos') {
+      base = base.filter((tx) =>
+        filterType === 'ingresos' ? tx.type === 'ingreso' : tx.type === 'gasto'
+      );
+    }
+
+    if (filterCategory !== 'todas') {
+      base = base.filter((tx) => tx.category === filterCategory);
+    }
+
+    // Orden descendente por fecha (más reciente arriba)
+    base.sort((a, b) => {
+      const da = new Date((a.date || a.createdAt || '1970-01-01') + 'T00:00:00').getTime();
+      const db = new Date((b.date || b.createdAt || '1970-01-01') + 'T00:00:00').getTime();
+      return db - da;
+    });
+
+    return base;
+  }, [
+    transactions,
+    monthKeyStr,
+    budgetCutDay,
+    activeUser,
+    showOnlyMine,
+    filterType,
+    filterCategory,
+  ]);
+
+  const totals = useMemo(() => {
+    let ingresos = 0;
+    let gastos = 0;
+
+    for (const tx of filtered) {
+      const amt = Number(tx.amount || 0);
+      if (tx.type === 'ingreso') ingresos += amt;
+      if (tx.type === 'gasto') gastos += amt;
+    }
+
+    return {
+      ingresos,
+      gastos,
+      balance: ingresos - gastos,
+    };
+  }, [filtered]);
+
+  function getOwnerName(tx) {
+    if (tx.ownerName) return tx.ownerName;
+    if (tx.ownerEmail && tx.ownerEmail === superAdminEmail) return 'Admin';
+    if (tx.ownerEmail) return tx.ownerEmail.split('@')[0];
+    return '—';
+  }
+
+  async function handleAdd(e) {
+    e.preventDefault();
+
+    const n = Number(amount || 0);
+if (!n || n <= 0 || !addTransaction) {
+  alert('Ingresa un monto válido.');
+  return;
+}
+
+
+    const normalized = {
+      type,
+      amount: n,
+      category: type === 'gasto' ? (category || categories[0] || 'Otros') : '',
+      description: description.trim(),
+      date: date || new Date().toISOString().slice(0, 10),
+      createdAt: new Date().toISOString(),
+      ownerId: activeUser?.id || null,
+      ownerName: activeUser?.name || null,
+      ownerEmail: activeUser?.email || null,
+    };
+
+    try {
+      await addTransaction(normalized);
+      setAmount('');
+      setDescription('');
+      setShowIngresoModal(false);
+      setShowGastoModal(false);
+    } catch (err) {
+      console.error('Error al agregar movimiento:', err);
+      alert('No se pudo guardar el movimiento.');
+    }
+  }
+
+
+  return (
+    <div className="max-w-6xl mx-auto py-6 px-4 space-y-6">
+        <SectionTitle
+    right={
+      <div className="flex gap-2">
+  <button
+    type="button"
+    className="px-4 py-1.5 rounded-full text-xs font-medium bg-blue-600 text-white hover:bg-blue-700 transition"
+    onClick={() => {
+      setType('ingreso');
+      setShowIngresoModal(true);
+    }}
+  >
+    + Ingreso
+  </button>
+
+  <button
+    type="button"
+    className="px-4 py-1.5 rounded-full text-xs font-medium bg-red-600 text-white hover:bg-red-700 transition"
+    onClick={() => {
+      setType('gasto');
+      setShowGastoModal(true);
+    }}
+  >
+    + Gasto
+  </button>
+</div>
+
+    }
+  >
+    Movimientos del periodo
+  </SectionTitle>
+
+
+      {/* Resumen superior */}
+      <div className="grid md:grid-cols-3 gap-4">
+        <Card>
+          <div className="text-xs uppercase text-gray-500 mb-1">Ingresos</div>
+          <div className="text-lg font-semibold">
+            <Money n={totals.ingresos} />
+          </div>
+        </Card>
+        <Card>
+          <div className="text-xs uppercase text-gray-500 mb-1">Gastos</div>
+          <div className="text-lg font-semibold">
+            <Money n={totals.gastos} />
+          </div>
+        </Card>
+        <Card>
+          <div className="text-xs uppercase text-gray-500 mb-1">Balance</div>
+          <div
+            className={`text-lg font-semibold ${
+              totals.balance < 0 ? 'text-red-600' : 'text-green-600'
+            }`}
+          >
+            <Money n={totals.balance} />
+          </div>
+        </Card>
+      </div>
+
+      {/* Filtros */}
+      <Card>
+        <div className="flex flex-wrap gap-3 items-center mb-4">
+          <span className="text-sm font-medium">Filtros:</span>
+
+          <select
+            className="border rounded-lg px-2 py-1 text-sm"
+            value={filterType}
+            onChange={(e) => setFilterType(e.target.value)}
+          >
+            <option value="todos">Todos</option>
+            <option value="ingresos">Solo ingresos</option>
+            <option value="gastos">Solo gastos</option>
+          </select>
+
+          <select
+            className="border rounded-lg px-2 py-1 text-sm"
+            value={filterCategory}
+            onChange={(e) => setFilterCategory(e.target.value)}
+          >
+            <option value="todas">Todas las categorías</option>
+            {categories.map((c) => (
+              <option key={c} value={c}>
+                {c}
+              </option>
+            ))}
+          </select>
+
+          <label className="flex items-center gap-1 text-sm">
+            <input
+              type="checkbox"
+              className="rounded"
+              checked={showOnlyMine}
+              onChange={(e) => setShowOnlyMine(e.target.checked)}
+            />
+            Solo mis movimientos
+          </label>
+        </div>
+      </Card>
+
+
+      {/* Tabla de movimientos */}
+      <Card>
+        <div className="flex justify-between items-center mb-3">
+          <h3 className="font-semibold">Listado de movimientos</h3>
+          <span className="text-xs text-gray-500">
+            {filtered.length} movimiento{filtered.length === 1 ? '' : 's'}
+          </span>
+        </div>
+
+        {filtered.length === 0 ? (
+          <div className="text-sm text-gray-500">
+            No hay movimientos para el periodo y filtros seleccionados.
+          </div>
+        ) : (
+          <div className="overflow-x-auto -mx-2">
+            <table className="min-w-full text-sm">
+              <thead>
+                <tr className="border-b text-xs text-gray-500">
+                  <th className="px-2 py-1 text-left">Fecha</th>
+                  <th className="px-2 py-1 text-left">Descripción</th>
+                  <th className="px-2 py-1 text-left">Categoría</th>
+                  <th className="px-2 py-1 text-left">Tipo</th>
+                  <th className="px-2 py-1 text-right">Monto</th>
+                  <th className="px-2 py-1 text-left">Usuario</th>
+                  <th className="px-2 py-1"></th>
+                </tr>
+              </thead>
+              <tbody>
+                {filtered.map((tx) => (
+                  <tr key={tx.id} className="border-b last:border-0">
+                    <td className="px-2 py-1 align-top">
+                      {(tx.date || '').slice(0, 10)}
+                    </td>
+                    <td className="px-2 py-1 align-top">
+                      {tx.description || <span className="text-gray-400">—</span>}
+                    </td>
+                    <td className="px-2 py-1 align-top">
+                      {tx.category || <span className="text-gray-400">—</span>}
+                    </td>
+                    <td className="px-2 py-1 align-top">
+                      {tx.type === 'ingreso' ? 'Ingreso' : 'Gasto'}
+                    </td>
+                    <td className="px-2 py-1 align-top text-right">
+                      <Money n={tx.amount} />
+                    </td>
+                    <td className="px-2 py-1 align-top text-xs text-gray-500">
+                      {getOwnerName(tx)}
+                    </td>
+                    <td className="px-2 py-1 align-top text-right">
+                      {removeTransaction && (
+                        <button
+                          className="text-xs text-red-600"
+                          onClick={() => removeTransaction(tx.id)}
+                        >
+                          Eliminar
+                        </button>
+                      )}
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
+      </Card>
+      {(showIngresoModal || showGastoModal) && (
+        <div className="fixed inset-0 z-30 flex items-start justify-center bg-black/30 pt-16">
+          <div className="bg-white dark:bg-gray-900 rounded-2xl shadow-xl p-5 w-full max-w-xl">
+            <div className="flex items-center justify-between mb-3">
+              <h3 className="text-lg font-semibold">
+                {type === 'ingreso' ? 'Nuevo ingreso' : 'Nuevo gasto'}
+              </h3>
+              <button
+                type="button"
+                className="text-sm text-gray-500 hover:text-gray-800"
+                onClick={() => {
+                  setShowIngresoModal(false);
+                  setShowGastoModal(false);
+                }}
+              >
+                ✕ Cerrar
+              </button>
+            </div>
+
+            <form onSubmit={handleAdd} className="grid gap-3">
+  {/* Monto – siempre primero */}
+{/* Monto con formateo dinámico */}
+<div className="flex flex-col gap-1">
+  <label className="text-xs text-gray-500">Monto</label>
+
+  <div className="flex items-center gap-2">
+    <span className="text-sm text-gray-500">$</span>
+
+    <input
+      type="text"
+      className="border rounded-lg px-2 py-1 text-sm flex-1"
+      value={amountFormatted}
+      onChange={(e) => {
+        const raw = e.target.value;
+      
+        // Solo números
+        const digits = raw.replace(/\D/g, '');
+      
+        // Si no hay dígitos, dejamos el campo vacío
+        if (!digits) {
+          setAmountFormatted('');
+          setAmount('');
+          return;
+        }
+      
+        // Formatear CLP con puntos de miles
+        const formatted = new Intl.NumberFormat('es-CL', {
+          maximumFractionDigits: 0,
+        }).format(Number(digits));
+      
+        setAmountFormatted(formatted);
+        setAmount(digits); // valor real sin formato
+      }}      
+      placeholder="0"
+    />
+  </div>
+</div>
+
+
+
+  {/* Fecha – siempre segundo */}
+  <div className="flex flex-col gap-1">
+    <label className="text-xs text-gray-500">Fecha</label>
+    <input
+      type="date"
+      className="border rounded-lg px-2 py-1 text-sm"
+      value={date}
+      onChange={(e) => setDate(e.target.value)}
+      required
+    />
+  </div>
+
+  {/* Categoría – SOLO para gasto, y va DESPUÉS de la fecha */}
+  {type === 'gasto' && (
+    <div className="flex flex-col gap-1">
+      <label className="text-xs text-gray-500">Categoría</label>
+      <select
+        className="border rounded-lg px-2 py-1 text-sm"
+        value={category}
+        onChange={(e) => setCategory(e.target.value)}
+      >
+        {categories.map((c) => (
+          <option key={c} value={c}>
+            {c}
+          </option>
+        ))}
+      </select>
+    </div>
+  )}
+
+  {/* Descripción + botón – al final en ambos casos */}
+  <div className="flex flex-col gap-1">
+    <label className="text-xs text-gray-500">Descripción</label>
+    <div className="flex gap-2">
+      <input
+        className="border rounded-lg px-2 py-1 text-sm flex-1"
+        value={description}
+        onChange={(e) => setDescription(e.target.value)}
+        placeholder="Ej: sueldo, supermercado, benzina, etc."
+      />
+      <button
+        type="submit"
+        className="px-3 py-1.5 rounded-xl border bg-gray-900 text-white text-sm"
+      >
+        Agregar
+      </button>
+    </div>
+  </div>
+</form>
+
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+// --- DASHBOARD & PRESUPUESTOS ---
 function Dashboard({ data, monthKeyStr }) {
-  const mk = monthKeyStr;
-  const cats =
-    data.categories && data.categories.length ? data.categories : CATEGORIES;
+  const {
+    categories = CATEGORIES,
+    budgets = {},
+    transactions = [],
+    debts = [],
+    savings = [],
+    budgetCutDay = 1,
+    activeUserPreferences,
+  } = data || {};
 
-  const { start, end } = getBudgetPeriod(mk, data.budgetCutDay || 1);
-  const monthTx = data.transactions.filter((t) => {
+  const mk = monthKeyStr;
+
+  // Filtramos movimientos del periodo actual (según día de corte)
+  const { start, end } = getBudgetPeriod(mk, budgetCutDay);
+  const monthTx = transactions.filter((t) => {
     const d = t.date || '';
     return d >= start && d < end;
   });
@@ -900,20 +1344,24 @@ function Dashboard({ data, monthKeyStr }) {
   const totalIngresos = monthTx
     .filter((t) => t.type === 'ingreso')
     .reduce((a, b) => a + Number(b.amount || 0), 0);
+
   const totalGastos = monthTx
     .filter((t) => t.type === 'gasto')
     .reduce((a, b) => a + Number(b.amount || 0), 0);
+
   const balance = totalIngresos - totalGastos;
+
+  const cats = categories && categories.length ? categories : CATEGORIES;
 
   const catSpend = cats.reduce((acc, c) => {
     const spent = monthTx
       .filter((t) => t.type === 'gasto' && t.category === c)
       .reduce((a, b) => a + Number(b.amount || 0), 0);
-  
-    const b = data.budgets?.[c];
+
+    const b = budgets?.[c];
     let plan = 0;
     let funded = 0;
-  
+
     if (typeof b === 'number') {
       plan = funded = Number(b || 0);
     } else if (b && typeof b === 'object') {
@@ -922,67 +1370,49 @@ function Dashboard({ data, monthKeyStr }) {
         b.funded !== undefined ? b.funded : (b.plan || 0)
       );
     }
-  
+
     const pctFundedUsed = funded > 0 ? (spent / funded) * 100 : 0;
-  
+
     acc[c] = { spent, plan, funded, pctFundedUsed };
     return acc;
   }, {});
-  
 
   const pctIngresosVsGastos =
     totalIngresos > 0 ? (totalGastos / totalIngresos) * 100 : 0;
 
-  const debtTotals = data.debts.reduce(
-    (acc, d) => (
-      (acc.original += Number(d.original || 0)),
-      (acc.remaining += Number(d.remaining || 0)),
-      acc
-    ),
+  const debtTotals = debts.reduce(
+    (acc, d) => {
+      acc.original += Number(d.original || 0);
+      acc.remaining += Number(d.remaining || 0);
+      return acc;
+    },
     { original: 0, remaining: 0 }
   );
+
   const debtProgress =
     debtTotals.original > 0
       ? ((debtTotals.original - debtTotals.remaining) / debtTotals.original) *
         100
       : 0;
 
-  const savingsTotals = data.savings.reduce(
-    (acc, s) => (
-      (acc.goal += Number(s.goal || 0)),
-      (acc.saved += Number(s.saved || 0)),
-      acc
-    ),
+  const savingsTotals = savings.reduce(
+    (acc, s) => {
+      acc.goal += Number(s.goal || 0);
+      acc.saved += Number(s.saved || 0);
+      return acc;
+    },
     { goal: 0, saved: 0 }
   );
+
   const savingsProgress =
     savingsTotals.goal > 0 ? (savingsTotals.saved / savingsTotals.goal) * 100 : 0;
 
-  const invTotals = data.investments.reduce(
-    (acc, i) => (
-      (acc.contrib += Number(i.contributed || 0)),
-      (acc.current += Number(i.current || 0)),
-      acc
-    ),
-    { contrib: 0, current: 0 }
-  );
-  const invROI =
-    invTotals.contrib > 0
-      ? ((invTotals.current - invTotals.contrib) / invTotals.contrib) * 100
-      : 0;
-
-      const invProgress =
-  invTotals.contrib > 0
-    ? Math.max(0, Math.min(100, invROI))
-    : 0;
-
-
-  const cardsPrefs = data.activeUserPreferences?.dashboardCards || {};
+  const cardsPrefs = activeUserPreferences?.dashboardCards || {};
   const showResumenMes = cardsPrefs.resumenMes ?? true;
   const showDeudas = cardsPrefs.deudas ?? true;
   const showAhorro = cardsPrefs.ahorro ?? true;
-  const showInversiones = cardsPrefs.inversiones ?? true;
   const showPresupuestos = cardsPrefs.presupuestos ?? true;
+  // IMPORTANTE: ya NO usamos tarjetas de inversiones en el dashboard
 
   return (
     <div className="grid gap-4 md:grid-cols-2 lg:grid-cols-3">
@@ -1017,7 +1447,7 @@ function Dashboard({ data, monthKeyStr }) {
               <Progress value={pctIngresosVsGastos} />
             </div>
             <div className="text-xs text-gray-500">
-              Día de corte del mes: {data.budgetCutDay}
+              Día de corte del mes: {budgetCutDay}
             </div>
           </div>
         </Card>
@@ -1041,7 +1471,7 @@ function Dashboard({ data, monthKeyStr }) {
             </div>
             <div>
               <div className="text-sm mb-1">% pagado</div>
-              <Progress value={debtProgress} />
+              <Progress value={debtProgress} mode="good" />
             </div>
           </div>
         </Card>
@@ -1065,325 +1495,60 @@ function Dashboard({ data, monthKeyStr }) {
             </div>
             <div>
               <div className="text-sm mb-1">% de meta alcanzada</div>
-              <Progress value={savingsProgress} />
+              <Progress value={savingsProgress} mode="good" />
             </div>
           </div>
         </Card>
       )}
 
-{showPresupuestos && (
-  <Card className="md:col-span-2 lg:col-span-3">
-    <SectionTitle>Presupuestos (progreso por categoría)</SectionTitle>
-    <div className="grid gap-3 md:grid-cols-2 lg:grid-cols-3">
-      {cats.map((c) => (
-        <div key={c} className="border rounded-xl p-3">
-          <div className="flex justify-between text-sm mb-1">
-            <span className="font-medium">{c}</span>
-            <span>
-  <Money n={catSpend[c].spent} /> /{' '}
-  <Money n={catSpend[c].funded} />{' '}
-  <span className="text-xs text-gray-500">
-    (Objetivo: <Money n={catSpend[c].plan} />)
-  </span>
-</span>
-
+      {showPresupuestos && (
+        <Card className="md:col-span-2 lg:col-span-3">
+          <SectionTitle>Presupuestos (progreso por categoría)</SectionTitle>
+          <div className="grid gap-3 md:grid-cols-2 lg:grid-cols-3">
+            {cats.map((c) => (
+              <div key={c} className="border rounded-xl p-3">
+                <div className="flex justify-between text-sm mb-1">
+                  <span className="font-medium">{c}</span>
+                  <span>
+                    Gasto: <Money n={catSpend[c].spent} /> / Presupuesto:{' '}
+                    <Money n={catSpend[c].funded} />
+                  </span>
+                </div>
+                <Progress value={catSpend[c].pctFundedUsed} />
+              </div>
+            ))}
           </div>
-          <Progress value={catSpend[c].pctFundedUsed} />
-        </div>
-      ))}
-    </div>
-  </Card>
-)}
-
-
-{showInversiones && (
-  <Card>
-    <SectionTitle>Inversiones</SectionTitle>
-    <div className="space-y-2">
-      <div className="flex justify-between">
-        <span>Contribuido</span>
-        <strong>
-          <Money n={invTotals.contrib} />
-        </strong>
-      </div>
-      <div className="flex justify-between">
-        <span>Valor actual</span>
-        <strong>
-          <Money n={invTotals.current} />
-        </strong>
-      </div>
-      <div>
-        <div className="text-sm mb-1">ROI (%)</div>
-        <Progress value={invProgress} />
-        <div className="text-xs text-gray-600 mt-1">
-          ROI real: {invROI.toFixed(2)}%
-        </div>
-      </div>
-    </div>
-  </Card>
-)}
-    </div>
-  );
-}
-
-function formatAmountCLP(raw) {
-  const digits = String(raw).replace(/\D/g, '');
-  if (!digits) return '';
-  const n = Number(digits);
-  return n.toLocaleString('es-CL', { minimumFractionDigits: 0 });
-}
-
-function parseAmountCLP(formatted) {
-  const digits = String(formatted).replace(/\D/g, '');
-  return Number(digits || 0);
-}
-
-function Transactions({
-  data,
-  actions,
-  activeUser,
-  monthKeyStr,
-  superAdminEmail,
-  budgetCutDay,
-}) {
-  const cats =
-    data.categories && data.categories.length ? data.categories : CATEGORIES;
-
-  const prefs = activeUser?.preferences || {};
-  const txDefaults = prefs.transactionsDefaults || {};
-
-  const [form, setForm] = useState({
-    date: new Date().toISOString().slice(0, 10),
-    type: txDefaults.type || 'gasto',
-    amount: '',
-    category: txDefaults.defaultCategory || CATEGORIES[0],
-    note: '',
-    user: activeUser?.name || superAdminEmail || 'Usuario',
-  });
-
-  useEffect(() => {
-    const newPrefs = activeUser?.preferences || {};
-    const newDefaults = newPrefs.transactionsDefaults || {};
-    setForm((prev) => ({
-      ...prev,
-      type: newDefaults.type || 'gasto',
-      category: newDefaults.defaultCategory || cats[0] || CATEGORIES[0],
-      user:
-        activeUser?.name ||
-        superAdminEmail ||
-        prev.user ||
-        'Usuario',
-    }));
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [activeUser?.id, superAdminEmail, cats]);
-
-  const mk = monthKeyStr;
-  const { start, end } = getBudgetPeriod(mk, budgetCutDay || 1);
-  const monthTx = [...data.transactions]
-    .filter((t) => {
-      const d = t.date || '';
-      return d >= start && d < end;
-    })
-    .sort((a, b) => (b.date || '').localeCompare(a.date || ''));
-
-  async function addTx(e) {
-    e.preventDefault();
-    const tx = {
-      ...form,
-      amount: parseAmountCLP(form.amount),
-      createdAt: Date.now(),
-    };
-    await actions.addTransaction(tx);
-    setForm((prev) => ({ ...prev, amount: '', note: '' }));
-  }
-
-  const totals = useMemo(() => {
-    const ing = monthTx
-      .filter((t) => t.type === 'ingreso')
-      .reduce((a, b) => a + Number(b.amount || 0), 0);
-    const gas = monthTx
-      .filter((t) => t.type === 'gasto')
-      .reduce((a, b) => a + Number(b.amount || 0), 0);
-    return { ing, gas, bal: ing - gas };
-  }, [monthTx]);
-
-  return (
-    <div className="grid gap-4 lg:grid-cols-3">
-      <Card className="lg:col-span-1">
-        <SectionTitle>Nuevo movimiento</SectionTitle>
-        <form onSubmit={addTx} className="grid gap-3">
-          <div className="grid gap-1">
-            <label className="text-sm">Fecha</label>
-            <input
-              type="date"
-              className="border rounded-lg p-2"
-              value={form.date}
-              onChange={(e) => setForm({ ...form, date: e.target.value })}
-            />
-          </div>
-          <div className="grid gap-1">
-            <label className="text-sm">Tipo</label>
-            <select
-              className="border rounded-lg p-2"
-              value={form.type}
-              onChange={(e) => setForm({ ...form, type: e.target.value })}
-            >
-              <option value="gasto">Gasto</option>
-              <option value="ingreso">Ingreso</option>
-            </select>
-          </div>
-          {form.type === 'gasto' && (
-            <div className="grid gap-1">
-              <label className="text-sm">Categoría</label>
-              <select
-                className="border rounded-lg p-2"
-                value={form.category}
-                onChange={(e) => setForm({ ...form, category: e.target.value })}
-              >
-                {cats.map((c) => (
-                  <option key={c} value={c}>
-                    {c}
-                  </option>
-                ))}
-              </select>
-            </div>
-          )}
-          <div className="grid gap-1">
-            <label className="text-sm">Monto (CLP)</label>
-            <input
-              type="text"
-              className="border rounded-lg p-2"
-              value={form.amount}
-              onChange={(e) =>
-                setForm({
-                  ...form,
-                  amount: formatAmountCLP(e.target.value),
-                })
-              }
-              required
-            />
-          </div>
-
-          <div className="grid gap-1">
-            <label className="text-sm">Persona</label>
-            <div className="border rounded-lg p-2 bg-gray-50 dark:bg-gray-900 text-sm">
-              {form.user}
-            </div>
-          </div>
-          <div className="grid gap-1">
-            <label className="text-sm">Nota (opcional)</label>
-            <input
-              className="border rounded-lg p-2"
-              value={form.note}
-              onChange={(e) => setForm({ ...form, note: e.target.value })}
-            />
-          </div>
-          <button className="px-3 py-2 rounded-xl border bg-gray-900 text-white">
-            Agregar
-          </button>
-        </form>
-
-        <div className="mt-4 text-sm space-y-1">
-          <div className="flex justify-between">
-            <span>Ingresos del periodo</span>
-            <strong>
-              <Money n={totals.ing} />
-            </strong>
-          </div>
-          <div className="flex justify-between">
-            <span>Gastos del periodo</span>
-            <strong>
-              <Money n={totals.gas} />
-            </strong>
-          </div>
-          <div
-            className={`flex justify-between ${
-              totals.bal >= 0 ? 'text-green-700' : 'text-red-600'
-            }`}
-          >
-            <span>Balance</span>
-            <strong>
-              <Money n={totals.bal} />
-            </strong>
-          </div>
-          <div className="text-xs text-gray-500">
-  Período: {formatBudgetPeriodLabel(mk, budgetCutDay || 1)} (día de corte {budgetCutDay})
-</div>
-        </div>
-      </Card>
-
-      <Card className="lg:col-span-2">
-        <SectionTitle>Movimientos del periodo</SectionTitle>
-        <div className="overflow-auto max-h-[60vh]">
-          <table className="w-full text-sm">
-            <thead className="sticky top-0 bg-white dark:bg-gray-800">
-              <tr>
-                <th className="text-left p-2">Fecha</th>
-                <th className="text-left p-2">Tipo</th>
-                <th className="text-left p-2">Categoría</th>
-                <th className="text-right p-2">Monto</th>
-                <th className="text-left p-2">Persona</th>
-                <th className="text-left p-2">Nota</th>
-                <th className="p-2"></th>
-              </tr>
-            </thead>
-            <tbody>
-              {monthTx.map((t) => (
-                <tr key={t.id} className="border-t">
-                  <td className="p-2">{t.date}</td>
-                  <td className="p-2">{t.type}</td>
-                  <td className="p-2">
-                    {t.type === 'gasto' ? t.category : '—'}
-                  </td>
-                  <td className="p-2 text-right">
-                    <Money n={t.amount} />
-                  </td>
-                  <td className="p-2">{t.user}</td>
-                  <td className="p-2">{t.note}</td>
-                  <td className="p-2 text-right">
-                    <button
-                      className="text-red-600"
-                      onClick={() => actions.removeTransaction(t.id)}
-                    >
-                      Eliminar
-                    </button>
-                  </td>
-                </tr>
-              ))}
-              {monthTx.length === 0 && (
-                <tr>
-                  <td colSpan={7} className="p-4 text-center text-gray-500">
-                    Sin movimientos en este periodo.
-                  </td>
-                </tr>
-              )}
-            </tbody>
-          </table>
-        </div>
-      </Card>
+        </Card>
+      )}
     </div>
   );
 }
 
 function Budgets({ data, actions, monthKeyStr }) {
-  const cats =
-    data.categories && data.categories.length ? data.categories : CATEGORIES;
+  const {
+    budgets = {},
+    transactions = [],
+    categories = [],
+    budgetCutDay = 1,
+  } = data || {};
 
+  const cats = categories && categories.length ? categories : CATEGORIES;
   const mk = monthKeyStr;
-  const cutDay = data.budgetCutDay || 1;
+  const cutDay = budgetCutDay;
 
+  // Periodo actual y anterior (según día de corte)
   const { start, end } = getBudgetPeriod(mk, cutDay);
   const prevMk = shiftMonth(mk, -1);
   const { start: prevStart, end: prevEnd } = getBudgetPeriod(prevMk, cutDay);
 
-  const [viewMode, setViewMode] = useState('amount');
+  const [viewMode, setViewMode] = useState('amount'); // amount | percent
 
-  const monthTx = data.transactions.filter((t) => {
+  const monthTx = transactions.filter((t) => {
     const d = t.date || '';
     return d >= start && d < end;
   });
 
-  const prevMonthTx = data.transactions.filter((t) => {
+  const prevMonthTx = transactions.filter((t) => {
     const d = t.date || '';
     return d >= prevStart && d < prevEnd;
   });
@@ -1392,14 +1557,17 @@ function Budgets({ data, actions, monthKeyStr }) {
   const ingresosPrev = prevMonthTx
     .filter((t) => t.type === 'ingreso')
     .reduce((a, b) => a + Number(b.amount || 0), 0);
+
   const gastosPrev = prevMonthTx
     .filter((t) => t.type === 'gasto')
     .reduce((a, b) => a + Number(b.amount || 0), 0);
+
   const saldoAnterior = ingresosPrev - gastosPrev; // puede ser + o -
 
   const ingresosPeriodo = monthTx
     .filter((t) => t.type === 'ingreso')
     .reduce((a, b) => a + Number(b.amount || 0), 0);
+
   const gastosPeriodo = monthTx
     .filter((t) => t.type === 'gasto')
     .reduce((a, b) => a + Number(b.amount || 0), 0);
@@ -1413,7 +1581,7 @@ function Budgets({ data, actions, monthKeyStr }) {
       .filter((t) => t.type === 'gasto' && t.category === c)
       .reduce((a, b) => a + Number(b.amount || 0), 0);
 
-    const b = data.budgets?.[c];
+    const b = budgets?.[c];
     let plan = 0;
     let funded = 0;
 
@@ -1427,12 +1595,10 @@ function Budgets({ data, actions, monthKeyStr }) {
     }
 
     const pctFundedUsed = funded > 0 ? (spent / funded) * 100 : 0;
-    const pctPlanFunded = plan > 0 ? (funded / plan) * 100 : 0;
 
-    return { c, spent, plan, funded, pctFundedUsed, pctPlanFunded };
+    return { c, spent, plan, funded, pctFundedUsed };
   });
 
-  const totalPlan = rows.reduce((a, r) => a + r.plan, 0);
   const totalFunded = rows.reduce((a, r) => a + r.funded, 0);
   const totalSpent = rows.reduce((a, r) => a + r.spent, 0);
 
@@ -1462,66 +1628,49 @@ function Budgets({ data, actions, monthKeyStr }) {
         <div className="space-y-3">
           {rows.map((r) => (
             <div key={r.c} className="border rounded-xl p-3">
-              <div className="flex items-center gap-3">
-                <div className="flex-1">
-                  <div className="flex justify-between text-sm mb-1">
-                    <span className="font-medium">{r.c}</span>
-                    <span>
-  {viewMode === 'amount' ? (
-    <>
-      <Money n={r.spent} /> / <Money n={r.funded} />{' '}
-      <span className="text-xs text-gray-500">
-        (Objetivo: <Money n={r.plan} />)
-      </span>
-    </>
-  ) : (
-    <>
-      Usado:{' '}
-      {r.funded > 0 ? r.pctFundedUsed.toFixed(0) : 0}% ·
-      Asignado sobre objetivo:{' '}
-      {r.plan > 0 ? r.pctPlanFunded.toFixed(0) : 0}%
-    </>
-  )}
-</span>
+              <div className="text-sm font-medium mb-2">{r.c}</div>
 
+              <div className="flex flex-col gap-3">
+                {/* Barra: Gasto vs Presupuesto */}
+                <div className="flex items-center gap-3">
+                  <div className="flex-1">
+                    <div className="flex justify-between text-xs mb-1">
+                      <span>Gasto vs Presupuestado</span>
+                      <span>
+                        {viewMode === 'amount' ? (
+                          <>
+                            <Money n={r.spent} /> / <Money n={r.funded} />
+                          </>
+                        ) : (
+                          <>
+                            {r.funded > 0
+                              ? `${r.pctFundedUsed.toFixed(0)}% usado`
+                              : '0% usado'}
+                          </>
+                        )}
+                      </span>
+                    </div>
+                    <Progress value={r.pctFundedUsed} />
                   </div>
-                  <Progress value={r.pctFundedUsed} />
-                  <p className="text-xs text-gray-500 mt-1">
-  Asignado {r.plan > 0 ? r.pctPlanFunded.toFixed(0) : 0}% del objetivo.
-</p>
-                </div>
 
-                {/* Inputs plan / funded */}
-                <div className="w-40 flex flex-col gap-2 text-xs">
+{/* Input: Presupuesto (antes "Asignado") */}
+<div className="w-32 text-xs">
   <label className="flex flex-col gap-1">
-    <span>Objetivo</span>
+    <span>Presupuesto</span>
     <input
       type="number"
-      className="border rounded-lg p-1.5 w-full"
-      value={r.plan}
       min={0}
       step="1"
-      onChange={(e) => actions.setBudgetPlan(r.c, e.target.value)}
-      title="Objetivo mensual para esta categoría"
-      placeholder="Objetivo"
-    />
-  </label>
-
-  <label className="flex flex-col gap-1">
-    <span>Asignado</span>
-    <input
-      type="number"
-      className="border rounded-lg p-1.5 w-full"
-      value={r.funded}
-      min={0}
-      step="1"
-      onChange={(e) => actions.setBudgetFunded(r.c, e.target.value)}
-      title="Monto real que asignas este período"
-      placeholder="Asignado"
+      className="border rounded-lg px-2 py-1 text-right"
+      value={r.funded || ''}
+      onChange={(e) =>
+        actions.setBudgetFunded(mk, r.c, e.target.value)
+      }
     />
   </label>
 </div>
 
+                </div>
               </div>
             </div>
           ))}
@@ -1530,87 +1679,105 @@ function Budgets({ data, actions, monthKeyStr }) {
 
       {/* DERECHA: resumen del período con rollover */}
       <Card>
-        <SectionTitle>Resumen del período</SectionTitle>
-        <div className="space-y-2 text-sm">
-          <div className="flex justify-between">
-            <span>Saldo anterior (rollover)</span>
-            <strong>
-              <Money n={saldoAnterior} />
-            </strong>
-          </div>
-          <div className="flex justify-between">
-            <span>Ingresos del período</span>
-            <strong>
-              <Money n={ingresosPeriodo} />
-            </strong>
-          </div>
-          <div className="flex justify-between">
-            <span>Disponible para presupuestar</span>
-            <strong>
-              <Money n={disponible} />
-            </strong>
-          </div>
-
-          <hr className="my-2" />
-
-          <div className="flex justify-between">
-            <span>Plan total</span>
-            <strong>
-              <Money n={totalPlan} />
-            </strong>
-          </div>
-          <div className="flex justify-between">
-            <span>Presupuesto financiado</span>
-            <strong>
-              <Money n={totalFunded} />
-            </strong>
-          </div>
-          <div className="flex justify-between">
-            <span>Sin asignar / sobreasignado</span>
-            <strong
-              className={
-                restanteSinAsignar < 0 ? 'text-red-600' : 'text-green-700'
-              }
-            >
-              <Money n={restanteSinAsignar} />
-            </strong>
-          </div>
-
-          <hr className="my-2" />
-
-          <div className="flex justify-between">
-            <span>Gastado</span>
-            <strong>
-              <Money n={gastosPeriodo} />
-            </strong>
-          </div>
-          <div className="flex justify-between">
-            <span>Balance final</span>
-            <strong
-              className={
-                balanceFinal < 0 ? 'text-red-600' : 'text-green-700'
-              }
-            >
-              <Money n={balanceFinal} />
-            </strong>
-          </div>
-
-          <div>
-            <div className="text-sm mb-1">% usado sobre financiado</div>
-            <Progress value={pctUsadoSobreFunded} />
-          </div>
-
-          <div className="text-xs text-gray-500">
-            Día de corte del mes: {data.budgetCutDay}
-          </div>
+      <SectionTitle>Resumen del período</SectionTitle>
+      <div className="space-y-2 text-sm">
+        {/* Bloque 1: Antes de presupuestar */}
+        <div className="text-xs font-semibold text-gray-500 uppercase">
+          1. Antes de presupuestar
         </div>
+
+        <div className="flex justify-between">
+          <span>Lo que traes del período anterior</span>
+          <strong>
+            <Money n={saldoAnterior} />
+          </strong>
+        </div>
+        <div className="flex justify-between">
+          <span>Ingresos de este período</span>
+          <strong>
+            <Money n={ingresosPeriodo} />
+          </strong>
+        </div>
+        <div className="flex justify-between">
+          <span>Total disponible para este período</span>
+          <strong>
+            <Money n={disponible} />
+          </strong>
+        </div>
+
+        <hr className="my-2" />
+
+        {/* Bloque 2: Tu presupuesto */}
+        <div className="text-xs font-semibold text-gray-500 uppercase">
+          2. Tu presupuesto
+        </div>
+
+        <div className="flex justify-between">
+          <span>Lo que ya asignaste en presupuestos</span>
+          <strong>
+            <Money n={totalFunded} />
+          </strong>
+        </div>
+        <div className="flex justify-between">
+          <span>Te queda por asignar / te pasaste</span>
+          <strong
+            className={
+              restanteSinAsignar < 0 ? 'text-red-600' : 'text-green-700'
+            }
+          >
+            <Money n={restanteSinAsignar} />
+          </strong>
+        </div>
+
+        <hr className="my-2" />
+
+        {/* Bloque 3: Lo que ha ocurrido de verdad */}
+        <div className="text-xs font-semibold text-gray-500 uppercase">
+          3. Lo que ha ocurrido de verdad
+        </div>
+
+        <div className="flex justify-between">
+          <span>Gastado hasta ahora</span>
+          <strong>
+            <Money n={gastosPeriodo} />
+          </strong>
+        </div>
+        <div className="flex justify-between">
+          <span>Te queda al final (si no gastas más)</span>
+          <strong
+            className={
+              balanceFinal < 0 ? 'text-red-600' : 'text-green-700'
+            }
+          >
+            <Money n={balanceFinal} />
+          </strong>
+        </div>
+        <div>
+          <div className="flex justify-between text-sm mb-1">
+            <span>% usado sobre tu presupuesto</span>
+            <span>
+              {totalFunded > 0
+                ? `${pctUsadoSobreFunded.toFixed(0)}%`
+                : '—'}
+            </span>
+          </div>
+          <Progress value={pctUsadoSobreFunded} />
+        </div>
+
+        <div className="text-xs text-gray-500">
+          Día de corte del mes: {budgetCutDay}
+        </div>
+      </div>
+
       </Card>
     </div>
   );
 }
-
+// --- DEUDAS & AHORRO ---
 
 function Debts({ data, actions }) {
+  const debts = data?.debts || [];
+
   const [form, setForm] = useState({
     name: '',
     original: '',
@@ -1687,7 +1854,7 @@ function Debts({ data, actions }) {
       <Card className="lg:col-span-2">
         <SectionTitle>Listado de deudas</SectionTitle>
         <div className="space-y-3">
-          {data.debts.map((d) => {
+          {debts.map((d) => {
             const progress =
               d.original > 0
                 ? ((d.original - d.remaining) / d.original) * 100
@@ -1710,7 +1877,7 @@ function Debts({ data, actions }) {
                     </div>
                   </div>
                   <div className="w-56">
-                    <Progress value={progress} />
+                    <Progress value={progress} mode="good" />
                     <div className="text-xs text-gray-600 mt-1">
                       Pagado: {progress.toFixed(1)}%
                     </div>
@@ -1730,6 +1897,7 @@ function Debts({ data, actions }) {
                     onClick={async () => {
                       const el = document.getElementById(`pay-${d.id}`);
                       const amt = Number(el?.value || 0);
+                      if (amt <= 0) return;
                       await actions.updateDebt(d.id, {
                         remaining: Math.max(0, Number(d.remaining || 0) - amt),
                       });
@@ -1748,7 +1916,7 @@ function Debts({ data, actions }) {
               </div>
             );
           })}
-          {data.debts.length === 0 && (
+          {debts.length === 0 && (
             <div className="text-gray-500">Sin deudas registradas.</div>
           )}
         </div>
@@ -1758,6 +1926,8 @@ function Debts({ data, actions }) {
 }
 
 function Savings({ data, actions }) {
+  const savings = data?.savings || [];
+
   const [form, setForm] = useState({ name: '', goal: '', saved: '' });
 
   async function addSaving(e) {
@@ -1810,7 +1980,7 @@ function Savings({ data, actions }) {
       <Card className="lg:col-span-2">
         <SectionTitle>Metas</SectionTitle>
         <div className="space-y-3">
-          {data.savings.map((s) => {
+          {savings.map((s) => {
             const pct = s.goal > 0 ? (s.saved / s.goal) * 100 : 0;
             return (
               <div
@@ -1826,7 +1996,7 @@ function Savings({ data, actions }) {
                     </div>
                   </div>
                   <div className="w-56">
-                    <Progress value={pct} />
+                    <Progress value={pct} mode="good" />
                     <div className="text-xs text-gray-600 mt-1">
                       Completado: {pct.toFixed(1)}%
                     </div>
@@ -1846,6 +2016,7 @@ function Savings({ data, actions }) {
                     onClick={async () => {
                       const el = document.getElementById(`sav-${s.id}`);
                       const amt = Number(el?.value || 0);
+                      if (amt <= 0) return;
                       await actions.updateSaving(s.id, {
                         saved: Number(s.saved || 0) + amt,
                       });
@@ -1864,7 +2035,7 @@ function Savings({ data, actions }) {
               </div>
             );
           })}
-          {data.savings.length === 0 && (
+          {savings.length === 0 && (
             <div className="text-gray-500">Sin metas registradas.</div>
           )}
         </div>
@@ -1872,119 +2043,6 @@ function Savings({ data, actions }) {
     </div>
   );
 }
-
-function Investments({ data, actions }) {
-  const [form, setForm] = useState({ name: '', contributed: '', current: '' });
-
-  async function addInv(e) {
-    e.preventDefault();
-    const i = {
-      name: form.name || 'Inversión',
-      contributed: Number(form.contributed || 0),
-      current: Number(form.current || 0),
-      createdAt: Date.now(),
-    };
-    await actions.addInvestment(i);
-    setForm({ name: '', contributed: '', current: '' });
-  }
-
-  return (
-    <div className="grid gap-4 lg:grid-cols-3">
-      <Card>
-        <SectionTitle>Nueva inversión</SectionTitle>
-        <form onSubmit={addInv} className="grid gap-3">
-          <input
-            className="border rounded-lg p-2"
-            placeholder="Nombre (ej. ETF SP500)"
-            value={form.name}
-            onChange={(e) => setForm({ ...form, name: e.target.value })}
-          />
-          <input
-            className="border rounded-lg p-2"
-            type="number"
-            min={0}
-            step="1"
-            placeholder="Contribuido (CLP)"
-            value={form.contributed}
-            onChange={(e) => setForm({ ...form, contributed: e.target.value })}
-          />
-          <input
-            className="border rounded-lg p-2"
-            type="number"
-            min={0}
-            step="1"
-            placeholder="Valor actual (CLP)"
-            value={form.current}
-            onChange={(e) => setForm({ ...form, current: e.target.value })}
-          />
-          <button className="px-3 py-2 rounded-xl border bg-gray-900 text-white">
-            Agregar inversión
-          </button>
-        </form>
-      </Card>
-
-      <Card className="lg:col-span-2">
-        <SectionTitle>Portafolio</SectionTitle>
-        <div className="space-y-3">
-          {data.investments.map((i) => {
-            const roi =
-              i.contributed > 0
-                ? ((i.current - i.contributed) / i.contributed) * 100
-                : 0;
-            return (
-              <div
-                key={i.id || i.name + i.contrib}
-                className="border rounded-xl p-3"
-              >
-                <div className="flex items-center justify-between">
-                  <div>
-                    <div className="font-medium">{i.name}</div>
-                    <div className="text-sm text-gray-600">
-                      Contribuido: <Money n={i.contributed} /> · Actual:{' '}
-                      <Money n={i.current} /> · ROI: {roi.toFixed(2)}%
-                    </div>
-                  </div>
-                  <div className="flex items-center gap-2">
-                    <input
-                      type="number"
-                      min={0}
-                      step="1"
-                      className="border rounded-lg p-2 w-40"
-                      placeholder="Nuevo valor"
-                      id={`inv-${i.id}`}
-                    />
-                    <button
-                      className="px-3 py-2 rounded-xl border"
-                      onClick={async () => {
-                        const el = document.getElementById(`inv-${i.id}`);
-                        await actions.updateInvestment(i.id, {
-                          current: Number(el?.value || 0),
-                        });
-                        if (el) el.value = '';
-                      }}
-                    >
-                      Actualizar
-                    </button>
-                    <button
-                      className="text-red-600"
-                      onClick={() => actions.removeInvestment(i.id)}
-                    >
-                      Eliminar
-                    </button>
-                  </div>
-                </div>
-              </div>
-            );
-          })}
-          {data.investments.length === 0 && (
-            <div className="text-gray-500">Sin inversiones registradas.</div>
-          )}
-        </div>
-      </Card>
-    </div>
-  );
-}
-
 function Settings({
   data,
   householdId,
@@ -2004,11 +2062,10 @@ function Settings({
   });
 
   const cats = categories && categories.length ? categories : CATEGORIES;
-const users = Array.isArray(data.householdUsers) ? data.householdUsers : [];
+  const users = Array.isArray(data.householdUsers) ? data.householdUsers : [];
 
-// Solo es super admin si el usuario de la casa seleccionado tiene isSuperAdmin = true
-const isSuperAdmin = !!activeHouseholdUser?.isSuperAdmin;
-
+  // Solo es super admin si el usuario de la casa seleccionado tiene isSuperAdmin = true
+  const isSuperAdmin = !!activeHouseholdUser?.isSuperAdmin;
 
   const superAdminUser = users.find((u) => u.isSuperAdmin) || null;
   const familyUsers = users.filter((u) => !u.isSuperAdmin);
@@ -2152,14 +2209,14 @@ const isSuperAdmin = !!activeHouseholdUser?.isSuperAdmin;
     const base = activeHouseholdUser?.preferences || {};
     return {
       defaultTab: base.defaultTab || 'dashboard',
-      showOnlyMyMovements: false,
-    dashboardCards: {
-      resumenMes: base.dashboardCards?.resumenMes ?? true,
-      deudas: base.dashboardCards?.deudas ?? true,
-      ahorro: base.dashboardCards?.ahorro ?? true,
-      inversiones: base.dashboardCards?.inversiones ?? true,
-      presupuestos: base.dashboardCards?.presupuestos ?? true,
-    },
+      showOnlyMyMovements: !!base.showOnlyMyMovements,
+      dashboardCards: {
+        resumenMes: base.dashboardCards?.resumenMes ?? true,
+        deudas: base.dashboardCards?.deudas ?? true,
+        ahorro: base.dashboardCards?.ahorro ?? true,
+        inversiones: base.dashboardCards?.inversiones ?? false, // por si en el futuro reactivas inversiones
+        presupuestos: base.dashboardCards?.presupuestos ?? true,
+      },
       transactionsDefaults: {
         type: base.transactionsDefaults?.type || 'gasto',
         defaultCategory:
@@ -2176,14 +2233,14 @@ const isSuperAdmin = !!activeHouseholdUser?.isSuperAdmin;
     const base = activeHouseholdUser?.preferences || {};
     setPrefs({
       defaultTab: base.defaultTab || 'dashboard',
-    showOnlyMyMovements: false,
-    dashboardCards: {
-      resumenMes: base.dashboardCards?.resumenMes ?? true,
-      deudas: base.dashboardCards?.deudas ?? true,
-      ahorro: base.dashboardCards?.ahorro ?? true,
-      inversiones: base.dashboardCards?.inversiones ?? true,
-      presupuestos: base.dashboardCards?.presupuestos ?? true,
-    },
+      showOnlyMyMovements: !!base.showOnlyMyMovements,
+      dashboardCards: {
+        resumenMes: base.dashboardCards?.resumenMes ?? true,
+        deudas: base.dashboardCards?.deudas ?? true,
+        ahorro: base.dashboardCards?.ahorro ?? true,
+        inversiones: base.dashboardCards?.inversiones ?? false,
+        presupuestos: base.dashboardCards?.presupuestos ?? true,
+      },
       transactionsDefaults: {
         type: base.transactionsDefaults?.type || 'gasto',
         defaultCategory:
@@ -2405,6 +2462,26 @@ const isSuperAdmin = !!activeHouseholdUser?.isSuperAdmin;
                 </div>
 
                 <div className="border rounded-xl p-3">
+                  <div className="font-medium text-sm mb-2">Vista y filtros</div>
+                  <div className="grid gap-2 text-sm">
+                    <label className="inline-flex items-center gap-2">
+                      <input
+                        type="checkbox"
+                        className="rounded border-gray-300"
+                        checked={prefs.showOnlyMyMovements}
+                        onChange={(e) =>
+                          setPrefs((prev) => ({
+                            ...prev,
+                            showOnlyMyMovements: e.target.checked,
+                          }))
+                        }
+                      />
+                      <span>Mostrar solo mis movimientos en la vista Movimientos</span>
+                    </label>
+                  </div>
+                </div>
+
+                <div className="border rounded-xl p-3">
                   <div className="font-medium text-sm mb-2">Aspecto</div>
                   <div className="grid gap-2 text-sm">
                     <div className="grid gap-1">
@@ -2575,23 +2652,23 @@ const isSuperAdmin = !!activeHouseholdUser?.isSuperAdmin;
                   {userForm.isSuperAdmin && familyUsers.length > 0 && '(obligatorio)'}
                 </label>
                 <input
-  className="border rounded-lg p-2"
-  type="text"
-  inputMode="numeric"
-  pattern="\d*"
-  name="household-pin"
-  autoComplete="off"
-  data-lpignore="true"
-  data-form-type="other"
-  style={{ WebkitTextSecurity: 'disc' }}
-  value={userForm.pin}
-  onChange={(e) =>
-    setUserForm((prev) => ({
-      ...prev,
-      pin: e.target.value,
-    }))
-  }
-/>
+                  className="border rounded-lg p-2"
+                  type="text"
+                  inputMode="numeric"
+                  pattern="\d*"
+                  name="household-pin"
+                  autoComplete="off"
+                  data-lpignore="true"
+                  data-form-type="other"
+                  style={{ WebkitTextSecurity: 'disc' }}
+                  value={userForm.pin}
+                  onChange={(e) =>
+                    setUserForm((prev) => ({
+                      ...prev,
+                      pin: e.target.value,
+                    }))
+                  }
+                />
 
                 <p className="text-xs text-gray-500">
                   {userForm.isSuperAdmin
@@ -2609,24 +2686,24 @@ const isSuperAdmin = !!activeHouseholdUser?.isSuperAdmin;
                       PIN del administrador (para autorizar)
                     </label>
                     <input
-  className="border rounded-lg p-2"
-  type="text"
-  inputMode="numeric"
-  pattern="\d*"
-  name="admin-authorization-pin"
-  autoComplete="off"
-  data-lpignore="true"
-  data-form-type="other"
-  style={{ WebkitTextSecurity: 'disc' }}
-  value={userForm.adminPin}
-  onChange={(e) =>
-    setUserForm((prev) => ({
-      ...prev,
-      adminPin: e.target.value,
-    }))
-  }
-  required
-/>
+                      className="border rounded-lg p-2"
+                      type="text"
+                      inputMode="numeric"
+                      pattern="\d*"
+                      name="admin-authorization-pin"
+                      autoComplete="off"
+                      data-lpignore="true"
+                      data-form-type="other"
+                      style={{ WebkitTextSecurity: 'disc' }}
+                      value={userForm.adminPin}
+                      onChange={(e) =>
+                        setUserForm((prev) => ({
+                          ...prev,
+                          adminPin: e.target.value,
+                        }))
+                      }
+                      required
+                    />
 
                     <p className="text-xs text-gray-500">
                       Escribe el PIN del administrador del hogar para confirmar la
@@ -2693,6 +2770,10 @@ export default function App() {
 
   const h = useHouseholdData(selectedHid);
 
+  const budgetsForSelectedMonth =
+  (h.budgets && h.budgets[selectedMonth]) || {};
+
+
   const householdUsers = h.householdUsers || [];
   const activeUser =
     householdUsers.find((u) => u.id === selectedHouseholdUserId) || null;
@@ -2754,13 +2835,13 @@ export default function App() {
   async function handleUserLogin(e) {
     e.preventDefault();
     setLoginError('');
-  
+
     const user = householdUsers.find((u) => u.id === loginUserId);
     if (!user) {
       setLoginError('Usuario inválido');
       return;
     }
-  
+
     // MODO NORMAL: validar PIN
     if (!useAccountPassword) {
       if (user.pin && user.pin !== loginPin) {
@@ -2773,7 +2854,7 @@ export default function App() {
         setLoginError('Solo el administrador puede usar la contraseña de la cuenta.');
         return;
       }
-  
+
       const current = auth.currentUser;
       if (!current || !current.email) {
         setLoginError(
@@ -2781,12 +2862,12 @@ export default function App() {
         );
         return;
       }
-  
+
       if (!accountPassword.trim()) {
         setLoginError('Escribe la contraseña de tu cuenta.');
         return;
       }
-  
+
       try {
         const cred = EmailAuthProvider.credential(
           current.email,
@@ -2800,7 +2881,7 @@ export default function App() {
         return;
       }
     }
-  
+
     // Si llegó aquí, pasó la validación (PIN o contraseña)
     setSelectedHouseholdUserId(user.id);
     setShowUserSelector(false);
@@ -2809,10 +2890,8 @@ export default function App() {
     setUseAccountPassword(false);
     setLoginError('');
   }
-  
 
   async function handleAdminLoginWithPassword(password) {
-    // Usuario actualmente autenticado en Firebase (email/contraseña)
     if (!authedUser || !authedUser.email) {
       setLoginError(
         'Primero debes iniciar sesión con tu email y contraseña.'
@@ -2820,7 +2899,6 @@ export default function App() {
       return;
     }
 
-    // Usuario de la casa que es Admin
     const adminUser = householdUsers.find((u) => u.isSuperAdmin);
     if (!adminUser) {
       setLoginError('No hay un administrador configurado en este hogar.');
@@ -2828,11 +2906,9 @@ export default function App() {
     }
 
     try {
-      // Reautenticar con la contraseña de la cuenta
       const cred = EmailAuthProvider.credential(authedUser.email, password);
       await reauthenticateWithCredential(authedUser, cred);
 
-      // Si la contraseña es correcta, entramos como Admin ignorando el PIN
       setSelectedHouseholdUserId(adminUser.id);
       setShowUserSelector(false);
       setLoginPin('');
@@ -2842,8 +2918,6 @@ export default function App() {
       setLoginError('Contraseña incorrecta.');
     }
   }
-
-
 
   const handleLogout = async () => {
     await signOut(auth);
@@ -2862,27 +2936,23 @@ export default function App() {
   const density = userPrefs.ui?.density || 'normal';
   const showOnlyMyMovements = !!userPrefs.showOnlyMyMovements;
 
-  const filteredTransactions = useMemo(() => {
-    if (!showOnlyMyMovements || !activeUser?.name) return h.transactions;
-    return h.transactions.filter((t) => t.user === activeUser.name);
-  }, [h.transactions, showOnlyMyMovements, activeUser?.name]);
-
   const data = {
-    categories: h.categories,
-    budgets: h.budgets,
-    transactions: filteredTransactions,
-    debts: h.debts,
-    savings: h.savings,
-    investments: h.investments,
-    householdUsers: h.householdUsers,
-    superAdminEmail: h.superAdminEmail,
-    budgetCutDay: h.budgetCutDay,
-  };
+  categories: h.categories,
+  budgets: budgetsForSelectedMonth,
+  transactions: h.transactions,
+  debts: h.debts,
+  savings: h.savings,
+  householdUsers: h.householdUsers,
+  superAdminEmail: h.superAdminEmail,
+  budgetCutDay: h.budgetCutDay,
+};
+
+  
 
   const actions = {
     setBudget: h.setBudget,
     setBudgetPlan: h.setBudgetPlan,
-    setBudgetFunded: h.setBudgetFunded,
+    setBudgetFunded: (monthKeyStr, cat, value) => h.setBudgetFunded(monthKeyStr, cat, value),
     addTransaction: h.addTransaction,
     removeTransaction: h.removeTransaction,
     addDebt: h.addDebt,
@@ -2891,9 +2961,6 @@ export default function App() {
     addSaving: h.addSaving,
     updateSaving: h.updateSaving,
     removeSaving: h.removeSaving,
-    addInvestment: h.addInvestment,
-    updateInvestment: h.updateInvestment,
-    removeInvestment: h.removeInvestment,
     addCategory: h.addCategory,
     removeCategory: h.removeCategory,
     renameCategory: h.renameCategory,
@@ -2902,6 +2969,7 @@ export default function App() {
     removeHouseholdUser: h.removeHouseholdUser,
     setBudgetCutDay: h.setBudgetCutDay,
   };
+  
 
   const superAdminUser =
     householdUsers.find((u) => u.isSuperAdmin) || null;
@@ -2946,101 +3014,95 @@ export default function App() {
                 onSubmit={handleUserLogin}
                 autoComplete="off"
               >
-
-<div className="grid gap-1">
-                <label className="text-sm">Usuario</label>
-                <select
-                  className="border rounded-lg p-2"
-                  value={loginUserId}
-                  onChange={(e) => {
-                    setLoginUserId(e.target.value);
-                    setLoginError('');
-                    setUseAccountPassword(false);
-                    setAccountPassword('');
-                    setLoginPin('');
-                  }}
-                >
-                  {householdUsers.map((u) => (
-                    <option key={u.id} value={u.id}>
-                      {u.name} {u.isSuperAdmin ? '(Admin)' : ''}
-                    </option>
-                  ))}
-                </select>
-              </div>
-
-              
-
+                <div className="grid gap-1">
+                  <label className="text-sm">Usuario</label>
+                  <select
+                    className="border rounded-lg p-2"
+                    value={loginUserId}
+                    onChange={(e) => {
+                      setLoginUserId(e.target.value);
+                      setLoginError('');
+                      setUseAccountPassword(false);
+                      setAccountPassword('');
+                      setLoginPin('');
+                    }}
+                  >
+                    {householdUsers.map((u) => (
+                      <option key={u.id} value={u.id}>
+                        {u.name} {u.isSuperAdmin ? '(Admin)' : ''}
+                      </option>
+                    ))}
+                  </select>
+                </div>
 
                 <div className="grid gap-2">
-  {/* Campo PIN (solo cuando NO usamos contraseña de la cuenta) */}
-  {!useAccountPassword && (
-    <div className="grid gap-1">
-      <label className="text-sm">
-        PIN (si el usuario no tiene PIN, deja en blanco)
-      </label>
-      <input
-  type="text"                // <-- ya no es password
-  inputMode="numeric"
-  pattern="\d*"
-  name="household-pin-login"
-  autoComplete="off"
-  data-lpignore="true"
-  data-form-type="other"
-  className="border rounded-lg p-2"
-  value={loginPin}
-  onChange={(e) => setLoginPin(e.target.value)}
-  placeholder="PIN (si el usuario no tiene PIN, deja en blanco)"
-  style={{ WebkitTextSecurity: 'disc' }}  // <-- se ve como contraseña, pero no lo es
-/>
+                  {!useAccountPassword && (
+                    <div className="grid gap-1">
+                      <label className="text-sm">
+                        PIN (si el usuario no tiene PIN, deja en blanco)
+                      </label>
+                      <input
+                        type="text"
+                        inputMode="numeric"
+                        pattern="\d*"
+                        name="household-pin-login"
+                        autoComplete="off"
+                        data-lpignore="true"
+                        data-form-type="other"
+                        className="border rounded-lg p-2"
+                        value={loginPin}
+                        onChange={(e) => setLoginPin(e.target.value)}
+                        placeholder="PIN (si el usuario no tiene PIN, deja en blanco)"
+                        style={{ WebkitTextSecurity: 'disc' }}
+                      />
+                      <p className="text-xs text-gray-500">
+                        Si olvidaste tu PIN, pídele ayuda al administrador del hogar.
+                      </p>
+                    </div>
+                  )}
 
+                  {useAccountPassword && (
+                    <div className="grid gap-1">
+                      <label className="text-sm">
+                        Contraseña de tu cuenta (no el PIN)
+                      </label>
+                      <input
+                        type="password"
+                        name="admin-account-password"
+                        autoComplete="current-password"
+                        className="border rounded-lg p-2"
+                        value={accountPassword}
+                        onChange={(e) => setAccountPassword(e.target.value)}
+                        placeholder="Escribe la contraseña de tu cuenta"
+                      />
+                      <p className="text-xs text-gray-500">
+                        Usaremos tu contraseña de Firebase para confirmar que eres el
+                        administrador y dejarte entrar aunque no recuerdes el PIN.
+                      </p>
+                    </div>
+                  )}
 
-      <p className="text-xs text-gray-500">
-        Si olvidaste tu PIN, pídele ayuda al administrador del hogar.
-      </p>
-    </div>
-  )}
-
-  {/* Modo recuperación: contraseña de la cuenta del admin */}
-  {useAccountPassword && (
-    <div className="grid gap-1">
-      <label className="text-sm">Contraseña de tu cuenta (no el PIN)</label>
-      <input
-        type="password"
-        name="admin-account-password"
-        autoComplete="current-password"
-        className="border rounded-lg p-2"
-        value={accountPassword}
-        onChange={(e) => setAccountPassword(e.target.value)}
-        placeholder="Escribe la contraseña de tu cuenta"
-      />
-      <p className="text-xs text-gray-500">
-        Usaremos tu contraseña de Firebase para confirmar que eres el
-        administrador y dejarte entrar aunque no recuerdes el PIN.
-      </p>
-    </div>
-  )}
-
-  {/* Toggle entre PIN y contraseña de cuenta (solo si el usuario elegido es admin) */}
-  {(() => {
-    const selectedUser = householdUsers.find((u) => u.id === loginUserId);
-    if (!selectedUser || !selectedUser.isSuperAdmin) return null;
-    return (
-      <button
-        type="button"
-        className="text-xs text-blue-600 underline text-left"
-        onClick={() => {
-          setUseAccountPassword((prev) => !prev);
-          setLoginError('');
-        }}
-      >
-        {useAccountPassword
-          ? 'Volver a usar el PIN del admin'
-          : '¿Olvidaste tu PIN de admin? Entra usando tu contraseña de la cuenta.'}
-      </button>
-    );
-  })()}
-</div>
-
+                  {(() => {
+                    const selectedUser = householdUsers.find(
+                      (u) => u.id === loginUserId
+                    );
+                    if (!selectedUser || !selectedUser.isSuperAdmin) return null;
+                    return (
+                      <button
+                        type="button"
+                        className="text-xs text-blue-600 underline text-left"
+                        onClick={() => {
+                          setUseAccountPassword((prev) => !prev);
+                          setLoginError('');
+                        }}
+                      >
+                        {useAccountPassword
+                          ? 'Volver a usar el PIN del admin'
+                          : '¿Olvidaste tu PIN de admin? Entra usando tu contraseña de la cuenta.'}
+                      </button>
+                    );
+                  })()}
+                </div>
 
                 {loginError && (
                   <div className="text-xs text-red-600">{loginError}</div>
@@ -3084,64 +3146,72 @@ export default function App() {
           hasCtx && showUserSelector ? 'filter blur-sm pointer-events-none' : ''
         }
       >
-{hasCtx && tab !== 'settings' && (
-  <div
-    className={`max-w-6xl mx-auto px-4 mt-2 mb-1 flex items-center justify-between text-sm ${
-      theme === 'dark' ? 'text-gray-100' : 'text-gray-900 dark:text-gray-100'
-    }`}
-  >
-    <div className="flex items-center gap-2">
-      <button
-        className="px-2 py-1 border rounded-lg"
-        onClick={() => setSelectedMonth((prev) => shiftMonth(prev, -1))}
-      >
-        ◀
-      </button>
-      <span className="font-medium">
-        {formatBudgetPeriodLabel(selectedMonth, data.budgetCutDay || 1)}
-      </span>
-      <button
-        className="px-2 py-1 border rounded-lg"
-        onClick={() => setSelectedMonth((prev) => shiftMonth(prev, 1))}
-      >
-        ▶
-      </button>
-    </div>
-    <div className="flex items-center gap-2">
-      <button
-        className="px-2 py-1 border rounded-lg"
-        onClick={() => setSelectedMonth(monthKey())}
-      >
-        Ir a mes actual
-      </button>
-    </div>
-  </div>
-)}
+        {hasCtx && tab !== 'settings' && (
+          <div
+            className={`max-w-6xl mx-auto px-4 mt-2 mb-1 flex items-center justify-between text-sm ${
+              theme === 'dark'
+                ? 'text-gray-100'
+                : 'text-gray-900 dark:text-gray-100'
+            }`}
+          >
+            <div className="flex items-center gap-2">
+              <button
+                className="px-2 py-1 border rounded-lg"
+                onClick={() => setSelectedMonth((prev) => shiftMonth(prev, -1))}
+              >
+                ◀
+              </button>
+              <span className="font-medium">
+                {formatBudgetPeriodLabel(selectedMonth, data.budgetCutDay || 1)}
+              </span>
+              <button
+                className="px-2 py-1 border rounded-lg"
+                onClick={() => setSelectedMonth((prev) => shiftMonth(prev, 1))}
+              >
+                ▶
+              </button>
+            </div>
+            <div className="flex items-center gap-2">
+            <button
+              className="px-2 py-1 border rounded-lg"
+              onClick={() => {
+                const todayStr = new Date().toISOString().slice(0, 10); // "YYYY-MM-DD"
+                const currentBudgetKey = budgetMonthKeyForDate(
+                  todayStr,
+                  data.budgetCutDay || 1
+                );
+                setSelectedMonth(currentBudgetKey);
+              }}
+            >
+              Ir al periodo actual
+            </button>
+
+            </div>
+          </div>
+        )}
 
         <main
           className={`max-w-6xl mx-auto p-4 grid gap-4 ${
             density === 'compact' ? 'text-xs' : 'text-sm'
           }`}
         >
-          {!hasCtx && (
-            <AuthGate onReady={(c) => setCtx(c)} />
-          )}
+          {!hasCtx && <AuthGate onReady={(c) => setCtx(c)} />}
 
           {hasCtx && tab === 'dashboard' && (
-            <Dashboard
-              data={{
-                categories: data.categories,
-                budgets: data.budgets,
-                transactions: data.transactions,
-                debts: data.debts,
-                savings: data.savings,
-                investments: data.investments,
-                budgetCutDay: data.budgetCutDay,
-                activeUserPreferences: userPrefs,
-              }}
-              monthKeyStr={selectedMonth}
-            />
-          )}
+          <Dashboard
+            data={{
+              categories: data.categories,
+              budgets: data.budgets,
+              transactions: data.transactions,
+              debts: data.debts,
+              savings: data.savings,
+              budgetCutDay: data.budgetCutDay,
+              activeUserPreferences: userPrefs,
+            }}
+            monthKeyStr={selectedMonth}
+          />
+        )}
+
 
           {hasCtx && tab === 'transactions' && (
             <Transactions
@@ -3154,6 +3224,7 @@ export default function App() {
               monthKeyStr={selectedMonth}
               superAdminEmail={data.superAdminEmail || ctx.user?.email || null}
               budgetCutDay={data.budgetCutDay}
+              onChangeMonth={setSelectedMonth}
             />
           )}
 
@@ -3178,32 +3249,26 @@ export default function App() {
             <Savings data={{ savings: data.savings }} actions={actions} />
           )}
 
-          {hasCtx && tab === 'investments' && (
-            <Investments
-              data={{ investments: data.investments }}
-              actions={actions}
-            />
-          )}
+          {/* YA NO HAY VISTA DE INVERSIONES */}
 
           {hasCtx && tab === 'settings' && (
-            <Settings
-              data={{
-                budgets: data.budgets,
-                transactions: data.transactions,
-                debts: data.debts,
-                savings: data.savings,
-                investments: data.investments,
-                householdUsers: data.householdUsers,
-                superAdminEmail: data.superAdminEmail,
-                budgetCutDay: data.budgetCutDay,
-              }}
-              householdId={selectedHid}
-              user={ctx.user}
-              categories={data.categories}
-              actions={actions}
-              activeHouseholdUser={activeUser}
-            />
-          )}
+          <Settings
+            data={{
+              budgets: data.budgets,
+              transactions: data.transactions,
+              debts: data.debts,
+              savings: data.savings,
+              householdUsers: data.householdUsers,
+              superAdminEmail: data.superAdminEmail,
+              budgetCutDay: data.budgetCutDay,
+            }}
+            householdId={selectedHid}
+            user={ctx.user}
+            categories={data.categories}
+            actions={actions}
+            activeHouseholdUser={activeUser}
+          />
+        )}
         </main>
 
         <footer className="text-center text-xs text-gray-500 p-4">
