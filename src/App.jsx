@@ -3190,11 +3190,12 @@ export default function App() {
           </div>
         )}
 
-        <main
-          className={`max-w-6xl mx-auto p-4 grid gap-4 ${
-            density === 'compact' ? 'text-xs' : 'text-sm'
-          }`}
-        >
+<main
+  className={`max-w-6xl mx-auto px-4 py-4 grid gap-4 ${
+    density === 'compact' ? 'text-xs' : 'text-sm'
+  }`}
+>
+
           {!hasCtx && <AuthGate onReady={(c) => setCtx(c)} />}
 
           {hasCtx && tab === 'dashboard' && (
