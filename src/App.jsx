@@ -32,8 +32,11 @@ import {
   where,
 } from 'firebase/firestore';
 
+const DEBT_CATEGORY = 'Deudas';
+
 // --- Utils ---
 const CATEGORIES = [
+  DEBT_CATEGORY,
   'Hogar',
   'Alimentación',
   'Transporte',
@@ -44,6 +47,7 @@ const CATEGORIES = [
   'Vestuario',
   'Otros',
 ];
+
 
 function monthKey(date = new Date()) {
   return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}`;
@@ -112,6 +116,24 @@ function budgetMonthKeyForDate(dateStr, cutDay = 1) {
   const base = new Date(d.getFullYear(), d.getMonth() + offset, 1);
   return monthKey(base);
 }
+
+function addMonthsToDate(dateStr, delta) {
+  if (!dateStr) return '';
+  const [y, m, d] = dateStr.split('-').map(Number);
+  if (!y || !m || !d) return dateStr;
+  const dt = new Date(y, m - 1 + delta, d);
+  return dt.toISOString().slice(0, 10);
+}
+
+function computeQuotaStatus(planned, paid) {
+  const pPlan = Number(planned || 0);
+  const pPaid = Number(paid || 0);
+  if (pPaid <= 0 && pPlan <= 0) return 'none';
+  if (pPaid <= 0) return 'pending';
+  if (pPaid + 1e-6 < pPlan) return 'partial';
+  return 'paid';
+}
+
 
 function Money({ n }) {
   const sign = Number(n) < 0 ? '-' : '';
@@ -521,11 +543,21 @@ function useHouseholdData(householdId) {
 
     const unsubHH = onSnapshot(doc(db, 'households', householdId), (snap) => {
       const d = snap.data() || {};
-      const cats =
-        d.categories && Array.isArray(d.categories)
-          ? d.categories
-          : [...CATEGORIES];
-      setCategories(cats);
+      const rawCats =
+      d.categories && Array.isArray(d.categories)
+        ? d.categories
+        : [...CATEGORIES];
+
+    // Asegurar que "Deudas" exista y vaya al comienzo
+    let cats;
+    if (!rawCats.includes(DEBT_CATEGORY)) {
+      cats = [DEBT_CATEGORY, ...rawCats];
+    } else {
+      cats = [DEBT_CATEGORY, ...rawCats.filter((c) => c !== DEBT_CATEGORY)];
+    }
+
+    setCategories(cats);
+
 
       // Presupuestos por mes guardados en el campo "budgets"
       const rawBudgets = d.budgets || {};
@@ -707,6 +739,10 @@ async function setBudgetFunded(monthKeyStr, cat, value) {
   async function addCategory(name) {
     const trimmed = String(name || '').trim();
     if (!trimmed) return;
+
+    // "Deudas" es una categoría fija, no se agrega manualmente
+    if (trimmed === DEBT_CATEGORY) return;
+
 
     const ref = doc(db, 'households', householdId);
     const snap = await getDoc(ref);
@@ -920,7 +956,36 @@ function Transactions({
   superAdminEmail,
   budgetCutDay,
 }) {
-  const { transactions = [], categories = [] } = data || {};
+  const {
+    transactions = [],
+    categories = [],
+    debts = [],
+  } = data || {};
+
+  const debtsArray = Array.isArray(debts) ? debts : [];
+
+  const currentPeriodKey = useMemo(
+    () => monthKeyStr || monthKey(new Date()),
+    [monthKeyStr]
+  );
+  
+
+
+  // Suma de: (cuota planificada - pagado) de todos los periodos <= actual
+  const suggestedDebtAmount = useMemo(() => {
+    if (!currentPeriodKey) return 0;
+
+    return debtsArray
+      .flatMap((d) => (Array.isArray(d.schedule) ? d.schedule : []))
+      .filter((q) => q.periodKey && q.periodKey <= currentPeriodKey)
+      .reduce((sum, q) => {
+        const planned = Number(q.plannedAmount || 0);
+        const paid = Number(q.paidAmount || 0);
+        const remaining = planned - paid;
+        return remaining > 0 ? sum + remaining : sum;
+      }, 0);
+  }, [debtsArray, currentPeriodKey]);
+
   const { addTransaction, removeTransaction } = actions || {};
 
   const [type, setType] = useState('gasto'); // gasto | ingreso
@@ -935,6 +1000,28 @@ function Transactions({
   const [showGastoModal, setShowGastoModal] = useState(false);
   const [amountFormatted, setAmountFormatted] = useState('');
 
+  // Cuando abres "Nuevo gasto" con categoría Deuda, autocompleta el monto
+  useEffect(() => {
+    const isDebtCategory = category === 'Deuda'; // usa EXACTAMENTE el nombre que tengas en tu lista de categorías
+    const modalOpen = showGastoModal;
+
+    if (!modalOpen) return;          // solo cuando está abierto el modal de gasto
+    if (type !== 'gasto') return;    // solo en gastos
+    if (!isDebtCategory) return;     // solo si la categoría es Deuda
+    if (suggestedDebtAmount <= 0) return;
+
+    // Si ya escribió un monto, no lo tocamos
+    if (amount && Number(amount) > 0) return;
+
+    const n = Math.round(suggestedDebtAmount);
+    const digits = String(n);
+    const formatted = new Intl.NumberFormat('es-CL', {
+      maximumFractionDigits: 0,
+    }).format(n);
+
+    setAmount(digits);        // valor "real" sin formato
+    setAmountFormatted(formatted); // valor mostrado con puntos
+  }, [showGastoModal, type, category, suggestedDebtAmount, amount]);
 
 
   const periodLabel = useMemo(
@@ -1320,6 +1407,7 @@ if (!n || n <= 0 || !addTransaction) {
     </div>
   );
 }
+
 // --- DASHBOARD & PRESUPUESTOS ---
 function Dashboard({ data, monthKeyStr }) {
   const {
@@ -1530,11 +1618,23 @@ function Budgets({ data, actions, monthKeyStr }) {
     transactions = [],
     categories = [],
     budgetCutDay = 1,
+    debts = [],
   } = data || {};
+
 
   const cats = categories && categories.length ? categories : CATEGORIES;
   const mk = monthKeyStr;
   const cutDay = budgetCutDay;
+
+  const debtsArray = Array.isArray(debts) ? debts : [];
+
+  const debtPlannedForPeriod = debtsArray
+    .flatMap((d) =>
+      Array.isArray(d.schedule) ? d.schedule : []
+    )
+    .filter((q) => q.periodKey === mk)
+    .reduce((sum, q) => sum + Number(q.plannedAmount || 0), 0);
+
 
   // Periodo actual y anterior (según día de corte)
   const { start, end } = getBudgetPeriod(mk, cutDay);
@@ -1593,6 +1693,14 @@ function Budgets({ data, actions, monthKeyStr }) {
         b.funded !== undefined ? b.funded : (b.plan || 0)
       );
     }
+
+        // Si es la categoría fija "Deudas" y no hay presupuesto guardado,
+    // usa por defecto la suma de cuotas planificadas para este período.
+    if (c === DEBT_CATEGORY && !b && debtPlannedForPeriod > 0) {
+      plan = debtPlannedForPeriod;
+      funded = debtPlannedForPeriod;
+    }
+
 
     const pctFundedUsed = funded > 0 ? (spent / funded) * 100 : 0;
 
@@ -1775,59 +1883,279 @@ function Budgets({ data, actions, monthKeyStr }) {
 }
 // --- DEUDAS & AHORRO ---
 
-function Debts({ data, actions }) {
+function Debts({ data, actions, monthKeyStr }) {
   const debts = data?.debts || [];
+  const budgetCutDay = data?.budgetCutDay || 1;
+
+  const { addDebt, updateDebt, removeDebt } = actions || {};
 
   const [form, setForm] = useState({
     name: '',
     original: '',
     remaining: '',
     rateAPR: '',
-    due: '',
+    firstDue: '',
+    installments: '',
   });
 
-  async function addDebt(e) {
+  const [quotaModal, setQuotaModal] = useState(null); // { debtId, quotaId, periodKey, plannedAmount, paidAmount, dueDate }
+
+  const [debtEditModal, setDebtEditModal] = useState(null);
+
+  function openDebtEditModal(debt) {
+    setDebtEditModal({
+      id: debt.id,
+      name: debt.name || '',
+      rateAPR: debt.rateAPR != null ? String(debt.rateAPR) : '',
+      due: debt.due || '',
+    });
+  }
+
+  async function handleSaveDebtMeta(e) {
     e.preventDefault();
+    if (!debtEditModal || !updateDebt) return;
+
+    const { id, name, rateAPR, due } = debtEditModal;
+
+    await updateDebt(id, {
+      name: name || 'Deuda',
+      rateAPR: rateAPR !== '' ? Number(rateAPR) : 0,
+      due: due || null,
+    });
+
+    setDebtEditModal(null);
+  }
+
+
+// clave del período actual basada en HOY
+const currentPeriodKey = useMemo(
+  () => monthKeyStr || monthKey(new Date()),
+  [monthKeyStr]
+);
+
+const visiblePeriods = useMemo(() => {
+  const center = currentPeriodKey;
+  const arr = [];
+  // solo 6 periodos: 2 antes, 3 después
+  for (let delta = -2; delta <= 3; delta += 1) {
+    arr.push(shiftMonth(center, delta));
+  }
+  return arr;
+}, [currentPeriodKey]);
+
+
+
+  function handleFormChange(field, value) {
+    setForm((prev) => ({ ...prev, [field]: value }));
+  }
+
+  function buildSchedule(totalRemaining, installments, firstDue) {
+    const n = Math.max(1, installments);
+    const per = Math.floor(totalRemaining / n);
+    const schedule = [];
+    let acc = 0;
+
+    for (let i = 0; i < n; i += 1) {
+      let planned = per;
+      if (i === n - 1) {
+        planned = totalRemaining - acc;
+      }
+      acc += planned;
+
+      const dueDate = addMonthsToDate(firstDue, i);
+      const periodKey = budgetMonthKeyForDate(dueDate, budgetCutDay);
+
+      schedule.push({
+        id: `${Date.now()}-${i}-${Math.random().toString(36).slice(2, 6)}`,
+        periodKey,
+        dueDate,
+        plannedAmount: planned,
+        paidAmount: 0,
+        status: computeQuotaStatus(planned, 0),
+      });
+    }
+
+    return schedule;
+  }
+
+  async function handleAddDebt(e) {
+    e.preventDefault();
+
+    const original = Number(form.original || 0);
+    if (!original || !addDebt) return;
+
+    const remaining =
+      form.remaining && Number(form.remaining) > 0
+        ? Number(form.remaining)
+        : original;
+
+    const alreadyPaid = Math.max(0, original - remaining);
+    const installments = Math.max(1, Number(form.installments || 1));
+    const firstDue =
+      form.firstDue || new Date().toISOString().slice(0, 10);
+
+    const schedule = buildSchedule(remaining, installments, firstDue);
+    const lastQuota = schedule[schedule.length - 1];
+
     const d = {
       name: form.name || 'Deuda',
-      original: Number(form.original || 0),
-      remaining: Number(form.remaining || 0),
+      original,
+      remaining,
+      alreadyPaid,
       rateAPR: Number(form.rateAPR || 0),
-      due: form.due || '',
+      due: lastQuota?.dueDate || firstDue,
       createdAt: Date.now(),
+      schedule,
     };
-    await actions.addDebt(d);
-    setForm({ name: '', original: '', remaining: '', rateAPR: '', due: '' });
+
+    await addDebt(d);
+
+    setForm({
+      name: '',
+      original: '',
+      remaining: '',
+      rateAPR: '',
+      firstDue: '',
+      installments: '',
+    });
+  }
+
+  function openQuotaModal(debt, quota, defaultPeriodKey) {
+    const basePeriodKey = quota?.periodKey || defaultPeriodKey || monthKeyStr || monthKey();
+    const { end } = getBudgetPeriod(
+      basePeriodKey,
+      budgetCutDay
+    );
+    const defaultDueDate = quota?.dueDate || end;
+
+    setQuotaModal({
+      debtId: debt.id,
+      quotaId: quota?.id || null,
+      periodKey: basePeriodKey,
+      plannedAmount:
+        quota && quota.plannedAmount != null
+          ? String(quota.plannedAmount)
+          : '',
+      paidAmount:
+        quota && quota.paidAmount != null ? String(quota.paidAmount) : '',
+      dueDate: defaultDueDate,
+    });
+  }
+
+  async function handleSaveQuota(e) {
+    e.preventDefault();
+    if (!quotaModal || !updateDebt) return;
+
+    const { debtId, quotaId, periodKey, plannedAmount, paidAmount, dueDate } =
+      quotaModal;
+
+    const debt = debts.find((d) => d.id === debtId);
+    if (!debt) {
+      setQuotaModal(null);
+      return;
+    }
+
+    const schedule = Array.isArray(debt.schedule) ? [...debt.schedule] : [];
+
+    if (quotaId) {
+      const idx = schedule.findIndex((q) => q.id === quotaId);
+      if (idx !== -1) {
+        schedule[idx] = {
+          ...schedule[idx],
+          periodKey,
+          plannedAmount: Number(plannedAmount || 0),
+          paidAmount: Number(paidAmount || 0),
+          dueDate,
+          status: computeQuotaStatus(plannedAmount, paidAmount),
+        };
+      }
+    } else {
+      schedule.push({
+        id: `${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+        periodKey,
+        plannedAmount: Number(plannedAmount || 0),
+        paidAmount: Number(paidAmount || 0),
+        dueDate,
+        status: computeQuotaStatus(plannedAmount, paidAmount),
+      });
+    }
+
+    const totalPaidFromSchedule = schedule.reduce(
+      (sum, q) => sum + Number(q.paidAmount || 0),
+      0
+    );
+    const newRemaining = Math.max(
+      0,
+      Number(debt.original || 0) - totalPaidFromSchedule
+    );
+
+    await updateDebt(debtId, { schedule, remaining: newRemaining });
+
+    setQuotaModal(null);
+  }
+
+  function quotaBoxColor(quota) {
+    const status =
+      quota?.status ||
+      computeQuotaStatus(quota?.plannedAmount, quota?.paidAmount);
+
+    if (status === 'paid') return 'bg-green-600 text-white';
+    if (status === 'partial') return 'bg-amber-500 text-white';
+    if (status === 'pending') return 'bg-gray-300 text-gray-800';
+    return 'bg-gray-100 text-gray-600';
+  }
+
+  function totalPlannedForPeriod(periodKey) {
+    return debts
+      .flatMap((d) => (Array.isArray(d.schedule) ? d.schedule : []))
+      .filter((q) => q.periodKey === periodKey)
+      .reduce((sum, q) => sum + Number(q.plannedAmount || 0), 0);
   }
 
   return (
     <div className="grid gap-4 lg:grid-cols-3">
       <Card>
         <SectionTitle>Nueva deuda</SectionTitle>
-        <form onSubmit={addDebt} className="grid gap-3">
+        <form onSubmit={handleAddDebt} className="grid gap-3">
           <input
             className="border rounded-lg p-2"
             placeholder="Nombre (ej. Tarjeta, Préstamo)"
             value={form.name}
-            onChange={(e) => setForm({ ...form, name: e.target.value })}
+            onChange={(e) => handleFormChange('name', e.target.value)}
           />
           <input
             className="border rounded-lg p-2"
             type="number"
             min={0}
             step="1"
-            placeholder="Monto original"
+            placeholder="Monto original (total)"
             value={form.original}
-            onChange={(e) => setForm({ ...form, original: e.target.value })}
+            onChange={(e) => handleFormChange('original', e.target.value)}
           />
           <input
             className="border rounded-lg p-2"
             type="number"
             min={0}
             step="1"
-            placeholder="Saldo pendiente"
+            placeholder="Saldo pendiente (opcional)"
             value={form.remaining}
-            onChange={(e) => setForm({ ...form, remaining: e.target.value })}
+            onChange={(e) => handleFormChange('remaining', e.target.value)}
+          />
+          <input
+            className="border rounded-lg p-2"
+            type="number"
+            min={1}
+            step="1"
+            placeholder="Número de cuotas"
+            value={form.installments}
+            onChange={(e) => handleFormChange('installments', e.target.value)}
+          />
+          <input
+            className="border rounded-lg p-2"
+            type="date"
+            placeholder="Fecha de primer pago"
+            value={form.firstDue}
+            onChange={(e) => handleFormChange('firstDue', e.target.value)}
           />
           <input
             className="border rounded-lg p-2"
@@ -1836,15 +2164,9 @@ function Debts({ data, actions }) {
             step="0.01"
             placeholder="Tasa anual % (opcional)"
             value={form.rateAPR}
-            onChange={(e) => setForm({ ...form, rateAPR: e.target.value })}
+            onChange={(e) => handleFormChange('rateAPR', e.target.value)}
           />
-          <input
-            className="border rounded-lg p-2"
-            type="date"
-            placeholder="Fecha límite (opcional)"
-            value={form.due}
-            onChange={(e) => setForm({ ...form, due: e.target.value })}
-          />
+
           <button className="px-3 py-2 rounded-xl border bg-gray-900 text-white">
             Agregar deuda
           </button>
@@ -1852,78 +2174,360 @@ function Debts({ data, actions }) {
       </Card>
 
       <Card className="lg:col-span-2">
-        <SectionTitle>Listado de deudas</SectionTitle>
-        <div className="space-y-3">
-          {debts.map((d) => {
-            const progress =
-              d.original > 0
-                ? ((d.original - d.remaining) / d.original) * 100
-                : 0;
-            return (
-              <div
-                key={d.id || d.name + d.due}
-                className="border rounded-xl p-3"
-              >
-                <div className="flex items-center justify-between">
-                  <div>
-                    <div className="font-medium">{d.name}</div>
-                    <div className="text-sm text-gray-600">
-                      Saldo: <Money n={d.remaining} /> / Original:{' '}
-                      <Money n={d.original} />
-                    </div>
-                    <div className="text-xs text-gray-500">
-                      {d.rateAPR ? `Tasa: ${d.rateAPR}%` : ''}{' '}
-                      {d.due ? `· Vence: ${d.due}` : ''}
-                    </div>
-                  </div>
-                  <div className="w-56">
-                    <Progress value={progress} mode="good" />
-                    <div className="text-xs text-gray-600 mt-1">
-                      Pagado: {progress.toFixed(1)}%
-                    </div>
-                  </div>
+        <SectionTitle
+          right={
+            <div className="flex flex-col items-end text-xs gap-1">
+              <div className="flex items-center gap-3">
+                <div className="flex items-center gap-1">
+                  <span className="w-4 h-3 rounded bg-gray-300" />
+                  <span>Pendiente</span>
                 </div>
-                <div className="mt-3 flex items-center gap-2">
-                  <input
-                    type="number"
-                    min={0}
-                    step="1"
-                    placeholder="Pago (CLP)"
-                    className="border rounded-lg p-2"
-                    id={`pay-${d.id}`}
-                  />
-                  <button
-                    className="px-3 py-2 rounded-xl border"
-                    onClick={async () => {
-                      const el = document.getElementById(`pay-${d.id}`);
-                      const amt = Number(el?.value || 0);
-                      if (amt <= 0) return;
-                      await actions.updateDebt(d.id, {
-                        remaining: Math.max(0, Number(d.remaining || 0) - amt),
-                      });
-                      if (el) el.value = '';
-                    }}
-                  >
-                    Registrar pago
-                  </button>
-                  <button
-                    className="ml-auto text-red-600"
-                    onClick={() => actions.removeDebt(d.id)}
-                  >
-                    Eliminar
-                  </button>
+                <div className="flex items-center gap-1">
+                  <span className="w-4 h-3 rounded bg-amber-500" />
+                  <span>Pago parcial</span>
+                </div>
+                <div className="flex items-center gap-1">
+                  <span className="w-4 h-3 rounded bg-green-600" />
+                  <span>Pagado</span>
                 </div>
               </div>
-            );
-          })}
-          {debts.length === 0 && (
-            <div className="text-gray-500">Sin deudas registradas.</div>
-          )}
-        </div>
+              <div className="text-[11px] text-gray-500">
+                Total cuotas planificadas este período:{' '}
+                <Money n={totalPlannedForPeriod(monthKeyStr)} />
+              </div>
+            </div>
+          }
+        >
+          Calendario de deudas
+        </SectionTitle>
+
+        {debts.length === 0 ? (
+          <div className="text-gray-500">Sin deudas registradas.</div>
+        ) : (
+          <div>
+            <div className="min-w-full space-y-3">
+              {/* Encabezado de periodos */}
+              <div
+                className="grid text-xs font-medium text-gray-600 mb-1"
+                style={{
+                  gridTemplateColumns: `180px repeat(${visiblePeriods.length}, minmax(90px, 1fr))`,
+                }}
+              >
+                <div />
+                {visiblePeriods.map((pk) => {
+                  const isCurrent = pk === currentPeriodKey;
+                  return (
+                    <div
+                      key={pk}
+                      className={
+                        'text-center px-1 rounded-lg ' +
+                        (isCurrent
+                          ? 'bg-green-100 text-green-800 font-semibold border border-green-400'
+                          : '')
+                      }
+                    >
+                      {formatBudgetPeriodLabel(pk, budgetCutDay)}
+                    </div>
+                  );
+                })}
+              </div>
+
+
+              {/* Filas por deuda */}
+              {debts.map((d) => {
+                const progress =
+                  d.original > 0
+                    ? ((d.original - (d.remaining || 0)) / d.original) * 100
+                    : 0;
+
+                return (
+                  <div
+                    key={d.id || d.name + d.due}
+                    className="border rounded-xl p-3"
+                  >
+                    <div className="flex items-center justify-between mb-2">
+                      <div>
+                        <div className="font-medium">{d.name}</div>
+                        <div className="text-sm text-gray-600">
+                          Saldo: <Money n={d.remaining} /> / Original:{' '}
+                          <Money n={d.original} />
+                        </div>
+                        <div className="text-xs text-gray-500">
+                          {d.rateAPR ? `Tasa: ${d.rateAPR}%` : ''}{' '}
+                          {d.due ? `· Último vencimiento: ${d.due}` : ''}
+                        </div>
+                      </div>
+                      <div className="w-56">
+                        <Progress value={progress} mode="good" />
+                        <div className="text-xs text-gray-600 mt-1">
+                          Pagado: {progress.toFixed(1)}%
+                        </div>
+                      </div>
+                    </div>
+
+                    <div
+                      className="grid text-xs items-center"
+                      style={{
+                        gridTemplateColumns: `180px repeat(${visiblePeriods.length}, minmax(90px, 1fr))`,
+                      }}
+                    >
+                      <div className="text-xs text-gray-500">Cuotas</div>
+                      {visiblePeriods.map((pk) => {
+                        const quota = (d.schedule || []).find(
+                          (q) => q.periodKey === pk
+                        );
+
+                        if (!quota) {
+                          return (
+                            <button
+                              key={pk}
+                              type="button"
+                              className="h-7 flex items-center justify-center border border-dashed border-gray-300 rounded hover:bg-gray-50"
+                              onClick={() => openQuotaModal(d, null, pk)}
+                            >
+                              <span className="text-[10px] text-gray-400">
+                                + cuota
+                              </span>
+                            </button>
+                          );
+                        }
+
+                        return (
+                          <button
+                            key={pk}
+                            type="button"
+                            className="h-7 flex items-center justify-center"
+                            onClick={() => openQuotaModal(d, quota, pk)}
+                          >
+                            <div
+                              className={`w-full h-6 rounded flex items-center justify-center ${quotaBoxColor(
+                                quota
+                              )}`}
+                            >
+                              <span className="text-[10px] truncate px-1">
+                                <Money n={quota.plannedAmount} />
+                              </span>
+                            </div>
+                          </button>
+                        );
+                      })}
+                    </div>
+
+                    <div className="mt-3 flex justify-center gap-3">
+                      <button
+                        type="button"
+                        className="text-xs px-3 py-1.5 rounded-lg border text-gray-700 hover:bg-gray-50"
+                        onClick={() => openDebtEditModal(d)}
+                      >
+                        Editar deuda
+                      </button>
+                      <button
+                        type="button"
+                        className="text-xs px-3 py-1.5 rounded-lg border border-red-500 text-red-600 hover:bg-red-50"
+                        onClick={() => removeDebt && removeDebt(d.id)}
+                      >
+                        Eliminar deuda
+                      </button>
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+        )}
       </Card>
+
+      {quotaModal && (
+        <div className="fixed inset-0 z-30 flex items-start justify-center bg-black/30 pt-16">
+          <div className="bg-white dark:bg-gray-900 rounded-2xl shadow-xl p-5 w-full max-w-md">
+            <div className="flex items-center justify-between mb-3">
+              <h3 className="text-lg font-semibold">
+                {quotaModal.quotaId ? 'Editar cuota' : 'Nueva cuota'}
+              </h3>
+              <button
+                type="button"
+                className="text-sm text-gray-500 hover:text-gray-800"
+                onClick={() => setQuotaModal(null)}
+              >
+                ✕
+              </button>
+            </div>
+
+            <form onSubmit={handleSaveQuota} className="grid gap-3 text-sm">
+              <div className="grid gap-1">
+                <label>Periodo</label>
+                <select
+                  className="border rounded-lg p-2"
+                  value={quotaModal.periodKey}
+                  onChange={(e) =>
+                    setQuotaModal((prev) => ({
+                      ...prev,
+                      periodKey: e.target.value,
+                    }))
+                  }
+                >
+                  {visiblePeriods.map((pk) => (
+                    <option key={pk} value={pk}>
+                      {formatBudgetPeriodLabel(pk, budgetCutDay)}
+                    </option>
+                  ))}
+                </select>
+              </div>
+
+              <div className="grid gap-1">
+                <label>Monto planificado</label>
+                <input
+                  type="number"
+                  min={0}
+                  step="1"
+                  className="border rounded-lg p-2"
+                  value={quotaModal.plannedAmount}
+                  onChange={(e) =>
+                    setQuotaModal((prev) => ({
+                      ...prev,
+                      plannedAmount: e.target.value,
+                    }))
+                  }
+                />
+              </div>
+
+              <div className="grid gap-1">
+                <label>Monto pagado (acumulado en el período)</label>
+                <input
+                  type="number"
+                  min={0}
+                  step="1"
+                  className="border rounded-lg p-2"
+                  value={quotaModal.paidAmount}
+                  onChange={(e) =>
+                    setQuotaModal((prev) => ({
+                      ...prev,
+                      paidAmount: e.target.value,
+                    }))
+                  }
+                />
+              </div>
+
+              <div className="grid gap-1">
+                <label>Fecha de pago (o vencimiento)</label>
+                <input
+                  type="date"
+                  className="border rounded-lg p-2"
+                  value={quotaModal.dueDate}
+                  onChange={(e) =>
+                    setQuotaModal((prev) => ({
+                      ...prev,
+                      dueDate: e.target.value,
+                    }))
+                  }
+                />
+              </div>
+
+              <div className="flex justify-end gap-2 mt-2">
+                <button
+                  type="button"
+                  className="px-3 py-1.5 text-sm border rounded-lg"
+                  onClick={() => setQuotaModal(null)}
+                >
+                  Cancelar
+                </button>
+                <button
+                  type="submit"
+                  className="px-3 py-1.5 text-sm border rounded-lg bg-gray-900 text-white"
+                >
+                  Guardar cuota
+                </button>
+              </div>
+            </form>
+          </div>
+        </div>
+      )}
+
+{debtEditModal && (
+        <div className="fixed inset-0 z-30 flex items-start justify-center bg-black/30 pt-16">
+          <div className="bg-white dark:bg-gray-900 rounded-2xl shadow-xl p-5 w-full max-w-md">
+            <div className="flex items-center justify-between mb-3">
+              <h3 className="text-lg font-semibold">Editar deuda</h3>
+              <button
+                type="button"
+                className="text-sm text-gray-500 hover:text-gray-800"
+                onClick={() => setDebtEditModal(null)}
+              >
+                ✕
+              </button>
+            </div>
+
+            <form onSubmit={handleSaveDebtMeta} className="grid gap-3 text-sm">
+              <div className="grid gap-1">
+                <label>Nombre</label>
+                <input
+                  className="border rounded-lg p-2"
+                  value={debtEditModal.name}
+                  onChange={(e) =>
+                    setDebtEditModal((prev) => ({
+                      ...prev,
+                      name: e.target.value,
+                    }))
+                  }
+                />
+              </div>
+
+              <div className="grid gap-1">
+                <label>Fecha último vencimiento</label>
+                <input
+                  type="date"
+                  className="border rounded-lg p-2"
+                  value={debtEditModal.due || ''}
+                  onChange={(e) =>
+                    setDebtEditModal((prev) => ({
+                      ...prev,
+                      due: e.target.value,
+                    }))
+                  }
+                />
+              </div>
+
+              <div className="grid gap-1">
+                <label>Tasa anual % (opcional)</label>
+                <input
+                  type="number"
+                  min={0}
+                  step="0.01"
+                  className="border rounded-lg p-2"
+                  value={debtEditModal.rateAPR}
+                  onChange={(e) =>
+                    setDebtEditModal((prev) => ({
+                      ...prev,
+                      rateAPR: e.target.value,
+                    }))
+                  }
+                />
+              </div>
+
+              <div className="flex justify-end gap-2 mt-2">
+                <button
+                  type="button"
+                  className="px-3 py-1.5 text-sm border rounded-lg"
+                  onClick={() => setDebtEditModal(null)}
+                >
+                  Cancelar
+                </button>
+                <button
+                  type="submit"
+                  className="px-3 py-1.5 text-sm border rounded-lg bg-gray-900 text-white"
+                >
+                  Guardar cambios
+                </button>
+              </div>
+            </form>
+          </div>
+        </div>
+      )}
+
     </div>
   );
 }
+
 
 function Savings({ data, actions }) {
   const savings = data?.savings || [];
@@ -3229,20 +3833,22 @@ export default function App() {
         )}
 
 
-          {hasCtx && tab === 'transactions' && (
-            <Transactions
-              data={{
-                transactions: data.transactions,
-                categories: data.categories,
-              }}
-              actions={actions}
-              activeUser={activeUser}
-              monthKeyStr={selectedMonth}
-              superAdminEmail={data.superAdminEmail || ctx.user?.email || null}
-              budgetCutDay={data.budgetCutDay}
-              onChangeMonth={setSelectedMonth}
-            />
-          )}
+{hasCtx && tab === 'transactions' && (
+  <Transactions
+    data={{
+      transactions: data.transactions,
+      categories: data.categories,
+      debts: data.debts,
+    }}
+    actions={actions}
+    activeUser={activeUser}
+    monthKeyStr={selectedMonth}
+    superAdminEmail={data.superAdminEmail || ctx.user?.email || null}
+    budgetCutDay={data.budgetCutDay}
+  />
+)}
+
+
 
           {hasCtx && tab === 'budgets' && (
             <Budgets
@@ -3251,15 +3857,22 @@ export default function App() {
                 transactions: data.transactions,
                 categories: data.categories,
                 budgetCutDay: data.budgetCutDay,
+                debts: data.debts,
               }}
               actions={actions}
               monthKeyStr={selectedMonth}
             />
           )}
 
+
           {hasCtx && tab === 'debts' && (
-            <Debts data={{ debts: data.debts }} actions={actions} />
+            <Debts
+              data={{ debts: data.debts, budgetCutDay: data.budgetCutDay }}
+              actions={actions}
+              monthKeyStr={selectedMonth}
+            />
           )}
+
 
           {hasCtx && tab === 'savings' && (
             <Savings data={{ savings: data.savings }} actions={actions} />
