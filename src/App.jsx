@@ -2739,6 +2739,7 @@ export default function App() {
   const [tab, setTab] = useState('dashboard');
   const [ctx, setCtx] = useState(null);
   const [selectedMonth, setSelectedMonth] = useState(monthKey());
+  const [hasInitMonthByCutDay, setHasInitMonthByCutDay] = useState(false);
 
   const [selectedHouseholdUserId, setSelectedHouseholdUserId] = useState(
     () => localStorage.getItem('activeHouseholdUserId') || null
@@ -2769,6 +2770,20 @@ export default function App() {
   }, []);
 
   const h = useHouseholdData(selectedHid);
+
+    // Ajustar el mes seleccionado según el día de corte al entrar
+    useEffect(() => {
+      if (!selectedHid) return;                 // aún no hay hogar
+      if (!h || !h.budgetCutDay) return;        // aún no se cargan datos del hogar
+      if (hasInitMonthByCutDay) return;         // ya lo hicimos una vez
+  
+      const todayStr = new Date().toISOString().slice(0, 10); // "YYYY-MM-DD"
+      const key = budgetMonthKeyForDate(todayStr, h.budgetCutDay || 1);
+  
+      setSelectedMonth(key);
+      setHasInitMonthByCutDay(true);
+    }, [selectedHid, h.budgetCutDay, hasInitMonthByCutDay]);
+  
 
   const budgetsForSelectedMonth =
   (h.budgets && h.budgets[selectedMonth]) || {};
