@@ -32,3 +32,6 @@ dist-ssr
 *.pem
 *.key
 *.p12
+
+.firebase/
+dist/
