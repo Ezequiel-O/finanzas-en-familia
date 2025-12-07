@@ -1,17 +1,15 @@
 // src/modules/transactions/Transactions.jsx
 import React, { useState, useMemo, useEffect } from 'react';
-import { monthKey, formatBudgetPeriodLabel } from '../../utils/budgetPeriod.js';
+import {
+  monthKey,
+  formatBudgetPeriodLabel,
+  getBudgetPeriod,
+} from '../../utils/budgetPeriod.js';
 import { filterTransactionsByPeriodAndUser } from '../../utils/transactions.js';
 import { Card } from '../../components/ui/card.jsx';
 import { SectionTitle } from '../../components/ui/SectionTitle.jsx';
 import { Money } from '../../components/ui/money.jsx';
-// si usas Progress aquí, agrega:
-// import { Progress } from '../../components/ui/Progress.jsx';
-
-// si dentro de Transactions usas CATEGORIES:
 import { CATEGORIES } from '../../constants.js';
-// si usas helpers de periodo (monthKey, getBudgetPeriod, etc.) y ya los moviste a lib:
-// import { getBudgetPeriod } from '../../lib/budgetPeriod.js';
 
 export function Transactions({
   data,
@@ -30,7 +28,7 @@ export function Transactions({
     [monthKeyStr],
   );
 
-  // Suma de: (cuota planificada - pagado) de todos los periodos <= actual
+  // Suma de cuotas planificadas restantes para la categoria Deuda
   const suggestedDebtAmount = useMemo(() => {
     if (!currentPeriodKey) return 0;
 
@@ -59,17 +57,29 @@ export function Transactions({
   const [showGastoModal, setShowGastoModal] = useState(false);
   const [amountFormatted, setAmountFormatted] = useState('');
 
-  // Cuando abres "Nuevo gasto" con categoría Deuda, autocompleta el monto
+  // Calculadora de ajuste de balance
+  const [showBalanceModal, setShowBalanceModal] = useState(false);
+  const [cashInput, setCashInput] = useState('');
+  const [cashFormatted, setCashFormatted] = useState('');
+  const [debitInput, setDebitInput] = useState('');
+  const [debitFormatted, setDebitFormatted] = useState('');
+  const [adjustType, setAdjustType] = useState('ingreso'); // ingreso | gasto
+  const [adjustCategory, setAdjustCategory] = useState(
+    categories[0] || CATEGORIES[0] || '',
+  );
+  const [adjustNote, setAdjustNote] = useState('');
+  const [adjustError, setAdjustError] = useState('');
+
+  // Autocompletar monto de Deuda en modal de gasto
   useEffect(() => {
-    const isDebtCategory = category === 'Deuda'; // usa EXACTAMENTE el nombre que tengas en tu lista de categorías
+    const isDebtCategory = category === 'Deuda';
     const modalOpen = showGastoModal;
 
-    if (!modalOpen) return; // solo cuando está abierto el modal de gasto
-    if (type !== 'gasto') return; // solo en gastos
-    if (!isDebtCategory) return; // solo si la categoría es Deuda
+    if (!modalOpen) return;
+    if (type !== 'gasto') return;
+    if (!isDebtCategory) return;
     if (suggestedDebtAmount <= 0) return;
 
-    // Si ya escribió un monto, no lo tocamos
     if (amount && Number(amount) > 0) return;
 
     const n = Math.round(suggestedDebtAmount);
@@ -78,9 +88,16 @@ export function Transactions({
       maximumFractionDigits: 0,
     }).format(n);
 
-    setAmount(digits); // valor "real" sin formato
-    setAmountFormatted(formatted); // valor mostrado con puntos
+    setAmount(digits);
+    setAmountFormatted(formatted);
   }, [showGastoModal, type, category, suggestedDebtAmount, amount]);
+
+  // Ajustar categoria de gasto por defecto si cambian las categorias
+  useEffect(() => {
+    if (!categories || categories.length === 0) return;
+    setCategory((prev) => prev || categories[0]);
+    setAdjustCategory((prev) => prev || categories[0]);
+  }, [categories]);
 
   const periodLabel = useMemo(
     () => formatBudgetPeriodLabel(monthKeyStr, budgetCutDay),
@@ -106,7 +123,6 @@ export function Transactions({
       base = base.filter((tx) => tx.category === filterCategory);
     }
 
-    // Orden descendente por fecha (más reciente arriba)
     base.sort((a, b) => {
       const da = new Date(
         (a.date || a.createdAt || '1970-01-01') + 'T00:00:00',
@@ -145,6 +161,18 @@ export function Transactions({
     };
   }, [filtered]);
 
+  const platformBalance = totals.balance;
+  const cashValue = Number(cashInput || 0);
+  const debitValue = Number(debitInput || 0);
+  const realBalance = cashValue + debitValue;
+  const delta = realBalance - platformBalance;
+
+  useEffect(() => {
+    if (!showBalanceModal) return;
+    if (delta > 0) setAdjustType('ingreso');
+    else if (delta < 0) setAdjustType('gasto');
+  }, [delta, showBalanceModal]);
+
   function getOwnerName(tx) {
     if (tx.ownerName) return tx.ownerName;
     if (tx.ownerEmail && tx.ownerEmail === superAdminEmail) return 'Admin';
@@ -152,12 +180,48 @@ export function Transactions({
     return '—';
   }
 
+  function clampDateToPeriod(dateStr) {
+    const { start, end } = getBudgetPeriod(monthKeyStr, budgetCutDay);
+    if (!dateStr) return start;
+    const today = new Date(dateStr + 'T00:00:00');
+    const startDate = new Date(start + 'T00:00:00');
+    const endDate = new Date(end + 'T00:00:00');
+    const endMinusOne = new Date(endDate);
+    endMinusOne.setDate(endMinusOne.getDate() - 1);
+    if (today < startDate) return start;
+    if (today > endMinusOne) return endMinusOne.toISOString().slice(0, 10);
+    return today.toISOString().slice(0, 10);
+  }
+
+  function handleMoneyInput(raw, setters) {
+    const digits = raw.replace(/\D/g, '');
+    if (!digits) {
+      setters.setFormatted('');
+      setters.setValue('');
+      return;
+    }
+    const formatted = new Intl.NumberFormat('es-CL', {
+      maximumFractionDigits: 0,
+    }).format(Number(digits));
+    setters.setFormatted(formatted);
+    setters.setValue(digits);
+  }
+
+  function resetAdjustForm() {
+    setCashInput('');
+    setCashFormatted('');
+    setDebitInput('');
+    setDebitFormatted('');
+    setAdjustNote('');
+    setAdjustError('');
+  }
+
   async function handleAdd(e) {
     e.preventDefault();
 
     const n = Number(amount || 0);
     if (!n || n <= 0 || !addTransaction) {
-      alert('Ingresa un monto válido.');
+      alert('Ingresa un monto valido.');
       return;
     }
 
@@ -182,6 +246,70 @@ export function Transactions({
     } catch (err) {
       console.error('Error al agregar movimiento:', err);
       alert('No se pudo guardar el movimiento.');
+    }
+  }
+
+  async function handleSaveAdjustment() {
+    if (!addTransaction) return;
+    setAdjustError('');
+
+    const efectivo = Number(cashInput || 0);
+    const debito = Number(debitInput || 0);
+    if (Number.isNaN(efectivo) || Number.isNaN(debito) || efectivo < 0 || debito < 0) {
+      setAdjustError('Ingresa montos validos para efectivo y debito.');
+      return;
+    }
+
+    if (delta === 0) {
+      setAdjustError('No hay diferencia que ajustar.');
+      return;
+    }
+
+    if (adjustType === 'gasto' && !adjustCategory) {
+      setAdjustError('Selecciona una categoria para el gasto.');
+      return;
+    }
+
+    const amountAdjust = Math.abs(delta);
+    if (!amountAdjust || amountAdjust <= 0) {
+      setAdjustError('El monto de ajuste no es valido.');
+      return;
+    }
+
+    const todayStr = new Date().toISOString().slice(0, 10);
+    const txDate = clampDateToPeriod(todayStr);
+
+    const adjustmentTx = {
+      type: adjustType,
+      amount: amountAdjust,
+      category:
+        adjustType === 'gasto'
+          ? adjustCategory || categories[0] || 'Otros'
+          : '',
+      description:
+        adjustNote.trim() || 'Ajuste de balance desde calculadora',
+      date: txDate,
+      createdAt: new Date().toISOString(),
+      ownerId: activeUser?.id || null,
+      ownerName: activeUser?.name || null,
+      ownerEmail: activeUser?.email || null,
+      meta: {
+        cashSum: efectivo,
+        debitSum: debito,
+        platformBalance,
+        realBalance,
+        delta,
+        source: 'balance-calculator',
+      },
+    };
+
+    try {
+      await addTransaction(adjustmentTx);
+      setShowBalanceModal(false);
+      resetAdjustForm();
+    } catch (err) {
+      console.error('Error al guardar ajuste de balance:', err);
+      setAdjustError('No se pudo guardar el ajuste.');
     }
   }
 
@@ -232,7 +360,20 @@ export function Transactions({
           </div>
         </Card>
         <Card>
-          <div className="text-xs uppercase text-gray-500 mb-1">Balance</div>
+          <div className="flex items-start justify-between text-xs uppercase text-gray-500 mb-1">
+            <span>Balance</span>
+            <button
+              type="button"
+              className="ml-2 px-2 py-1 rounded-full border text-[11px] hover:bg-gray-100"
+              title="Ajustar balance con calculadora"
+              onClick={() => {
+                setShowBalanceModal(true);
+                setAdjustError('');
+              }}
+            >
+              🧮
+            </button>
+          </div>
           <div
             className={`text-lg font-semibold ${
               totals.balance < 0 ? 'text-red-600' : 'text-green-600'
@@ -263,7 +404,7 @@ export function Transactions({
             value={filterCategory}
             onChange={(e) => setFilterCategory(e.target.value)}
           >
-            <option value="todas">Todas las categorías</option>
+            <option value="todas">Todas las categorias</option>
             {categories.map((c) => (
               <option key={c} value={c}>
                 {c}
@@ -302,8 +443,8 @@ export function Transactions({
               <thead>
                 <tr className="border-b text-xs text-gray-500">
                   <th className="px-2 py-1 text-left">Fecha</th>
-                  <th className="px-2 py-1 text-left">Descripción</th>
-                  <th className="px-2 py-1 text-left">Categoría</th>
+                  <th className="px-2 py-1 text-left">Descripcion</th>
+                  <th className="px-2 py-1 text-left">Categoria</th>
                   <th className="px-2 py-1 text-left">Tipo</th>
                   <th className="px-2 py-1 text-right">Monto</th>
                   <th className="px-2 py-1 text-left">Usuario</th>
@@ -350,6 +491,8 @@ export function Transactions({
           </div>
         )}
       </Card>
+
+      {/* Modal ingreso/gasto */}
       {(showIngresoModal || showGastoModal) && (
         <div className="fixed inset-0 z-30 flex items-start justify-center bg-black/30 pt-16">
           <div className="bg-white dark:bg-gray-900 rounded-2xl shadow-xl p-5 w-full max-w-xl">
@@ -365,13 +508,12 @@ export function Transactions({
                   setShowGastoModal(false);
                 }}
               >
-                ✕ Cerrar
+                × Cerrar
               </button>
             </div>
 
             <form onSubmit={handleAdd} className="grid gap-3">
-              {/* Monto – siempre primero */}
-              {/* Monto con formateo dinámico */}
+              {/* Monto */}
               <div className="flex flex-col gap-1">
                 <label className="text-xs text-gray-500">Monto</label>
 
@@ -384,31 +526,25 @@ export function Transactions({
                     value={amountFormatted}
                     onChange={(e) => {
                       const raw = e.target.value;
-
-                      // Solo números
                       const digits = raw.replace(/\D/g, '');
-
-                      // Si no hay dígitos, dejamos el campo vacío
                       if (!digits) {
                         setAmountFormatted('');
                         setAmount('');
                         return;
                       }
-
-                      // Formatear CLP con puntos de miles
                       const formatted = new Intl.NumberFormat('es-CL', {
                         maximumFractionDigits: 0,
                       }).format(Number(digits));
 
                       setAmountFormatted(formatted);
-                      setAmount(digits); // valor real sin formato
+                      setAmount(digits);
                     }}
                     placeholder="0"
                   />
                 </div>
               </div>
 
-              {/* Fecha – siempre segundo */}
+              {/* Fecha */}
               <div className="flex flex-col gap-1">
                 <label className="text-xs text-gray-500">Fecha</label>
                 <input
@@ -420,10 +556,10 @@ export function Transactions({
                 />
               </div>
 
-              {/* Categoría – SOLO para gasto, y va DESPUÉS de la fecha */}
+              {/* Categoria solo para gasto */}
               {type === 'gasto' && (
                 <div className="flex flex-col gap-1">
-                  <label className="text-xs text-gray-500">Categoría</label>
+                  <label className="text-xs text-gray-500">Categoria</label>
                   <select
                     className="border rounded-lg px-2 py-1 text-sm"
                     value={category}
@@ -438,9 +574,9 @@ export function Transactions({
                 </div>
               )}
 
-              {/* Descripción + botón – al final en ambos casos */}
+              {/* Descripcion */}
               <div className="flex flex-col gap-1">
-                <label className="text-xs text-gray-500">Descripción</label>
+                <label className="text-xs text-gray-500">Descripcion</label>
                 <div className="flex gap-2">
                   <input
                     className="border rounded-lg px-2 py-1 text-sm flex-1"
@@ -457,6 +593,213 @@ export function Transactions({
                 </div>
               </div>
             </form>
+          </div>
+        </div>
+      )}
+
+      {/* Modal calculadora de ajuste */}
+      {showBalanceModal && (
+        <div className="fixed inset-0 z-40 flex items-start justify-center bg-black/40 backdrop-blur-sm pt-16">
+          <div className="bg-white dark:bg-gray-900 rounded-2xl shadow-xl p-5 w-full max-w-2xl">
+            <div className="flex items-center justify-between mb-3">
+              <h3 className="text-lg font-semibold">
+                Calculadora de ajuste de balance ({periodLabel})
+              </h3>
+              <button
+                type="button"
+                className="text-sm text-gray-500 hover:text-gray-800"
+                onClick={() => {
+                  setShowBalanceModal(false);
+                  resetAdjustForm();
+                }}
+              >
+                ×
+              </button>
+            </div>
+
+            <div className="grid md:grid-cols-2 gap-4">
+              <div className="flex flex-col gap-2">
+                <label className="text-xs text-gray-500">
+                  Suma de efectivo actual
+                </label>
+                <div className="flex items-center gap-2">
+                  <span className="text-sm text-gray-500">$</span>
+                  <input
+                    type="text"
+                    className="border rounded-lg px-2 py-1 text-sm flex-1"
+                    value={cashFormatted}
+                    onChange={(e) =>
+                      handleMoneyInput(e.target.value, {
+                        setFormatted: setCashFormatted,
+                        setValue: setCashInput,
+                      })
+                    }
+                    placeholder="0"
+                  />
+                </div>
+              </div>
+
+              <div className="flex flex-col gap-2">
+                <label className="text-xs text-gray-500">
+                  Suma de debito actual
+                </label>
+                <div className="flex items-center gap-2">
+                  <span className="text-sm text-gray-500">$</span>
+                  <input
+                    type="text"
+                    className="border rounded-lg px-2 py-1 text-sm flex-1"
+                    value={debitFormatted}
+                    onChange={(e) =>
+                      handleMoneyInput(e.target.value, {
+                        setFormatted: setDebitFormatted,
+                        setValue: setDebitInput,
+                      })
+                    }
+                    placeholder="0"
+                  />
+                </div>
+              </div>
+            </div>
+
+            <div className="grid md:grid-cols-3 gap-3 mt-4">
+              <div className="border rounded-lg p-3">
+                <div className="text-xs text-gray-500">
+                  Balance en plataforma
+                </div>
+                <div className="text-lg font-semibold">
+                  <Money n={platformBalance} />
+                </div>
+              </div>
+              <div className="border rounded-lg p-3">
+                <div className="text-xs text-gray-500">Balance real total</div>
+                <div className="text-lg font-semibold">
+                  <Money n={realBalance} />
+                </div>
+              </div>
+              <div className="border rounded-lg p-3">
+                <div className="text-xs text-gray-500">Diferencia (delta)</div>
+                <div
+                  className={`text-lg font-semibold ${
+                    delta < 0 ? 'text-red-600' : 'text-green-700'
+                  }`}
+                >
+                  <Money n={delta} />
+                </div>
+              </div>
+            </div>
+
+            <div className="mt-3 text-sm">
+              {delta > 0 && (
+                <p>
+                  Hay <strong>mas dinero real</strong> que el balance de la
+                  plataforma. Este delta se registrara como un{' '}
+                  <strong>INGRESO</strong>.
+                </p>
+              )}
+              {delta < 0 && (
+                <p>
+                  Hay <strong>menos dinero real</strong> que el balance de la
+                  plataforma. Este delta se registrara como un{' '}
+                  <strong>GASTO</strong>.
+                </p>
+              )}
+              {delta === 0 && (
+                <p>
+                  No hay diferencia entre el balance real y el balance de la
+                  plataforma.
+                </p>
+              )}
+            </div>
+
+            <div className="mt-4 border-t pt-3 grid gap-3">
+              <div className="grid md:grid-cols-3 gap-3">
+                <div className="flex flex-col gap-2">
+                  <div className="text-xs text-gray-500">Tipo de ajuste</div>
+                  <div className="flex gap-3 text-sm">
+                    <label className="flex items-center gap-1">
+                      <input
+                        type="radio"
+                        name="adjust-type"
+                        value="ingreso"
+                        checked={adjustType === 'ingreso'}
+                        onChange={(e) => setAdjustType(e.target.value)}
+                      />
+                      Ingreso
+                    </label>
+                    <label className="flex items-center gap-1">
+                      <input
+                        type="radio"
+                        name="adjust-type"
+                        value="gasto"
+                        checked={adjustType === 'gasto'}
+                        onChange={(e) => setAdjustType(e.target.value)}
+                      />
+                      Gasto
+                    </label>
+                  </div>
+                </div>
+
+                {adjustType === 'gasto' && (
+                  <div className="flex flex-col gap-2">
+                    <label className="text-xs text-gray-500">
+                      Categoria del ajuste
+                    </label>
+                    <select
+                      className="border rounded-lg px-2 py-1 text-sm"
+                      value={adjustCategory}
+                      onChange={(e) => setAdjustCategory(e.target.value)}
+                    >
+                      {categories.map((c) => (
+                        <option key={c} value={c}>
+                          {c}
+                        </option>
+                      ))}
+                    </select>
+                  </div>
+                )}
+
+                <div className="flex flex-col gap-2">
+                  <label className="text-xs text-gray-500">
+                    Nota / comentario (opcional)
+                  </label>
+                  <input
+                    className="border rounded-lg px-2 py-1 text-sm"
+                    value={adjustNote}
+                    onChange={(e) => setAdjustNote(e.target.value)}
+                    placeholder="Ajuste de balance desde calculadora"
+                  />
+                </div>
+              </div>
+            </div>
+
+            {adjustError && (
+              <div className="text-sm text-red-600 mt-2">{adjustError}</div>
+            )}
+
+            <div className="flex justify-end gap-2 mt-4">
+              <button
+                type="button"
+                className="px-3 py-1.5 text-sm border rounded-lg"
+                onClick={() => {
+                  setShowBalanceModal(false);
+                  resetAdjustForm();
+                }}
+              >
+                Cancelar
+              </button>
+              <button
+                type="button"
+                className="px-3 py-1.5 text-sm rounded-lg text-white"
+                style={{
+                  backgroundColor: delta < 0 ? '#dc2626' : '#16a34a',
+                  opacity: delta === 0 ? 0.5 : 1,
+                }}
+                disabled={delta === 0}
+                onClick={handleSaveAdjustment}
+              >
+                Guardar
+              </button>
+            </div>
           </div>
         </div>
       )}

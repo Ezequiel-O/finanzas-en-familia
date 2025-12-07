@@ -4,8 +4,9 @@ import { Card } from '../../components/ui/card.jsx';
 import { SectionTitle } from '../../components/ui/SectionTitle.jsx';
 import { Money } from '../../components/ui/money.jsx';
 import { Progress } from '../../components/ui/Progress.jsx';
-import { getBudgetPeriod, shiftMonth } from '../../utils/budgetPeriod.js';
+import { shiftMonth } from '../../utils/budgetPeriod.js';
 import { CATEGORIES, DEBT_CATEGORY } from '../../constants.js';
+import { filterTransactionsByPeriodAndUser } from '../../utils/transactions.js';
 
 export function Budgets({ data, actions, monthKeyStr }) {
   const {
@@ -21,28 +22,37 @@ export function Budgets({ data, actions, monthKeyStr }) {
   const cutDay = budgetCutDay;
 
   const debtsArray = Array.isArray(debts) ? debts : [];
+  const monthTx = useMemo(
+    () =>
+      filterTransactionsByPeriodAndUser(
+        transactions,
+        mk,
+        cutDay,
+        null,
+        false, // Presupuestos mira todos los movimientos del hogar
+      ),
+    [transactions, mk, cutDay],
+  );
 
   const debtPlannedForPeriod = debtsArray
     .flatMap((d) => (Array.isArray(d.schedule) ? d.schedule : []))
     .filter((q) => q.periodKey === mk)
     .reduce((sum, q) => sum + Number(q.plannedAmount || 0), 0);
 
-  // Periodo actual y anterior (según día de corte)
-  const { start, end } = getBudgetPeriod(mk, cutDay);
   const prevMk = shiftMonth(mk, -1);
-  const { start: prevStart, end: prevEnd } = getBudgetPeriod(prevMk, cutDay);
+  const prevMonthTx = useMemo(
+    () =>
+      filterTransactionsByPeriodAndUser(
+        transactions,
+        prevMk,
+        cutDay,
+        null,
+        false,
+      ),
+    [transactions, prevMk, cutDay],
+  );
 
   const [viewMode, setViewMode] = useState('amount'); // amount | percent
-
-  const monthTx = transactions.filter((t) => {
-    const d = t.date || '';
-    return d >= start && d < end;
-  });
-
-  const prevMonthTx = transactions.filter((t) => {
-    const d = t.date || '';
-    return d >= prevStart && d < prevEnd;
-  });
 
   // --- ROLLOVER ---
   const ingresosPrev = prevMonthTx

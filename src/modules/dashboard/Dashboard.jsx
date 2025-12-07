@@ -4,7 +4,7 @@ import { SectionTitle } from '../../components/ui/SectionTitle.jsx';
 import { Money } from '../../components/ui/money.jsx';
 import { Progress } from '../../components/ui/Progress.jsx';
 import { CATEGORIES } from '../../constants.js';
-import { getBudgetPeriod } from '../../utils/budgetPeriod.js';
+import { filterTransactionsByPeriodAndUser } from '../../utils/transactions.js';
 
 export function Dashboard({ data, monthKeyStr }) {
   const {
@@ -20,11 +20,13 @@ export function Dashboard({ data, monthKeyStr }) {
   const mk = monthKeyStr;
 
   // Filtramos movimientos del periodo actual (según día de corte)
-  const { start, end } = getBudgetPeriod(mk, budgetCutDay);
-  const monthTx = transactions.filter((t) => {
-    const d = t.date || '';
-    return d >= start && d < end;
-  });
+  const monthTx = filterTransactionsByPeriodAndUser(
+    transactions,
+    mk,
+    budgetCutDay,
+    null,
+    false,
+  );
 
   const totalIngresos = monthTx
     .filter((t) => t.type === 'ingreso')
