@@ -15,8 +15,8 @@ import { auth } from '../../firebase';
 // y DEBE ser movida después.
 // Por ahora déjalo así, aunque falle el import. Ya lo resolvemos.
 import { ensureSingleHouseholdForUser } from '../../lib/household.js';
-// â†‘ si aÃºn NO tienes este archivo, luego lo creamos.
-// por ahora dÃ©jalo asÃ­, aunque falle el import. Ya lo resolvemos.
+// Si aún NO tienes este archivo, luego lo creamos.
+// Por ahora déjalo así, aunque falle el import. Ya lo resolvemos.
 
 export function AuthGate({ onReady }) {
   const [phase, setPhase] = useState('loading'); // loading | auth | ready
@@ -58,19 +58,19 @@ export function AuthGate({ onReady }) {
     if (code.includes('invalid-credential') || code.includes('wrong-password'))
       return 'Credenciales inválidas.';
     if (code.includes('user-not-found')) return 'Usuario no encontrado.';
-    if (code.includes('invalid-email')) return 'Email invÃ¡lido.';
+    if (code.includes('invalid-email')) return 'Email inválido.';
     if (code.includes('missing-password')) return 'Falta la contraseña.';
     if (code.includes('operation-not-allowed'))
-      return 'El mÃ©todo Email/Password no estÃ¡ habilitado en Firebase.';
+      return 'El método Email/Password no está habilitado en Firebase.';
     if (code.includes('network-request-failed'))
-      return 'Error de red. Revisa tu conexiÃ³n.';
+      return 'Error de red. Revisa tu conexión.';
     if (code.includes('too-many-requests'))
-      return 'Demasiados intentos. Intenta mÃ¡s tarde.';
+      return 'Demasiados intentos. Intenta más tarde.';
     if (code.includes('invalid-api-key'))
-      return 'API key invÃ¡lida en la configuraciÃ³n de Firebase.';
+      return 'API key inválida en la configuración de Firebase.';
     if (code.includes('domain-config-required'))
-      return 'Agrega este dominio a â€œAuthorized domainsâ€ en Firebase.';
-    return `No se pudo iniciar sesiÃ³n (${code}).`;
+      return 'Agrega este dominio a "Authorized domains" en Firebase.';
+    return `No se pudo iniciar sesión (${code}).`;
   }
 
   async function handleLogin(e) {
@@ -121,7 +121,7 @@ export function AuthGate({ onReady }) {
       if (code.includes('user-not-found')) {
         setResetError('No existe un usuario registrado con ese email.');
       } else if (code.includes('invalid-email')) {
-        setResetError('El email no es vÃ¡lido.');
+        setResetError('El email no es válido.');
       } else {
         setResetError(
           'No se pudo enviar el correo de recuperación. Intenta más tarde.',
@@ -212,7 +212,7 @@ export function AuthGate({ onReady }) {
             </div>
             <div className="flex items-center gap-2">
               <span className="inline-flex h-6 w-6 items-center justify-center rounded-full bg-amber-100 text-amber-700 dark:bg-amber-900/50 dark:text-amber-200 text-xs"></span>
-              Deudas y ahorro ordenados en un solo lugar
+              Deudas y ahorros ordenados en un solo lugar
             </div>
             <div className="flex items-center gap-2">
               <span className="inline-flex h-6 w-6 items-center justify-center rounded-full bg-purple-100 text-purple-700 dark:bg-purple-900/50 dark:text-purple-200 text-xs"></span>
