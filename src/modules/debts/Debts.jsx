@@ -1,4 +1,4 @@
-// src/modules/debts/Debts.jsx
+﻿// src/modules/debts/Debts.jsx
 import React, { useState, useMemo } from 'react';
 
 import { Card } from '../../components/ui/card.jsx';
@@ -12,10 +12,69 @@ import {
   formatBudgetPeriodLabel,
   budgetMonthKeyForDate,
 } from '../../utils/budgetPeriod.js';
+import { DEBT_CATEGORY } from '../../constants.js';
+
+function toNumber(n) {
+  const num = Number(n || 0);
+  return Number.isNaN(num) ? 0 : num;
+}
+
+function ensureScheduleArray(schedule) {
+  return Array.isArray(schedule)
+    ? schedule.map((q) => ({
+        id: q.id || Math.random().toString(36).slice(2, 10),
+        periodKey: q.periodKey || '',
+        plannedAmount: toNumber(q.plannedAmount),
+        paidAmount: toNumber(q.paidAmount),
+        dueDate: q.dueDate || '',
+        status: q.status || 'pending',
+      }))
+    : [];
+}
+
+function computeQuotaStatus(plannedAmount, paidAmount) {
+  const planned = toNumber(plannedAmount);
+  const paid = toNumber(paidAmount);
+  if (paid >= planned && planned > 0) return 'paid';
+  if (paid > 0) return 'partial';
+  return 'pending';
+}
+
+function addMonthsToDate(dateStr, months) {
+  const d = new Date((dateStr || '').replace(/-/g, '/'));
+  if (Number.isNaN(d.getTime())) return new Date().toISOString().slice(0, 10);
+  d.setMonth(d.getMonth() + months);
+  return d.toISOString().slice(0, 10);
+}
+
+function totalDebtPlannedForPeriod(debts, periodKey) {
+  return (debts || [])
+    .flatMap((d) => ensureScheduleArray(d.schedule))
+    .filter((q) => q.periodKey === periodKey)
+    .reduce((s, q) => s + toNumber(q.plannedAmount), 0);
+}
+
+function totalDebtPaidFromTransactions(transactions, periodKey, cutDay) {
+  const { start, end } = getBudgetPeriod(periodKey, cutDay);
+  return (transactions || [])
+    .filter((t) => t.category === DEBT_CATEGORY)
+    .filter((t) => {
+      const d = (t.date || t.createdAt || '').slice(0, 10);
+      return d >= start && d < end;
+    })
+    .reduce((s, t) => s + toNumber(t.amount), 0);
+}
 
 export function Debts({ data, actions, monthKeyStr }) {
-  const debts = data?.debts || [];
+  const debtsRaw = data?.debts || [];
   const budgetCutDay = data?.budgetCutDay || 1;
+  const transactions = data?.transactions || [];
+
+  const debts = debtsRaw.map((d) => ({
+    ...d,
+    id: d.id || Math.random().toString(36).slice(2, 10),
+    schedule: ensureScheduleArray(d.schedule),
+  }));
 
   const { addDebt, updateDebt, removeDebt } = actions || {};
 
@@ -26,54 +85,55 @@ export function Debts({ data, actions, monthKeyStr }) {
     rateAPR: '',
     firstDue: '',
     installments: '',
+    isSubscription: false,
   });
 
-  const [quotaModal, setQuotaModal] = useState(null); // { debtId, quotaId, periodKey, plannedAmount, paidAmount, dueDate }
-
+  const [quotaModal, setQuotaModal] = useState(null); // { debtId, quotaId, periodKey, plannedAmount, dueDate }
   const [debtEditModal, setDebtEditModal] = useState(null);
 
-  function openDebtEditModal(debt) {
-    setDebtEditModal({
-      id: debt.id,
-      name: debt.name || '',
-      rateAPR: debt.rateAPR != null ? String(debt.rateAPR) : '',
-      due: debt.due || '',
-    });
-  }
-
-  async function handleSaveDebtMeta(e) {
-    e.preventDefault();
-    if (!debtEditModal || !updateDebt) return;
-
-    const { id, name, rateAPR, due } = debtEditModal;
-
-    await updateDebt(id, {
-      name: name || 'Deuda',
-      rateAPR: rateAPR !== '' ? Number(rateAPR) : 0,
-      due: due || null,
-    });
-
-    setDebtEditModal(null);
-  }
-
-  // clave del período actual basada en HOY
   const currentPeriodKey = useMemo(
     () => monthKeyStr || monthKey(new Date()),
     [monthKeyStr],
   );
 
+  const trueCurrentPeriod = useMemo(() => {
+    const todayStr = new Date().toISOString().slice(0, 10);
+    return budgetMonthKeyForDate(todayStr, budgetCutDay);
+  }, [budgetCutDay]);
+
   const visiblePeriods = useMemo(() => {
     const center = currentPeriodKey;
-    const arr = [];
-    // solo 6 periodos: 2 antes, 3 después
-    for (let delta = -2; delta <= 3; delta += 1) {
-      arr.push(shiftMonth(center, delta));
-    }
-    return arr;
-  }, [currentPeriodKey]);
+    const list = [
+      shiftMonth(center, -1),
+      center,
+      shiftMonth(center, 1),
+      trueCurrentPeriod,
+    ];
+    return Array.from(new Set(list));
+  }, [currentPeriodKey, trueCurrentPeriod]);
 
   function handleFormChange(field, value) {
     setForm((prev) => ({ ...prev, [field]: value }));
+  }
+
+  function buildSubscriptionSchedule(monthlyAmount, startPeriodKey) {
+    const schedule = [];
+    const start = startPeriodKey || monthKey();
+    for (let i = -1; i <= 18; i += 1) {
+      const pk = shiftMonth(start, i);
+      const { end } = getBudgetPeriod(pk, budgetCutDay);
+      const endDate = new Date(end + 'T00:00:00');
+      endDate.setDate(endDate.getDate() - 1);
+      schedule.push({
+        id: `${Date.now()}-sub-${i}-${Math.random().toString(36).slice(2, 6)}`,
+        periodKey: pk,
+        dueDate: endDate.toISOString().slice(0, 10),
+        plannedAmount: monthlyAmount,
+        paidAmount: 0,
+        status: 'pending',
+      });
+    }
+    return schedule;
   }
 
   function buildSchedule(totalRemaining, installments, firstDue) {
@@ -105,33 +165,65 @@ export function Debts({ data, actions, monthKeyStr }) {
     return schedule;
   }
 
+  function handleSaveDebtMeta(e) {
+    e.preventDefault();
+    if (!debtEditModal || !updateDebt) return;
+
+    const patch = {
+      name: (debtEditModal.name || '').trim() || 'Deuda',
+      rateAPR:
+        debtEditModal.rateAPR !== undefined && debtEditModal.rateAPR !== ''
+          ? Number(debtEditModal.rateAPR)
+          : undefined,
+      due: debtEditModal.due || '',
+    };
+
+    updateDebt(debtEditModal.id, patch);
+    setDebtEditModal(null);
+  }
+
   async function handleAddDebt(e) {
     e.preventDefault();
 
-    const original = Number(form.original || 0);
+    const original = toNumber(form.original);
     if (!original || !addDebt) return;
 
-    const remaining =
-      form.remaining && Number(form.remaining) > 0
-        ? Number(form.remaining)
-        : original;
+    const isSubscription = !!form.isSubscription;
+    const firstDue = form.firstDue || new Date().toISOString().slice(0, 10);
+    const startPeriod = budgetMonthKeyForDate(firstDue, budgetCutDay);
+
+    let remaining = original;
+    let installments = Math.max(1, Number(form.installments || 1));
+    let schedule;
+    let lastQuota;
+
+    if (isSubscription) {
+      remaining = original;
+      installments = 1;
+      schedule = buildSubscriptionSchedule(original, startPeriod);
+      lastQuota = schedule[schedule.length - 1];
+    } else {
+      remaining =
+        form.remaining && Number(form.remaining) > 0
+          ? Number(form.remaining)
+          : original;
+      installments = Math.max(1, Number(form.installments || 1));
+      schedule = buildSchedule(remaining, installments, firstDue);
+      lastQuota = schedule[schedule.length - 1];
+    }
 
     const alreadyPaid = Math.max(0, original - remaining);
-    const installments = Math.max(1, Number(form.installments || 1));
-    const firstDue = form.firstDue || new Date().toISOString().slice(0, 10);
-
-    const schedule = buildSchedule(remaining, installments, firstDue);
-    const lastQuota = schedule[schedule.length - 1];
 
     const d = {
       name: form.name || 'Deuda',
       original,
       remaining,
       alreadyPaid,
-      rateAPR: Number(form.rateAPR || 0),
-      due: lastQuota?.dueDate || firstDue,
+      rateAPR: toNumber(form.rateAPR),
+      due: isSubscription ? null : lastQuota?.dueDate || firstDue,
       createdAt: Date.now(),
       schedule,
+      isSubscription,
     };
 
     await addDebt(d);
@@ -143,6 +235,7 @@ export function Debts({ data, actions, monthKeyStr }) {
       rateAPR: '',
       firstDue: '',
       installments: '',
+      isSubscription: false,
     });
   }
 
@@ -158,8 +251,6 @@ export function Debts({ data, actions, monthKeyStr }) {
       periodKey: basePeriodKey,
       plannedAmount:
         quota && quota.plannedAmount != null ? String(quota.plannedAmount) : '',
-      paidAmount:
-        quota && quota.paidAmount != null ? String(quota.paidAmount) : '',
       dueDate: defaultDueDate,
     });
   }
@@ -168,8 +259,7 @@ export function Debts({ data, actions, monthKeyStr }) {
     e.preventDefault();
     if (!quotaModal || !updateDebt) return;
 
-    const { debtId, quotaId, periodKey, plannedAmount, paidAmount, dueDate } =
-      quotaModal;
+    const { debtId, quotaId, periodKey, plannedAmount, dueDate } = quotaModal;
 
     const debt = debts.find((d) => d.id === debtId);
     if (!debt) {
@@ -177,7 +267,12 @@ export function Debts({ data, actions, monthKeyStr }) {
       return;
     }
 
-    const schedule = Array.isArray(debt.schedule) ? [...debt.schedule] : [];
+    const schedule = ensureScheduleArray(debt.schedule);
+    const paidInPeriod = totalDebtPaidFromTransactions(
+      transactions,
+      periodKey,
+      budgetCutDay,
+    );
 
     if (quotaId) {
       const idx = schedule.findIndex((q) => q.id === quotaId);
@@ -185,25 +280,25 @@ export function Debts({ data, actions, monthKeyStr }) {
         schedule[idx] = {
           ...schedule[idx],
           periodKey,
-          plannedAmount: Number(plannedAmount || 0),
-          paidAmount: Number(paidAmount || 0),
+          plannedAmount: toNumber(plannedAmount),
+          paidAmount: paidInPeriod,
           dueDate,
-          status: computeQuotaStatus(plannedAmount, paidAmount),
+          status: computeQuotaStatus(plannedAmount, paidInPeriod),
         };
       }
     } else {
       schedule.push({
         id: `${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
         periodKey,
-        plannedAmount: Number(plannedAmount || 0),
-        paidAmount: Number(paidAmount || 0),
+        plannedAmount: toNumber(plannedAmount),
+        paidAmount: paidInPeriod,
         dueDate,
-        status: computeQuotaStatus(plannedAmount, paidAmount),
+        status: computeQuotaStatus(plannedAmount, paidInPeriod),
       });
     }
 
     const totalPaidFromSchedule = schedule.reduce(
-      (sum, q) => sum + Number(q.paidAmount || 0),
+      (sum, q) => sum + toNumber(q.paidAmount),
       0,
     );
     const newRemaining = Math.max(
@@ -227,60 +322,106 @@ export function Debts({ data, actions, monthKeyStr }) {
     return 'bg-gray-100 text-gray-600';
   }
 
-  function totalPlannedForPeriod(periodKey) {
-    return debts
-      .flatMap((d) => (Array.isArray(d.schedule) ? d.schedule : []))
-      .filter((q) => q.periodKey === periodKey)
-      .reduce((sum, q) => sum + Number(q.plannedAmount || 0), 0);
+  function quotaTooltip(debt, quota) {
+    return `${debt.name || 'Deuda'}\nPlanificado: ${toNumber(
+      quota.plannedAmount,
+    )}\nPagado: ${toNumber(quota.paidAmount)}\nVence: ${quota.dueDate || '-'}`;
   }
 
+  const summaryPlanned = totalDebtPlannedForPeriod(debts, currentPeriodKey);
+  const summaryPaid = totalDebtPaidFromTransactions(
+    transactions,
+    currentPeriodKey,
+    budgetCutDay,
+  );
+  const summaryPending = Math.max(0, summaryPlanned - summaryPaid);
+
+  function paidAmountForQuota(periodKey) {
+    return totalDebtPaidFromTransactions(transactions, periodKey, budgetCutDay);
+  }
+
+  function linkedPaidForQuota(quotaId) {
+    if (!quotaId) return 0;
+    return (transactions || []).reduce((sum, t) => {
+      const metaId = t?.meta?.debtQuotaId;
+      if (metaId !== quotaId) return sum;
+      return sum + toNumber(t.amount);
+    }, 0);
+  }
+
+  const paidInPeriodForModal =
+    quotaModal && quotaModal.periodKey
+      ? totalDebtPaidFromTransactions(
+          transactions,
+          quotaModal.periodKey,
+          budgetCutDay,
+        )
+      : 0;
+
+  const linkedPaidForModal =
+    quotaModal && quotaModal.quotaId
+      ? linkedPaidForQuota(quotaModal.quotaId)
+      : 0;
+
+  const plannedForModal = quotaModal ? toNumber(quotaModal.plannedAmount) : 0;
+
+  const isModalQuotaPaid =
+    plannedForModal > 0 && paidInPeriodForModal >= plannedForModal;
+
   return (
-    <div className="grid gap-4 lg:grid-cols-3">
-      <Card>
+    <div className="grid gap-6 lg:grid-cols-10">
+      {/* Formulario izquierda */}
+      <Card className="lg:col-span-3 p-5">
         <SectionTitle>Nueva deuda</SectionTitle>
         <form onSubmit={handleAddDebt} className="grid gap-3">
           <input
-            className="border rounded-lg p-2"
-            placeholder="Nombre (ej. Tarjeta, Préstamo)"
+            className="border rounded-lg p-3 text-sm"
+            placeholder="Nombre (ej. Tarjeta, Prestamo)"
             value={form.name}
             onChange={(e) => handleFormChange('name', e.target.value)}
           />
+          <div className="grid grid-cols-2 gap-2">
+            <input
+              className="border rounded-lg p-3 text-sm"
+              type="number"
+              min={0}
+              step="1"
+              placeholder="Monto original"
+              value={form.original}
+              onChange={(e) => handleFormChange('original', e.target.value)}
+            />
+            <input
+              className="border rounded-lg p-3 text-sm"
+              type="number"
+              min={0}
+              step="1"
+              placeholder="Saldo pendiente (opcional)"
+              value={form.remaining}
+              onChange={(e) => handleFormChange('remaining', e.target.value)}
+            />
+          </div>
+          <div className="grid grid-cols-2 gap-2">
+            <input
+              className="border rounded-lg p-3 text-sm"
+              type="number"
+              min={1}
+              step="1"
+              placeholder="Numero de cuotas"
+              value={form.installments}
+              onChange={(e) => handleFormChange('installments', e.target.value)}
+              disabled={form.isSubscription}
+            />
+            <input
+              className="border rounded-lg p-3 text-sm"
+              type="date"
+              placeholder="Fecha de primer pago"
+              value={form.firstDue}
+              onChange={(e) => handleFormChange('firstDue', e.target.value)}
+              disabled={form.isSubscription}
+            />
+          </div>
           <input
-            className="border rounded-lg p-2"
-            type="number"
-            min={0}
-            step="1"
-            placeholder="Monto original (total)"
-            value={form.original}
-            onChange={(e) => handleFormChange('original', e.target.value)}
-          />
-          <input
-            className="border rounded-lg p-2"
-            type="number"
-            min={0}
-            step="1"
-            placeholder="Saldo pendiente (opcional)"
-            value={form.remaining}
-            onChange={(e) => handleFormChange('remaining', e.target.value)}
-          />
-          <input
-            className="border rounded-lg p-2"
-            type="number"
-            min={1}
-            step="1"
-            placeholder="Número de cuotas"
-            value={form.installments}
-            onChange={(e) => handleFormChange('installments', e.target.value)}
-          />
-          <input
-            className="border rounded-lg p-2"
-            type="date"
-            placeholder="Fecha de primer pago"
-            value={form.firstDue}
-            onChange={(e) => handleFormChange('firstDue', e.target.value)}
-          />
-          <input
-            className="border rounded-lg p-2"
+            className="border rounded-lg p-3 text-sm"
             type="number"
             min={0}
             step="0.01"
@@ -288,144 +429,158 @@ export function Debts({ data, actions, monthKeyStr }) {
             value={form.rateAPR}
             onChange={(e) => handleFormChange('rateAPR', e.target.value)}
           />
-
-          <button className="px-3 py-2 rounded-xl border bg-gray-900 text-white">
+          <label className="flex items-center gap-2 text-sm text-gray-700">
+            <input
+              type="checkbox"
+              checked={form.isSubscription}
+              onChange={(e) =>
+                handleFormChange('isSubscription', e.target.checked)
+              }
+            />
+            Es suscripcion (se repite mes a mes hasta eliminar)
+          </label>
+          <button className="px-3 py-3 rounded-xl border bg-gray-900 text-white text-sm font-semibold">
             Agregar deuda
           </button>
         </form>
       </Card>
 
-      <Card className="lg:col-span-2">
-        <SectionTitle
-          right={
-            <div className="flex flex-col items-end text-xs gap-1">
-              <div className="flex items-center gap-3">
-                <div className="flex items-center gap-1">
-                  <span className="w-4 h-3 rounded bg-gray-300" />
-                  <span>Pendiente</span>
-                </div>
-                <div className="flex items-center gap-1">
-                  <span className="w-4 h-3 rounded bg-amber-500" />
-                  <span>Pago parcial</span>
-                </div>
-                <div className="flex items-center gap-1">
-                  <span className="w-4 h-3 rounded bg-green-600" />
-                  <span>Pagado</span>
-                </div>
-              </div>
-              <div className="text-[11px] text-gray-500">
-                Total cuotas planificadas este período:{' '}
-                <Money n={totalPlannedForPeriod(monthKeyStr)} />
-              </div>
-            </div>
-          }
-        >
-          Calendario de deudas
-        </SectionTitle>
+      {/* Calendario derecha */}
+      <Card className="lg:col-span-7 p-5 space-y-4">
+        <SectionTitle>Calendario de deudas</SectionTitle>
 
+        {/* Chips estado */}
+        <div className="grid grid-cols-3 gap-3">
+          <div className="border rounded-xl p-3 bg-gray-50 text-center dark:bg-gray-800 dark:border-gray-700">
+            <div className="text-xs text-gray-500 dark:text-gray-300">Planificado</div>
+            <div className="text-lg font-semibold">
+              <Money n={summaryPlanned} />
+            </div>
+          </div>
+          <div className="border rounded-xl p-3 bg-gray-50 text-center dark:bg-gray-800 dark:border-gray-700">
+            <div className="text-xs text-gray-500 dark:text-gray-300">Pagado (Movimientos)</div>
+            <div className="text-lg font-semibold">
+              <Money n={summaryPaid} />
+            </div>
+          </div>
+          <div className="border rounded-xl p-3 bg-gray-50 text-center dark:bg-gray-800 dark:border-gray-700">
+            <div className="text-xs text-gray-500 dark:text-gray-300">Pendiente</div>
+            <div className="text-lg font-semibold">
+              <Money n={summaryPending} />
+            </div>
+          </div>
+        </div>
+
+        {/* Periodos */}
+        <div className="overflow-x-auto">
+          <div
+            className="grid text-[11px] font-semibold text-gray-700 border rounded-lg bg-gray-50 px-2 py-2 min-w-[520px] dark:bg-gray-800 dark:border-gray-700 dark:text-gray-200"
+            style={{
+              gridTemplateColumns: `160px repeat(${visiblePeriods.length}, minmax(90px, 1fr))`,
+            }}
+          >
+            <div
+              className="text-left px-2 cursor-help text-gray-700 dark:text-gray-200"
+              title="Deudas: se calculan por fecha de vencimiento/día de corte del periodo."
+            >
+              Cuotas por periodo
+            </div>
+            {visiblePeriods.map((pk) => {
+              const isActual = pk === trueCurrentPeriod;
+              const isSelected = pk === currentPeriodKey;
+              return (
+                <div
+                  key={pk}
+                  className={`text-center px-2 py-1 rounded-lg border flex flex-col items-center justify-center gap-1 ${
+                    isActual
+                      ? 'bg-green-50 text-green-800 border-green-400 dark:bg-green-900/30 dark:text-green-200 dark:border-green-500'
+                      : 'border-transparent bg-white dark:bg-gray-800 dark:border-gray-700 dark:text-gray-200'
+                  } ${isSelected ? 'ring-1 ring-blue-400' : ''}`}
+                >
+                  <span>{formatBudgetPeriodLabel(pk, budgetCutDay)}</span>
+                  {isSelected && (
+                    <span className="text-blue-500 text-[10px] leading-none">
+                      v
+                    </span>
+                  )}
+                </div>
+              );
+            })}
+          </div>
+        </div>
+
+        {/* Deudas */}
         {debts.length === 0 ? (
           <div className="text-gray-500">Sin deudas registradas.</div>
         ) : (
-          <div>
-            <div className="min-w-full space-y-3">
-              {/* Encabezado de periodos */}
-              <div
-                className="grid text-xs font-medium text-gray-600 mb-1"
-                style={{
-                  gridTemplateColumns: `180px repeat(${visiblePeriods.length}, minmax(90px, 1fr))`,
-                }}
-              >
-                <div />
-                {visiblePeriods.map((pk) => {
-                  const isCurrent = pk === currentPeriodKey;
-                  return (
+          <div className="space-y-4">
+            {debts.map((d) => {
+              const progress =
+                d.original > 0
+                  ? ((d.original - (d.remaining || 0)) / d.original) * 100
+                  : 0;
+
+              return (
+                <div
+                  key={d.id || d.name + d.due}
+                  className="rounded-xl border shadow-sm p-2 space-y-1 bg-white dark:bg-gray-800 dark:border-gray-700"
+                >
+                  <div className="text-base font-semibold text-gray-900 dark:text-gray-100 px-2">
+                    {d.name || 'Deuda'}
+                  </div>
+                  <div className="pt-2 overflow-x-auto">
                     <div
-                      key={pk}
-                      className={
-                        'text-center px-1 rounded-lg ' +
-                        (isCurrent
-                          ? 'bg-green-100 text-green-800 font-semibold border border-green-400'
-                          : '')
-                      }
-                    >
-                      {formatBudgetPeriodLabel(pk, budgetCutDay)}
-                    </div>
-                  );
-                })}
-              </div>
-
-              {/* Filas por deuda */}
-              {debts.map((d) => {
-                const progress =
-                  d.original > 0
-                    ? ((d.original - (d.remaining || 0)) / d.original) * 100
-                    : 0;
-
-                return (
-                  <div
-                    key={d.id || d.name + d.due}
-                    className="border rounded-xl p-3"
-                  >
-                    <div className="flex items-center justify-between mb-2">
-                      <div>
-                        <div className="font-medium">{d.name}</div>
-                        <div className="text-sm text-gray-600">
-                          Saldo: <Money n={d.remaining} /> / Original:{' '}
-                          <Money n={d.original} />
-                        </div>
-                        <div className="text-xs text-gray-500">
-                          {d.rateAPR ? `Tasa: ${d.rateAPR}%` : ''}{' '}
-                          {d.due ? `· Último vencimiento: ${d.due}` : ''}
-                        </div>
-                      </div>
-                      <div className="w-56">
-                        <Progress value={progress} mode="good" />
-                        <div className="text-xs text-gray-600 mt-1">
-                          Pagado: {progress.toFixed(1)}%
-                        </div>
-                      </div>
-                    </div>
-
-                    <div
-                      className="grid text-xs items-center"
+                      className="grid text-[11px] items-center gap-2 min-w-[520px]"
                       style={{
-                        gridTemplateColumns: `180px repeat(${visiblePeriods.length}, minmax(90px, 1fr))`,
+                        gridTemplateColumns: `160px repeat(${visiblePeriods.length}, minmax(90px, 1fr))`,
                       }}
                     >
-                      <div className="text-xs text-gray-500">Cuotas</div>
+                      <div className="text-base font-semibold text-gray-800 px-2">
+                        {d.name || 'Cuotas'}
+                      </div>
                       {visiblePeriods.map((pk) => {
                         const quota = (d.schedule || []).find(
                           (q) => q.periodKey === pk,
                         );
+                        const paid = paidAmountForQuota(pk);
 
                         if (!quota) {
                           return (
                             <button
                               key={pk}
                               type="button"
-                              className="h-7 flex items-center justify-center border border-dashed border-gray-300 rounded hover:bg-gray-50"
+                              className="h-10 min-w-[60px] px-2 flex items-center justify-center border border-dashed border-gray-300 rounded-md hover:bg-gray-50"
                               onClick={() => openQuotaModal(d, null, pk)}
                             >
-                              <span className="text-[10px] text-gray-400">
+                              <span className="text-[10px] text-gray-400 font-medium">
                                 + cuota
                               </span>
                             </button>
                           );
                         }
 
+                        const status = computeQuotaStatus(
+                          quota.plannedAmount,
+                          paid,
+                        );
+
                         return (
                           <button
                             key={pk}
                             type="button"
-                            className="h-7 flex items-center justify-center"
+                            className="h-10 min-w-[60px] px-2 flex items-center justify-center"
                             onClick={() => openQuotaModal(d, quota, pk)}
+                            title={quotaTooltip(d, {
+                              ...quota,
+                              paidAmount: paid,
+                            })}
                           >
                             <div
-                              className={`w-full h-6 rounded flex items-center justify-center ${quotaBoxColor(
-                                quota,
+                              className={`w-full h-full rounded-md flex items-center justify-center ${quotaBoxColor(
+                                { ...quota, paidAmount: paid, status },
                               )}`}
                             >
-                              <span className="text-[10px] truncate px-1">
+                              <span className="text-[10px] font-semibold truncate px-1">
                                 <Money n={quota.plannedAmount} />
                               </span>
                             </div>
@@ -433,31 +588,50 @@ export function Debts({ data, actions, monthKeyStr }) {
                         );
                       })}
                     </div>
+                  </div>
 
-                    <div className="mt-3 flex justify-center gap-3">
-                      <button
-                        type="button"
-                        className="text-xs px-3 py-1.5 rounded-lg border text-gray-700 hover:bg-gray-50"
-                        onClick={() => openDebtEditModal(d)}
-                      >
-                        Editar deuda
-                      </button>
-                      <button
-                        type="button"
-                        className="text-xs px-3 py-1.5 rounded-lg border border-red-500 text-red-600 hover:bg-red-50"
-                        onClick={() => removeDebt && removeDebt(d.id)}
-                      >
-                        Eliminar deuda
-                      </button>
+                  <div className="pt-2 flex justify-center gap-3">
+                    <button
+                      type="button"
+                      className="text-xs px-4 py-2 rounded-lg border text-gray-700 hover:bg-gray-50"
+                      onClick={() =>
+                        setDebtEditModal({
+                          id: d.id,
+                          name: d.name || '',
+                          rateAPR: d.rateAPR != null ? String(d.rateAPR) : '',
+                          due: d.due || '',
+                        })
+                      }
+                    >
+                      Editar deuda
+                    </button>
+                    <button
+                      type="button"
+                      className="text-xs px-4 py-2 rounded-lg border border-red-500 text-red-600 hover:bg-red-50"
+                      onClick={() => removeDebt && removeDebt(d.id)}
+                    >
+                      Eliminar deuda
+                    </button>
+                  </div>
+                  <div className="pt-1">
+                    <div className="text-[11px] text-gray-500 mb-1 text-left flex justify-between items-center">
+                      <span>Pagado</span>
+                      <span className="text-[11px] text-gray-600">
+                        Saldo: <Money n={d.remaining} />
+                      </span>
+                    </div>
+                    <Progress value={progress} mode="good" />
+                    <div className="text-[11px] text-gray-600 mt-1 text-right">
+                      Pagado: {progress.toFixed(1)}%
                     </div>
                   </div>
-                );
-              })}
-            </div>
+                </div>
+              );
+            })}
           </div>
         )}
       </Card>
-
+      {/* Modales */}
       {quotaModal && (
         <div className="fixed inset-0 z-30 flex items-start justify-center bg-black/30 pt-16">
           <div className="bg-white dark:bg-gray-900 rounded-2xl shadow-xl p-5 w-full max-w-md">
@@ -470,7 +644,7 @@ export function Debts({ data, actions, monthKeyStr }) {
                 className="text-sm text-gray-500 hover:text-gray-800"
                 onClick={() => setQuotaModal(null)}
               >
-                ✕
+                x
               </button>
             </div>
 
@@ -509,25 +683,36 @@ export function Debts({ data, actions, monthKeyStr }) {
                       plannedAmount: e.target.value,
                     }))
                   }
+                  required
                 />
               </div>
 
               <div className="grid gap-1">
-                <label>Monto pagado (acumulado en el período)</label>
-                <input
-                  type="number"
-                  min={0}
-                  step="1"
-                  className="border rounded-lg p-2"
-                  value={quotaModal.paidAmount}
-                  onChange={(e) =>
-                    setQuotaModal((prev) => ({
-                      ...prev,
-                      paidAmount: e.target.value,
-                    }))
-                  }
-                />
+                <label>Pagado (desde Movimientos)</label>
+                <div className="border rounded-lg p-2 bg-gray-50 dark:bg-gray-800 text-right">
+                  <Money n={paidInPeriodForModal} />
+                </div>
+                <p className="text-xs text-gray-500">
+                  El pago real proviene de las transacciones con categoria{' '}
+                  {`"${DEBT_CATEGORY}"`} en el periodo.
+                </p>
               </div>
+
+              {quotaModal.quotaId && (
+                <div className="grid gap-1">
+                  <label>Pagado vinculado a esta cuota</label>
+                  <div className="border rounded-lg p-2 bg-gray-50 dark:bg-gray-800 text-right">
+                    <Money n={linkedPaidForModal} />
+                  </div>
+                  <div
+                    className={`text-xs font-semibold ${
+                      isModalQuotaPaid ? 'text-green-700' : 'text-amber-700'
+                    }`}
+                  >
+                    {isModalQuotaPaid ? 'Pagada' : 'Pendiente por pagar'}
+                  </div>
+                </div>
+              )}
 
               <div className="grid gap-1">
                 <label>Fecha de pago (o vencimiento)</label>
@@ -574,7 +759,7 @@ export function Debts({ data, actions, monthKeyStr }) {
                 className="text-sm text-gray-500 hover:text-gray-800"
                 onClick={() => setDebtEditModal(null)}
               >
-                ✕
+                x
               </button>
             </div>
 
@@ -594,7 +779,7 @@ export function Debts({ data, actions, monthKeyStr }) {
               </div>
 
               <div className="grid gap-1">
-                <label>Fecha último vencimiento</label>
+                <label>Fecha Último vencimiento</label>
                 <input
                   type="date"
                   className="border rounded-lg p-2"

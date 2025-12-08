@@ -15,7 +15,7 @@ import {
 } from 'firebase/firestore';
 import { db } from '../firebase';
 import { DEBT_CATEGORY, CATEGORIES } from '../constants.js';
-import { monthKey } from '../utils/budgetPeriod';
+import { monthKey, shiftMonth } from '../utils/budgetPeriod';
 
 export default function useHouseholdData(householdId) {
   const [categories, setCategories] = useState(CATEGORIES);
@@ -160,7 +160,15 @@ export default function useHouseholdData(householdId) {
   }
 
   async function setBudgetFunded(monthKeyStr, cat, value) {
-    const n = Number(value || 0);
+    const isObj = value && typeof value === 'object';
+    const breakdown = isObj && Array.isArray(value.breakdown)
+      ? value.breakdown.map((item) => ({
+          id: item.id || Math.random().toString(36).slice(2, 10),
+          name: item.name || '',
+          amount: Number(item.amount || 0),
+        }))
+      : undefined;
+    const n = isObj ? Number(value.funded ?? value.amount ?? 0) : Number(value || 0);
     const ref = doc(db, 'households', householdId);
     const snap = await getDoc(ref);
     const data = snap.data() || {};
@@ -174,13 +182,30 @@ export default function useHouseholdData(householdId) {
     const prev = normalizeBudgetEntry(monthBudgets[cat]);
     const nextMonthBudgets = {
       ...monthBudgets,
-      [cat]: { ...prev, funded: n },
+      [cat]: { ...prev, funded: n, ...(breakdown ? { breakdown } : {}) },
     };
 
     const nextAllBudgets = {
       ...allBudgets,
       [mk]: nextMonthBudgets,
     };
+
+    // Copiar automáticamente al mes siguiente si no existe
+    const nextMkKey = shiftMonth(mk, 1);
+    const nextExisting = allBudgets[nextMkKey] || {};
+    if (!nextExisting[cat]) {
+      const nextPrev = normalizeBudgetEntry(nextExisting[cat]);
+      const clone = {
+        ...nextPrev,
+        funded: n,
+        plan: nextPrev.plan || n,
+        ...(breakdown ? { breakdown } : {}),
+      };
+      nextAllBudgets[nextMkKey] = {
+        ...nextExisting,
+        [cat]: clone,
+      };
+    }
 
     await updateDoc(ref, { budgets: nextAllBudgets });
   }
@@ -195,6 +220,13 @@ export default function useHouseholdData(householdId) {
       console.error('Error al guardar transacción:', e);
       alert('No se pudo guardar el movimiento. Revisa la consola.');
     }
+  }
+
+  async function updateTransaction(id, patch) {
+    await updateDoc(
+      doc(db, 'households', householdId, 'transactions', id),
+      patch,
+    );
   }
 
   async function removeTransaction(id) {
@@ -393,6 +425,7 @@ export default function useHouseholdData(householdId) {
     setBudgetPlan,
     setBudgetFunded,
     addTransaction,
+    updateTransaction,
     removeTransaction,
     addDebt,
     updateDebt,
@@ -409,3 +442,4 @@ export default function useHouseholdData(householdId) {
     setBudgetCutDay,
   };
 }
+

@@ -1,4 +1,4 @@
-﻿// Finanzas en Familia — App V2 (Firebase + Firestore, tiempo real)
+// Finanzas en Familia — App V2 (Firebase + Firestore, tiempo real)
 // - Autenticación email/contraseña
 // - Household compartido (código de hogar)
 // - Datos en Firestore con sincronización en tiempo real
@@ -8,7 +8,8 @@ import React, { useEffect, useState } from 'react';
 import {
   onAuthStateChanged,
   signOut,
-  sendPasswordResetEmail,
+  reauthenticateWithCredential,
+  EmailAuthProvider,
 } from 'firebase/auth';
 
 // Firebase
@@ -35,7 +36,7 @@ import {
   budgetMonthKeyForDate,
 } from './utils/budgetPeriod.js';
 
-// Config / estilos globales
+// Config / estilos globales (side-effects)
 import './App.css';
 
 export default function App() {
@@ -52,32 +53,15 @@ export default function App() {
   const [loginUserId, setLoginUserId] = useState('');
   const [loginPin, setLoginPin] = useState('');
   const [loginError, setLoginError] = useState('');
+  const [useAccountPassword, setUseAccountPassword] = useState(false);
+  const [accountPassword, setAccountPassword] = useState('');
   const [hasForcedUserSelection, setHasForcedUserSelection] = useState(false);
-
-  // === MODO RECUPERACIÓN PIN ADMIN ===
-  const [isResettingPin, setIsResettingPin] = useState(false);
-  const [pinResetEmail, setPinResetEmail] = useState('');
-  const [pinResetAccepted, setPinResetAccepted] = useState(false);
-  const [pinResetError, setPinResetError] = useState('');
-  const [pinResetMsg, setPinResetMsg] = useState('');
-  const [isSendingReset, setIsSendingReset] = useState(false);
 
   const [authedUser, setAuthedUser] = useState(null);
 
-  // Datos del hogar
-  const h = useHouseholdData(ctx?.householdId) || {};
-  const todayStr = new Date().toISOString().slice(0, 10);
   const selectedHid = ctx?.householdId || null;
 
-  const budgetsForSelectedMonth = (h.budgets && h.budgets[selectedMonth]) || {};
-  const householdUsers = h.householdUsers || [];
-  const activeUser =
-    householdUsers.find((u) => u.id === selectedHouseholdUserId) || null;
-
-  const selectedLoginUser =
-    householdUsers.find((u) => u.id === loginUserId) || null;
-
-  // Persistir usuario activo en localStorage
+  // Persistir usuario de la casa seleccionado
   useEffect(() => {
     if (selectedHouseholdUserId) {
       localStorage.setItem('activeHouseholdUserId', selectedHouseholdUserId);
@@ -92,34 +76,31 @@ export default function App() {
     return () => unsub();
   }, []);
 
-  // Prefijar correo para reset de PIN cuando se entra al modo de reseteo
-  useEffect(() => {
-    if (!isResettingPin) return;
-
-    const presetEmail =
-      authedUser?.email || selectedLoginUser?.email || h.superAdminEmail || '';
-
-    setPinResetEmail(presetEmail || '');
-  }, [
-    isResettingPin,
-    authedUser?.email,
-    selectedLoginUser?.email,
-    h.superAdminEmail,
-  ]);
+  // Datos del hogar
+  const h = useHouseholdData(selectedHid);
 
   // Ajustar el mes seleccionado según el día de corte al entrar
   useEffect(() => {
-    if (!h || !h.budgetCutDay) return;
-    if (!selectedHid) return;
-    if (hasInitMonthByCutDay) return;
+    if (!selectedHid) return; // aún no hay hogar
+    if (!h || !h.budgetCutDay) return; // aún no se cargan datos del hogar
+    if (hasInitMonthByCutDay) return; // ya lo hicimos una vez
 
+    const todayStr = new Date().toISOString().slice(0, 10); // "YYYY-MM-DD"
     const key = budgetMonthKeyForDate(todayStr, h.budgetCutDay || 1);
+
     setSelectedMonth(key);
     setHasInitMonthByCutDay(true);
-  }, [selectedHid, h.budgetCutDay, hasInitMonthByCutDay, todayStr]);
+  }, [selectedHid, h.budgetCutDay, hasInitMonthByCutDay]);
+
+  const budgetsForSelectedMonth = (h.budgets && h.budgets[selectedMonth]) || {};
+  const householdUsers = h.householdUsers || [];
+  const activeUser =
+    householdUsers.find((u) => u.id === selectedHouseholdUserId) || null;
 
   // Lógica de selector de usuario de la casa (PIN / admin)
   useEffect(() => {
+    if (!selectedHid) return;
+
     if (!householdUsers.length) {
       setShowUserSelector(false);
       setSelectedHouseholdUserId(null);
@@ -150,7 +131,9 @@ export default function App() {
       const exists = householdUsers.find(
         (u) => u.id === selectedHouseholdUserId,
       );
-      if (exists) {
+      if (!exists) {
+        setShowUserSelector(true);
+        setLoginUserId((superAdmin && superAdmin.id) || householdUsers[0].id);
         setLoginPin('');
         setLoginError('');
       }
@@ -171,91 +154,79 @@ export default function App() {
     hasForcedUserSelection,
   ]);
 
-  useEffect(() => {
-    // Si cambia de hogar, forzamos nuevamente selección de usuario
-    setHasForcedUserSelection(false);
-  }, [selectedHid]);
-
   async function handleUserLogin(e) {
     e.preventDefault();
-    if (isResettingPin) return; // en modo recuperación no se loguea
+    setLoginError('');
 
     const user = householdUsers.find((u) => u.id === loginUserId);
     if (!user) {
-      setLoginError('Usuario no encontrado');
+      setLoginError('Usuario inválido');
       return;
     }
 
-    if (user.pin && user.pin !== loginPin) {
-      setLoginError('PIN incorrecto');
-      return;
+    // MODO NORMAL: validar PIN
+    if (!useAccountPassword) {
+      if (user.pin && user.pin !== loginPin) {
+        setLoginError('PIN incorrecto');
+        return;
+      }
+    } else {
+      // MODO RECUPERAR PIN (solo super admin, usando contraseña de la cuenta)
+      if (!user.isSuperAdmin) {
+        setLoginError(
+          'Solo el administrador puede usar la contraseña de la cuenta.',
+        );
+        return;
+      }
+
+      const current = auth.currentUser;
+      if (!current || !current.email) {
+        setLoginError(
+          'No se pudo validar tu cuenta. Vuelve a iniciar sesión e inténtalo de nuevo.',
+        );
+        return;
+      }
+
+      if (!accountPassword.trim()) {
+        setLoginError('Escribe la contraseña de tu cuenta.');
+        return;
+      }
+
+      try {
+        const cred = EmailAuthProvider.credential(
+          current.email,
+          accountPassword.trim(),
+        );
+        await reauthenticateWithCredential(current, cred);
+        // Si no lanza error, la contraseña es correcta.
+      } catch (err) {
+        console.error('Error reautenticando:', err);
+        setLoginError('Contraseña de la cuenta incorrecta.');
+        return;
+      }
     }
 
-    setSelectedHouseholdUserId(loginUserId);
+    // Si llegó aquí, pasó la validación (PIN o contraseña)
+    setSelectedHouseholdUserId(user.id);
     setShowUserSelector(false);
     setLoginPin('');
+    setAccountPassword('');
+    setUseAccountPassword(false);
     setLoginError('');
   }
 
-  async function handlePinResetSubmit(e) {
-    e.preventDefault();
-    setPinResetError('');
-    setPinResetMsg('');
-
-    const mail = (pinResetEmail || '').trim();
-
-    if (!mail) {
-      setPinResetError('Por favor ingresa un correo válido.');
-      return;
-    }
-
-    if (!pinResetAccepted) {
-      setPinResetError(
-        'Debes aceptar recibir el enlace de restablecimiento en este correo.',
-      );
-      return;
-    }
-
-    try {
-      setIsSendingReset(true);
-      await sendPasswordResetEmail(auth, mail);
-      setPinResetMsg(
-        'Te enviamos un correo con el enlace para restablecer tu acceso. Revisa también tu carpeta de spam.',
-      );
-    } catch (err) {
-      console.error('Error enviando restablecimiento de PIN:', err);
-      const code = String(err?.code || '');
-      if (code.includes('invalid-email')) {
-        setPinResetError('El correo no es válido.');
-      } else if (code.includes('user-not-found')) {
-        setPinResetError('No encontramos un usuario con ese correo.');
-      } else if (code.includes('too-many-requests')) {
-        setPinResetError('Demasiados intentos. Intenta nuevamente más tarde.');
-      } else {
-        setPinResetError('No se pudo enviar el enlace. Intenta más tarde.');
-      }
-    } finally {
-      setIsSendingReset(false);
-    }
-  }
-
-  async function handleLogout() {
-    try {
-      await signOut(auth);
-    } catch (err) {
-      console.error('Error cerrando sesión:', err);
-    }
+  const handleLogout = async () => {
+    await signOut(auth);
     setCtx(null);
-    setAuthedUser(null);
     setSelectedHouseholdUserId(null);
-    setShowUserSelector(false);
-    // limpiar flujo de recuperación
-    setIsResettingPin(false);
-    setPinResetEmail('');
-    setPinResetError('');
-    setPinResetMsg('');
-    setPinResetAccepted(false);
-  }
+    setHasForcedUserSelection(false);
+    setTab('dashboard');
+  };
+
+  // Reset de flag cuando cambia de hogar
+  useEffect(() => {
+    setHasForcedUserSelection(false);
+  }, [selectedHid]);
 
   // Preferencias de usuario de la casa
   const userPrefs = activeUser?.preferences || {};
@@ -277,8 +248,8 @@ export default function App() {
   const actions = {
     setBudget: h.setBudget,
     setBudgetPlan: h.setBudgetPlan,
-    setBudgetFunded: (monthKeyStrArg, cat, value) =>
-      h.setBudgetFunded(monthKeyStrArg, cat, value),
+    setBudgetFunded: (monthKeyStr, cat, value) =>
+      h.setBudgetFunded(monthKeyStr, cat, value),
     addTransaction: h.addTransaction,
     removeTransaction: h.removeTransaction,
     addDebt: h.addDebt,
@@ -327,116 +298,43 @@ export default function App() {
         <div className="fixed inset-0 z-20 flex items-center justify-center bg-black/50">
           <div className="bg-white dark:bg-gray-800 rounded-2xl shadow-lg p-6 w-full max-w-md text-gray-900 dark:text-gray-100">
             <h2 className="text-lg font-semibold mb-3">
-              {isResettingPin
-                ? 'Restablecer PIN de administrador'
-                : '¿Quién está usando la app?'}
+              ¿Quién está usando la app?
             </h2>
 
-            {isResettingPin ? (
-              // ===== MODO RECUPERACIÓN PIN =====
+            {householdUsers.length === 0 ? (
+              <p className="text-sm text-gray-600">
+                No hay usuarios configurados aún. Ve a Ajustes &gt; Usuarios de
+                la casa para crearlos.
+              </p>
+            ) : (
               <form
                 className="grid gap-3"
-                onSubmit={handlePinResetSubmit}
+                onSubmit={handleUserLogin}
                 autoComplete="off"
               >
-                <p className="text-sm text-gray-600 dark:text-gray-300">
-                  Ingresa el correo del administrador. Te enviaremos un enlace
-                  para restablecer tu acceso. Luego podrás cambiar tu PIN dentro
-                  de la app.
-                </p>
-
                 <div className="grid gap-1">
-                  <label className="text-sm">Correo del administrador</label>
-                  <input
-                    type="email"
+                  <label className="text-sm">Usuario</label>
+                  <select
                     className="border rounded-lg p-2"
-                    value={pinResetEmail}
-                    onChange={(e) => setPinResetEmail(e.target.value)}
-                    placeholder="correo@ejemplo.com"
-                  />
-                </div>
-
-                <label className="flex items-start gap-2 text-sm">
-                  <input
-                    type="checkbox"
-                    className="mt-1"
-                    checked={pinResetAccepted}
-                    onChange={(e) => setPinResetAccepted(e.target.checked)}
-                  />
-                  <span>
-                    Acepto recibir un enlace de restablecimiento en este correo.
-                  </span>
-                </label>
-
-                {pinResetError && (
-                  <div className="text-xs text-red-600">{pinResetError}</div>
-                )}
-
-                {pinResetMsg && (
-                  <div className="text-xs text-green-600">{pinResetMsg}</div>
-                )}
-
-                <div className="flex justify-end gap-2 mt-2">
-                  <button
-                    type="button"
-                    className="px-3 py-1.5 text-xs text-blue-600 underline"
-                    onClick={() => {
-                      setIsResettingPin(false);
-                      setPinResetError('');
-                      setPinResetMsg('');
-                      setPinResetAccepted(false);
+                    value={loginUserId}
+                    onChange={(e) => {
+                      setLoginUserId(e.target.value);
+                      setLoginError('');
+                      setUseAccountPassword(false);
+                      setAccountPassword('');
+                      setLoginPin('');
                     }}
                   >
-                    Volver a ingresar con PIN
-                  </button>
-                  <button
-                    type="submit"
-                    className="px-3 py-1.5 text-sm border rounded-lg bg-gray-900 text-white disabled:opacity-60"
-                    disabled={
-                      isSendingReset ||
-                      !pinResetEmail.trim() ||
-                      !pinResetAccepted
-                    }
-                  >
-                    {isSendingReset
-                      ? 'Enviando...'
-                      : 'Enviar enlace para restablecer'}
-                  </button>
+                    {householdUsers.map((u) => (
+                      <option key={u.id} value={u.id}>
+                        {u.name} {u.isSuperAdmin ? '(Admin)' : ''}
+                      </option>
+                    ))}
+                  </select>
                 </div>
-              </form>
-            ) : (
-              // ===== MODO NORMAL (USUARIO + PIN) =====
-              <>
-                {householdUsers.length === 0 ? (
-                  <p className="text-sm text-gray-600">
-                    No hay usuarios configurados aún. Ve a Ajustes &gt; Usuarios
-                    de la casa para crearlos.
-                  </p>
-                ) : (
-                  <form
-                    className="grid gap-3"
-                    onSubmit={handleUserLogin}
-                    autoComplete="off"
-                  >
-                    <div className="grid gap-1">
-                      <label className="text-sm">Usuario</label>
-                      <select
-                        className="border rounded-lg p-2"
-                        value={loginUserId}
-                        onChange={(e) => {
-                          setLoginUserId(e.target.value);
-                          setLoginError('');
-                          setLoginPin('');
-                        }}
-                      >
-                        {householdUsers.map((u) => (
-                          <option key={u.id} value={u.id}>
-                            {u.name} {u.isSuperAdmin ? '(Admin)' : ''}
-                          </option>
-                        ))}
-                      </select>
-                    </div>
 
+                <div className="grid gap-2">
+                  {!useAccountPassword && (
                     <div className="grid gap-1">
                       <label className="text-sm">
                         PIN (si el usuario no tiene PIN, deja en blanco)
@@ -459,58 +357,87 @@ export default function App() {
                         Si olvidaste tu PIN, pídele ayuda al administrador del
                         hogar.
                       </p>
-
-                      {selectedLoginUser?.isSuperAdmin && (
-                        <button
-                          type="button"
-                          className="mt-1 text-xs text-blue-600 underline text-left"
-                          onClick={() => {
-                            setIsResettingPin(true);
-                            setPinResetError('');
-                            setPinResetMsg('');
-                            setPinResetAccepted(false);
-                          }}
-                        >
-                          ¿Olvidaste tu PIN de admin? Restablece tu PIN
-                        </button>
-                      )}
                     </div>
+                  )}
 
-                    {loginError && (
-                      <div className="text-xs text-red-600">{loginError}</div>
-                    )}
+                  {useAccountPassword && (
+                    <div className="grid gap-1">
+                      <label className="text-sm">
+                        Contraseña de tu cuenta (no el PIN)
+                      </label>
+                      <input
+                        type="password"
+                        name="admin-account-password"
+                        autoComplete="current-password"
+                        className="border rounded-lg p-2"
+                        value={accountPassword}
+                        onChange={(e) => setAccountPassword(e.target.value)}
+                        placeholder="Escribe la contraseña de tu cuenta"
+                      />
+                      <p className="text-xs text-gray-500">
+                        Usaremos tu contraseña de Firebase para confirmar que
+                        eres el administrador y dejarte entrar aunque no
+                        recuerdes el PIN.
+                      </p>
+                    </div>
+                  )}
 
-                    <div className="flex justify-end gap-2 mt-2">
-                      {superAdminHasPin ? (
-                        <button
-                          type="button"
-                          className="px-3 py-1.5 text-sm border rounded-lg"
-                          onClick={handleLogout}
-                        >
-                          Cerrar sesión
-                        </button>
-                      ) : (
-                        <button
-                          type="button"
-                          className="px-3 py-1.5 text-sm border rounded-lg"
-                          onClick={() => {
-                            setShowUserSelector(false);
-                            setLoginError('');
-                          }}
-                        >
-                          Cancelar
-                        </button>
-                      )}
+                  {(() => {
+                    const selectedUser = householdUsers.find(
+                      (u) => u.id === loginUserId,
+                    );
+                    if (!selectedUser || !selectedUser.isSuperAdmin)
+                      return null;
+                    return (
                       <button
-                        type="submit"
-                        className="px-3 py-1.5 text-sm border rounded-lg bg-gray-900 text-white"
+                        type="button"
+                        className="text-xs text-blue-600 underline text-left"
+                        onClick={() => {
+                          setUseAccountPassword((prev) => !prev);
+                          setLoginError('');
+                        }}
                       >
-                        Entrar
+                        {useAccountPassword
+                          ? 'Volver a usar el PIN del admin'
+                          : '¿Olvidaste tu PIN de admin? Entra usando tu contraseña de la cuenta.'}
                       </button>
-                    </div>
-                  </form>
+                    );
+                  })()}
+                </div>
+
+                {loginError && (
+                  <div className="text-xs text-red-600">{loginError}</div>
                 )}
-              </>
+
+                <div className="flex justify-end gap-2 mt-2">
+                  {superAdminHasPin ? (
+                    <button
+                      type="button"
+                      className="px-3 py-1.5 text-sm border rounded-lg"
+                      onClick={handleLogout}
+                    >
+                      Cerrar sesión
+                    </button>
+                  ) : (
+                    <button
+                      type="button"
+                      className="px-3 py-1.5 text-sm border rounded-lg"
+                      onClick={() => {
+                        setShowUserSelector(false);
+                        setLoginError('');
+                      }}
+                    >
+                      Cancelar
+                    </button>
+                  )}
+                  <button
+                    type="submit"
+                    className="px-3 py-1.5 text-sm border rounded-lg bg-gray-900 text-white"
+                  >
+                    Entrar
+                  </button>
+                </div>
+              </form>
             )}
           </div>
         </div>
@@ -534,7 +461,7 @@ export default function App() {
                 className="px-2 py-1 border rounded-lg"
                 onClick={() => setSelectedMonth((prev) => shiftMonth(prev, -1))}
               >
-                ◄
+                ◀
               </button>
               <span className="font-medium">
                 {formatBudgetPeriodLabel(selectedMonth, data.budgetCutDay || 1)}
@@ -543,16 +470,16 @@ export default function App() {
                 className="px-2 py-1 border rounded-lg"
                 onClick={() => setSelectedMonth((prev) => shiftMonth(prev, 1))}
               >
-                ►
+                ▶
               </button>
             </div>
             <div className="flex items-center gap-2">
               <button
                 className="px-2 py-1 border rounded-lg"
                 onClick={() => {
-                  const today = new Date().toISOString().slice(0, 10);
+                  const todayStr = new Date().toISOString().slice(0, 10); // "YYYY-MM-DD"
                   const currentBudgetKey = budgetMonthKeyForDate(
-                    today,
+                    todayStr,
                     data.budgetCutDay || 1,
                   );
                   setSelectedMonth(currentBudgetKey);
@@ -654,3 +581,4 @@ export default function App() {
     </div>
   );
 }
+

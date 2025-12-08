@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+﻿import React, { useState, useEffect } from 'react';
 
 import { Card } from '../../components/ui/card.jsx';
 
@@ -13,10 +13,10 @@ import { auth } from '../../firebase';
 
 // Esta función debe existir en tu App.jsx actual
 // y DEBE ser movida después.
-// Por ahora la importamos desde donde esté:
+// Por ahora déjalo así, aunque falle el import. Ya lo resolvemos.
 import { ensureSingleHouseholdForUser } from '../../lib/household.js';
-// ↑ si aún NO tienes este archivo, luego lo creamos.
-// por ahora déjalo así, aunque falle el import. Ya lo resolvemos.
+// â†‘ si aÃºn NO tienes este archivo, luego lo creamos.
+// por ahora dÃ©jalo asÃ­, aunque falle el import. Ya lo resolvemos.
 
 export function AuthGate({ onReady }) {
   const [phase, setPhase] = useState('loading'); // loading | auth | ready
@@ -58,19 +58,19 @@ export function AuthGate({ onReady }) {
     if (code.includes('invalid-credential') || code.includes('wrong-password'))
       return 'Credenciales inválidas.';
     if (code.includes('user-not-found')) return 'Usuario no encontrado.';
-    if (code.includes('invalid-email')) return 'Email inválido.';
+    if (code.includes('invalid-email')) return 'Email invÃ¡lido.';
     if (code.includes('missing-password')) return 'Falta la contraseña.';
     if (code.includes('operation-not-allowed'))
-      return 'El método Email/Password no está habilitado en Firebase.';
+      return 'El mÃ©todo Email/Password no estÃ¡ habilitado en Firebase.';
     if (code.includes('network-request-failed'))
-      return 'Error de red. Revisa tu conexión.';
+      return 'Error de red. Revisa tu conexiÃ³n.';
     if (code.includes('too-many-requests'))
-      return 'Demasiados intentos. Intenta más tarde.';
+      return 'Demasiados intentos. Intenta mÃ¡s tarde.';
     if (code.includes('invalid-api-key'))
-      return 'API key inválida en la configuración de Firebase.';
+      return 'API key invÃ¡lida en la configuraciÃ³n de Firebase.';
     if (code.includes('domain-config-required'))
-      return 'Agrega este dominio a “Authorized domains” en Firebase.';
-    return `No se pudo iniciar sesión (${code}).`;
+      return 'Agrega este dominio a â€œAuthorized domainsâ€ en Firebase.';
+    return `No se pudo iniciar sesiÃ³n (${code}).`;
   }
 
   async function handleLogin(e) {
@@ -121,7 +121,7 @@ export function AuthGate({ onReady }) {
       if (code.includes('user-not-found')) {
         setResetError('No existe un usuario registrado con ese email.');
       } else if (code.includes('invalid-email')) {
-        setResetError('El email no es válido.');
+        setResetError('El email no es vÃ¡lido.');
       } else {
         setResetError(
           'No se pudo enviar el correo de recuperación. Intenta más tarde.',
@@ -193,14 +193,32 @@ export function AuthGate({ onReady }) {
           </button>
         </Card>
 
-        <Card>
-          <h3 className="text-lg font-semibold mb-3">Tu centro de control</h3>
-          <ul className="space-y-2 text-sm ext-gray-900 dark:text-gray-100">
-            <li>✅ Presupuestos por categoría con % de avance</li>
-            <li>✅ Movimientos y conciliación rápida</li>
-            <li>✅ Deudas y ahorro</li>
-            <li>✅ Sesión familiar compartida</li>
-          </ul>
+        <Card className="bg-gradient-to-br from-gray-50 to-white dark:from-gray-800 dark:to-gray-900 border border-gray-200 dark:border-gray-700 shadow-md">
+          <h3 className="text-xl font-bold mb-2 text-gray-900 dark:text-gray-50">
+            Finanzas en Familia
+          </h3>
+          <p className="text-sm text-gray-600 dark:text-gray-300 mb-3">
+            Tu panel de mando para coordinar presupuesto, movimientos y metas
+            con toda la familia.
+          </p>
+          <div className="grid gap-2 text-sm text-gray-800 dark:text-gray-100">
+            <div className="flex items-center gap-2">
+              <span className="inline-flex h-6 w-6 items-center justify-center rounded-full bg-green-100 text-green-700 dark:bg-green-900/50 dark:text-green-200 text-xs"></span>
+              Presupuestos por categoría con avance en tiempo real
+            </div>
+            <div className="flex items-center gap-2">
+              <span className="inline-flex h-6 w-6 items-center justify-center rounded-full bg-blue-100 text-blue-700 dark:bg-blue-900/50 dark:text-blue-200 text-xs"></span>
+              Movimientos claros y conciliación rápida
+            </div>
+            <div className="flex items-center gap-2">
+              <span className="inline-flex h-6 w-6 items-center justify-center rounded-full bg-amber-100 text-amber-700 dark:bg-amber-900/50 dark:text-amber-200 text-xs"></span>
+              Deudas y ahorro ordenados en un solo lugar
+            </div>
+            <div className="flex items-center gap-2">
+              <span className="inline-flex h-6 w-6 items-center justify-center rounded-full bg-purple-100 text-purple-700 dark:bg-purple-900/50 dark:text-purple-200 text-xs"></span>
+              Sesión familiar compartida para que todos estén al día
+            </div>
+          </div>
         </Card>
       </div>
     );

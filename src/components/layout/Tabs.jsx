@@ -18,8 +18,8 @@ export function Tabs({ currentTab, onChange, tabs = DEFAULT_TABS }) {
           onClick={() => onChange(tab.id)}
           className={`px-3 py-1.5 rounded-full border text-sm ${
             currentTab === tab.id
-              ? 'bg-gray-900 text-white border-gray-900'
-              : 'bg-white dark:bg-gray-800 border-gray-300 dark:border-gray-600'
+              ? 'bg-gray-200 text-gray-900 border-gray-300 shadow-sm dark:bg-gray-200 dark:border-gray-200 dark:text-gray-900'
+              : 'bg-white dark:bg-transparent border-gray-300 dark:border-gray-500 text-gray-800 dark:text-gray-200 hover:bg-gray-100 dark:hover:bg-gray-700'
           }`}
         >
           {tab.label}

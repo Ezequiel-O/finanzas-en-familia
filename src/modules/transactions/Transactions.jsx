@@ -4,12 +4,13 @@ import {
   monthKey,
   formatBudgetPeriodLabel,
   getBudgetPeriod,
+  budgetMonthKeyForDate,
 } from '../../utils/budgetPeriod.js';
 import { filterTransactionsByPeriodAndUser } from '../../utils/transactions.js';
 import { Card } from '../../components/ui/card.jsx';
 import { SectionTitle } from '../../components/ui/SectionTitle.jsx';
 import { Money } from '../../components/ui/money.jsx';
-import { CATEGORIES } from '../../constants.js';
+import { CATEGORIES, DEBT_CATEGORY } from '../../constants.js';
 
 export function Transactions({
   data,
@@ -19,13 +20,18 @@ export function Transactions({
   superAdminEmail,
   budgetCutDay,
 }) {
-  const { transactions = [], categories = [], debts = [] } = data || {};
+  const { transactions = [], categories = [], debts = [], budgets = {} } =
+    data || {};
 
   const debtsArray = Array.isArray(debts) ? debts : [];
 
   const currentPeriodKey = useMemo(
     () => monthKeyStr || monthKey(new Date()),
     [monthKeyStr],
+  );
+  const trueCurrentPeriod = useMemo(
+    () => budgetMonthKeyForDate(new Date().toISOString().slice(0, 10), budgetCutDay),
+    [budgetCutDay],
   );
 
   // Suma de cuotas planificadas restantes para la categoria Deuda
@@ -43,7 +49,10 @@ export function Transactions({
       }, 0);
   }, [debtsArray, currentPeriodKey]);
 
-  const { addTransaction, removeTransaction } = actions || {};
+  const { addTransaction, updateTransaction, removeTransaction } =
+    actions || {};
+
+  const isDebtCategory = (cat) => cat === DEBT_CATEGORY || cat === 'Deuda';
 
   const [type, setType] = useState('gasto'); // gasto | ingreso
   const [amount, setAmount] = useState('');
@@ -56,6 +65,9 @@ export function Transactions({
   const [showIngresoModal, setShowIngresoModal] = useState(false);
   const [showGastoModal, setShowGastoModal] = useState(false);
   const [amountFormatted, setAmountFormatted] = useState('');
+  const [editingTx, setEditingTx] = useState(null);
+  const [selectedDebtQuotaId, setSelectedDebtQuotaId] = useState('');
+  const [selectedSubcategoryIds, setSelectedSubcategoryIds] = useState([]);
 
   // Calculadora de ajuste de balance
   const [showBalanceModal, setShowBalanceModal] = useState(false);
@@ -70,27 +82,60 @@ export function Transactions({
   const [adjustNote, setAdjustNote] = useState('');
   const [adjustError, setAdjustError] = useState('');
 
+  const currencyFormatter = useMemo(
+    () => new Intl.NumberFormat('es-CL', { maximumFractionDigits: 0 }),
+    [],
+  );
+
+  const formPeriodKey = useMemo(
+    () => budgetMonthKeyForDate(date, budgetCutDay),
+    [date, budgetCutDay],
+  );
+
+  const formPeriodLabel = useMemo(
+    () => formatBudgetPeriodLabel(formPeriodKey, budgetCutDay),
+    [formPeriodKey, budgetCutDay],
+  );
+
+  const budgetSubcategories = useMemo(() => {
+    if (!category) return [];
+    const catBudget = budgets?.[category];
+    const breakdown = Array.isArray(catBudget?.breakdown)
+      ? catBudget.breakdown
+      : [];
+    return breakdown.map((item) => ({
+      id: item.id || item.name || Math.random().toString(36).slice(2, 10),
+      name: item.name || 'Subcategoria',
+      amount: Number(item.amount || 0),
+    }));
+  }, [budgets, category]);
+
   // Autocompletar monto de Deuda en modal de gasto
   useEffect(() => {
-    const isDebtCategory = category === 'Deuda';
+    const debtSelected = isDebtCategory(category);
     const modalOpen = showGastoModal;
 
     if (!modalOpen) return;
     if (type !== 'gasto') return;
-    if (!isDebtCategory) return;
+    if (!debtSelected) return;
     if (suggestedDebtAmount <= 0) return;
 
     if (amount && Number(amount) > 0) return;
 
     const n = Math.round(suggestedDebtAmount);
     const digits = String(n);
-    const formatted = new Intl.NumberFormat('es-CL', {
-      maximumFractionDigits: 0,
-    }).format(n);
+    const formatted = currencyFormatter.format(n);
 
     setAmount(digits);
     setAmountFormatted(formatted);
-  }, [showGastoModal, type, category, suggestedDebtAmount, amount]);
+  }, [
+    showGastoModal,
+    type,
+    category,
+    suggestedDebtAmount,
+    amount,
+    currencyFormatter,
+  ]);
 
   // Ajustar categoria de gasto por defecto si cambian las categorias
   useEffect(() => {
@@ -98,6 +143,15 @@ export function Transactions({
     setCategory((prev) => prev || categories[0]);
     setAdjustCategory((prev) => prev || categories[0]);
   }, [categories]);
+
+  useEffect(() => {
+    if (type !== 'gasto' || !isDebtCategory(category)) {
+      setSelectedDebtQuotaId('');
+    }
+    if (type !== 'gasto') {
+      setSelectedSubcategoryIds([]);
+    }
+  }, [type, category]);
 
   const periodLabel = useMemo(
     () => formatBudgetPeriodLabel(monthKeyStr, budgetCutDay),
@@ -193,6 +247,16 @@ export function Transactions({
     return today.toISOString().slice(0, 10);
   }
 
+  function formatAmountForInput(value) {
+    const n = Number(value || 0);
+    if (!n || Number.isNaN(n)) {
+      return { digits: '', formatted: '' };
+    }
+    const rounded = Math.round(n);
+    const digits = String(rounded);
+    return { digits, formatted: currencyFormatter.format(rounded) };
+  }
+
   function handleMoneyInput(raw, setters) {
     const digits = raw.replace(/\D/g, '');
     if (!digits) {
@@ -200,12 +264,42 @@ export function Transactions({
       setters.setValue('');
       return;
     }
-    const formatted = new Intl.NumberFormat('es-CL', {
-      maximumFractionDigits: 0,
-    }).format(Number(digits));
+    const formatted = currencyFormatter.format(Number(digits));
     setters.setFormatted(formatted);
     setters.setValue(digits);
   }
+
+  function paidAmountForQuotaId(quotaId) {
+    if (!quotaId) return 0;
+    return (transactions || []).reduce((sum, t) => {
+      const metaId = t?.meta?.debtQuotaId;
+      if (metaId !== quotaId) return sum;
+      const amt = Number(t.amount || 0);
+      return Number.isNaN(amt) ? sum : sum + amt;
+    }, 0);
+  }
+
+  const debtQuotasForPeriod = useMemo(() => {
+    if (!formPeriodKey) return [];
+    return debtsArray.flatMap((d) => {
+      const schedule = Array.isArray(d.schedule) ? d.schedule : [];
+      return schedule
+        .filter((q) => q.periodKey === formPeriodKey)
+        .map((q) => {
+          const paid = paidAmountForQuotaId(q.id);
+          const planned = Number(q.plannedAmount || 0);
+          const isPaid = paid >= planned && planned > 0;
+          return {
+            id: q.id,
+            debtName: d.name || 'Deuda',
+            dueDate: q.dueDate || '',
+            planned,
+            paid,
+            isPaid,
+          };
+        });
+    });
+  }, [debtsArray, formPeriodKey, transactions]);
 
   function resetAdjustForm() {
     setCashInput('');
@@ -216,11 +310,65 @@ export function Transactions({
     setAdjustError('');
   }
 
+  function closeTransactionModal() {
+    setShowIngresoModal(false);
+    setShowGastoModal(false);
+    setEditingTx(null);
+    setAmount('');
+    setAmountFormatted('');
+    setDescription('');
+  }
+
+  function startNewTransaction(kind) {
+    setEditingTx(null);
+    setType(kind);
+    setAmount('');
+    setAmountFormatted('');
+    setDescription('');
+    setSelectedDebtQuotaId('');
+    if (kind === 'ingreso') setShowIngresoModal(true);
+    if (kind === 'gasto') setShowGastoModal(true);
+  }
+
+  function startEditTransaction(tx) {
+    if (!tx) return;
+    const baseType = tx.type === 'ingreso' ? 'ingreso' : 'gasto';
+    const { digits, formatted } = formatAmountForInput(tx.amount);
+    const baseDate = clampDateToPeriod(
+      (tx.date || tx.createdAt || new Date().toISOString().slice(0, 10)).slice(
+        0,
+        10,
+      ),
+    );
+
+    setType(baseType);
+    setAmount(digits);
+    setAmountFormatted(formatted);
+    setCategory(tx.category || categories[0] || '');
+    setDate(baseDate);
+    setDescription(tx.description || '');
+    setSelectedDebtQuotaId(tx?.meta?.debtQuotaId || '');
+    const metaSubs = tx?.meta?.budgetSubcategoryIds;
+    const singleMeta = tx?.meta?.budgetSubcategoryId;
+    if (Array.isArray(metaSubs)) {
+      setSelectedSubcategoryIds(metaSubs.filter(Boolean));
+    } else if (singleMeta) {
+      setSelectedSubcategoryIds([singleMeta]);
+    } else {
+      setSelectedSubcategoryIds([]);
+    }
+    setEditingTx(tx);
+    if (baseType === 'ingreso') setShowIngresoModal(true);
+    else setShowGastoModal(true);
+  }
+
   async function handleAdd(e) {
     e.preventDefault();
 
     const n = Number(amount || 0);
-    if (!n || n <= 0 || !addTransaction) {
+    const isEditing = !!editingTx;
+    const handler = isEditing ? updateTransaction : addTransaction;
+    if (!n || n <= 0 || !handler) {
       alert('Ingresa un monto valido.');
       return;
     }
@@ -231,20 +379,59 @@ export function Transactions({
       category: type === 'gasto' ? category || categories[0] || 'Otros' : '',
       description: description.trim(),
       date: date || new Date().toISOString().slice(0, 10),
-      createdAt: new Date().toISOString(),
-      ownerId: activeUser?.id || null,
-      ownerName: activeUser?.name || null,
-      ownerEmail: activeUser?.email || null,
+      ownerId: editingTx?.ownerId ?? activeUser?.id ?? null,
+      ownerName: editingTx?.ownerName ?? activeUser?.name ?? null,
+      ownerEmail: editingTx?.ownerEmail ?? activeUser?.email ?? null,
     };
 
+    const baseMeta = editingTx?.meta ? { ...editingTx.meta } : {};
+    if (selectedDebtQuotaId) {
+      baseMeta.debtQuotaId = selectedDebtQuotaId;
+    } else if (baseMeta.debtQuotaId) {
+      delete baseMeta.debtQuotaId;
+    }
+    if (selectedSubcategoryIds.length > 0) {
+      baseMeta.budgetSubcategoryIds = selectedSubcategoryIds;
+      baseMeta.budgetSubcategoryNames = selectedSubcategoryIds
+        .map((id) => budgetSubcategories.find((s) => s.id === id)?.name)
+        .filter(Boolean)
+        .join('; ');
+      // compat con datos antiguos: limpiamos la clave singular
+      delete baseMeta.budgetSubcategoryId;
+      delete baseMeta.budgetSubcategoryName;
+    } else {
+      delete baseMeta.budgetSubcategoryIds;
+      delete baseMeta.budgetSubcategoryNames;
+      delete baseMeta.budgetSubcategoryId;
+      delete baseMeta.budgetSubcategoryName;
+    }
+    const shouldPersistMeta =
+      selectedDebtQuotaId ||
+      selectedSubcategoryIds.length > 0 ||
+      (editingTx && editingTx.meta);
+    if (shouldPersistMeta) {
+      normalized.meta = baseMeta;
+    }
+
     try {
-      await addTransaction(normalized);
+      if (isEditing) {
+        await updateTransaction(editingTx.id, normalized);
+      } else {
+        await addTransaction({
+          ...normalized,
+          createdAt: new Date().toISOString(),
+        });
+      }
       setAmount('');
+      setAmountFormatted('');
       setDescription('');
+      setEditingTx(null);
+      setSelectedDebtQuotaId('');
+      setSelectedSubcategoryIds([]);
       setShowIngresoModal(false);
       setShowGastoModal(false);
     } catch (err) {
-      console.error('Error al agregar movimiento:', err);
+      console.error('Error al guardar movimiento:', err);
       alert('No se pudo guardar el movimiento.');
     }
   }
@@ -255,7 +442,12 @@ export function Transactions({
 
     const efectivo = Number(cashInput || 0);
     const debito = Number(debitInput || 0);
-    if (Number.isNaN(efectivo) || Number.isNaN(debito) || efectivo < 0 || debito < 0) {
+    if (
+      Number.isNaN(efectivo) ||
+      Number.isNaN(debito) ||
+      efectivo < 0 ||
+      debito < 0
+    ) {
       setAdjustError('Ingresa montos validos para efectivo y debito.');
       return;
     }
@@ -286,8 +478,7 @@ export function Transactions({
         adjustType === 'gasto'
           ? adjustCategory || categories[0] || 'Otros'
           : '',
-      description:
-        adjustNote.trim() || 'Ajuste de balance desde calculadora',
+      description: adjustNote.trim() || 'Ajuste de balance desde calculadora',
       date: txDate,
       createdAt: new Date().toISOString(),
       ownerId: activeUser?.id || null,
@@ -321,10 +512,7 @@ export function Transactions({
             <button
               type="button"
               className="px-4 py-1.5 rounded-full text-xs font-medium bg-blue-600 text-white hover:bg-blue-700 transition"
-              onClick={() => {
-                setType('ingreso');
-                setShowIngresoModal(true);
-              }}
+              onClick={() => startNewTransaction('ingreso')}
             >
               + Ingreso
             </button>
@@ -332,10 +520,7 @@ export function Transactions({
             <button
               type="button"
               className="px-4 py-1.5 rounded-full text-xs font-medium bg-red-600 text-white hover:bg-red-700 transition"
-              onClick={() => {
-                setType('gasto');
-                setShowGastoModal(true);
-              }}
+              onClick={() => startNewTransaction('gasto')}
             >
               + Gasto
             </button>
@@ -360,11 +545,10 @@ export function Transactions({
           </div>
         </Card>
         <Card>
-          <div className="flex items-start justify-between text-xs uppercase text-gray-500 mb-1">
-            <span>Balance</span>
+          <div className="relative">
             <button
               type="button"
-              className="ml-2 px-2 py-1 rounded-full border text-[11px] hover:bg-gray-100"
+              className="absolute top-2 right-2 w-10 h-10 flex items-center justify-center rounded-full bg-gray-100 border text-base hover:bg-gray-200"
               title="Ajustar balance con calculadora"
               onClick={() => {
                 setShowBalanceModal(true);
@@ -373,13 +557,16 @@ export function Transactions({
             >
               🧮
             </button>
-          </div>
-          <div
-            className={`text-lg font-semibold ${
-              totals.balance < 0 ? 'text-red-600' : 'text-green-600'
-            }`}
-          >
-            <Money n={totals.balance} />
+            <div className="text-xs uppercase text-gray-500 mb-1 text-center">
+              Balance
+            </div>
+            <div
+              className={`text-lg font-semibold text-center ${
+                totals.balance < 0 ? 'text-red-600' : 'text-green-600'
+              }`}
+            >
+              <Money n={totals.balance} />
+            </div>
           </div>
         </Card>
       </div>
@@ -427,7 +614,14 @@ export function Transactions({
       {/* Tabla de movimientos */}
       <Card>
         <div className="flex justify-between items-center mb-3">
-          <h3 className="font-semibold">Listado de movimientos</h3>
+          <div className="flex items-center gap-2">
+            <h3 className="font-semibold">Listado de movimientos</h3>
+            {currentPeriodKey === trueCurrentPeriod && (
+              <span className="text-[11px] px-2 py-0.5 rounded-full bg-green-100 text-green-700 border border-green-200">
+                Periodo actual
+              </span>
+            )}
+          </div>
           <span className="text-xs text-gray-500">
             {filtered.length} movimiento{filtered.length === 1 ? '' : 's'}
           </span>
@@ -475,14 +669,24 @@ export function Transactions({
                       {getOwnerName(tx)}
                     </td>
                     <td className="px-2 py-1 align-top text-right">
-                      {removeTransaction && (
-                        <button
-                          className="text-xs text-red-600"
-                          onClick={() => removeTransaction(tx.id)}
-                        >
-                          Eliminar
-                        </button>
-                      )}
+                      <div className="flex justify-end gap-3 text-xs">
+                        {updateTransaction && (
+                          <button
+                            className="text-blue-600 hover:text-blue-800"
+                            onClick={() => startEditTransaction(tx)}
+                          >
+                            Editar
+                          </button>
+                        )}
+                        {removeTransaction && (
+                          <button
+                            className="text-red-600 hover:text-red-800"
+                            onClick={() => removeTransaction(tx.id)}
+                          >
+                            Eliminar
+                          </button>
+                        )}
+                      </div>
                     </td>
                   </tr>
                 ))}
@@ -494,19 +698,21 @@ export function Transactions({
 
       {/* Modal ingreso/gasto */}
       {(showIngresoModal || showGastoModal) && (
-        <div className="fixed inset-0 z-30 flex items-start justify-center bg-black/30 pt-16">
-          <div className="bg-white dark:bg-gray-900 rounded-2xl shadow-xl p-5 w-full max-w-xl">
+        <div className="fixed inset-0 z-30 bg-black/30 backdrop-blur-sm overflow-y-auto">
+          <div className="min-h-full flex items-start justify-center pt-12 pb-12">
+            <div className="bg-white dark:bg-gray-900 rounded-2xl shadow-xl p-5 w-full max-w-xl mx-4">
             <div className="flex items-center justify-between mb-3">
               <h3 className="text-lg font-semibold">
-                {type === 'ingreso' ? 'Nuevo ingreso' : 'Nuevo gasto'}
+                {editingTx
+                  ? 'Editar movimiento'
+                  : type === 'ingreso'
+                    ? 'Nuevo ingreso'
+                    : 'Nuevo gasto'}
               </h3>
               <button
                 type="button"
                 className="text-sm text-gray-500 hover:text-gray-800"
-                onClick={() => {
-                  setShowIngresoModal(false);
-                  setShowGastoModal(false);
-                }}
+                onClick={closeTransactionModal}
               >
                 × Cerrar
               </button>
@@ -532,9 +738,9 @@ export function Transactions({
                         setAmount('');
                         return;
                       }
-                      const formatted = new Intl.NumberFormat('es-CL', {
-                        maximumFractionDigits: 0,
-                      }).format(Number(digits));
+                      const formatted = currencyFormatter.format(
+                        Number(digits),
+                      );
 
                       setAmountFormatted(formatted);
                       setAmount(digits);
@@ -558,20 +764,107 @@ export function Transactions({
 
               {/* Categoria solo para gasto */}
               {type === 'gasto' && (
-                <div className="flex flex-col gap-1">
-                  <label className="text-xs text-gray-500">Categoria</label>
-                  <select
-                    className="border rounded-lg px-2 py-1 text-sm"
-                    value={category}
-                    onChange={(e) => setCategory(e.target.value)}
-                  >
-                    {categories.map((c) => (
-                      <option key={c} value={c}>
-                        {c}
-                      </option>
-                    ))}
-                  </select>
-                </div>
+                <>
+                  <div className="flex flex-col gap-1">
+                    <label className="text-xs text-gray-500">Categoria</label>
+                    <select
+                      className="border rounded-lg px-2 py-1 text-sm"
+                      value={category}
+                      onChange={(e) => setCategory(e.target.value)}
+                    >
+                      {categories.map((c) => (
+                        <option key={c} value={c}>
+                          {c}
+                        </option>
+                      ))}
+                    </select>
+                  </div>
+
+                  {isDebtCategory(category) ? (
+                    <div className="flex flex-col gap-1">
+                      <label className="text-xs text-gray-500">
+                        Subcategoria (cuota del periodo)
+                      </label>
+                      <select
+                        className="border rounded-lg px-2 py-1 text-sm"
+                        value={selectedDebtQuotaId}
+                        onChange={(e) => setSelectedDebtQuotaId(e.target.value)}
+                      >
+                        <option value="">Sin asignar</option>
+                        {debtQuotasForPeriod.map((q) => (
+                          <option key={q.id} value={q.id}>
+                            {q.debtName} · {q.dueDate || formPeriodLabel}{' '}
+                            {q.isPaid ? '(Pagada)' : '(Pendiente)'}
+                          </option>
+                        ))}
+                      </select>
+                      {debtQuotasForPeriod.length === 0 ? (
+                        <p className="text-xs text-gray-500">
+                          No hay cuotas planificadas en {formPeriodLabel}.
+                        </p>
+                      ) : (
+                        <p className="text-xs text-gray-500">
+                          Opcional: vincula el movimiento a una cuota para
+                          marcarla como pagada con los movimientos del periodo.
+                        </p>
+                      )}
+                    </div>
+                  ) : (
+                    <div className="flex flex-col gap-1">
+                      <label className="text-xs text-gray-500">
+                        Subcategoria (presupuesto)
+                      </label>
+                      <div className="border rounded-lg px-2 py-2 text-sm space-y-1 max-h-40 overflow-y-auto">
+                        {budgetSubcategories.map((sub) => {
+                          const checked = selectedSubcategoryIds.includes(sub.id);
+                          return (
+                            <label
+                              key={sub.id}
+                              className="flex items-center justify-between gap-2 cursor-pointer"
+                            >
+                              <div className="flex items-center gap-2">
+                                <input
+                                  type="checkbox"
+                                  className="rounded"
+                                  checked={checked}
+                                  onChange={(e) => {
+                                    setSelectedSubcategoryIds((prev) => {
+                                      if (e.target.checked) {
+                                        return [...new Set([...prev, sub.id])];
+                                      }
+                                      return prev.filter((id) => id !== sub.id);
+                                    });
+                                  }}
+                                />
+                                <span>{sub.name}</span>
+                              </div>
+                              <span className="text-xs text-gray-600">
+                                {sub.amount ? `$${currencyFormatter.format(sub.amount)}` : ''}
+                              </span>
+                            </label>
+                          );
+                        })}
+                        {budgetSubcategories.length === 0 && (
+                          <div className="text-xs text-gray-500">
+                            Esta categoria no tiene subcategorias en el presupuesto del periodo.
+                          </div>
+                        )}
+                      </div>
+                      <div className="flex items-center justify-between text-xs text-gray-500">
+                        <span>
+                          Puedes elegir varias; se guardan separadas por ';' en el movimiento.
+                        </span>
+                        <button
+                          type="button"
+                          className="text-blue-600 hover:text-blue-800"
+                          onClick={() => setSelectedSubcategoryIds([])}
+                        >
+                          Limpiar
+                        </button>
+                      </div>
+                    </div>
+                  )}
+                </>
               )}
 
               {/* Descripcion */}
@@ -588,13 +881,14 @@ export function Transactions({
                     type="submit"
                     className="px-3 py-1.5 rounded-xl border bg-gray-900 text-white text-sm"
                   >
-                    Agregar
+                    {editingTx ? 'Guardar cambios' : 'Agregar'}
                   </button>
                 </div>
               </div>
             </form>
           </div>
         </div>
+      </div>
       )}
 
       {/* Modal calculadora de ajuste */}
