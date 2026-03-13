@@ -6,53 +6,162 @@
   text-rendering: optimizeLegibility;
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
+  --bg: #f2f5f9;
+  --surface-1: #f9fbfd;
+  --surface-2: #eef2f7;
+  --border: #dfe6ef;
+  --divider: #e7ecf2;
+  --shadow: 0 1px 2px rgba(15, 23, 42, 0.05),
+    0 14px 28px rgba(15, 23, 42, 0.08);
+  --text: #0f172a;
+  --text-muted: #556274;
+  --text-faint: #8b97a8;
+  --primary: #1e3a8a;
+  --primary-muted: #dbe6fb;
+  --primary-contrast: #f8fafc;
+  --input-bg: #ffffff;
+  --success: #15803d;
+  --warning: #d97706;
+  --danger: #dc2626;
+  --app-border-color: var(--border);
+  --app-tooltip-bg: var(--surface-2);
+}
+
+.dark {
+  --bg: #0b1220;
+  --surface-1: #121a2b;
+  --surface-2: #182235;
+  --border: #27334a;
+  --divider: #1e2a3d;
+  --shadow: 0 14px 32px rgba(2, 6, 23, 0.45);
+  --text: #e2e8f0;
+  --text-muted: #94a3b8;
+  --text-faint: #64748b;
+  --primary: #3b5fb8;
+  --primary-muted: #1c2a47;
+  --primary-contrast: #f8fafc;
+  --success: #22a35a;
+  --warning: #d48a1b;
+  --danger: #e25555;
+  --input-bg: var(--surface-2);
 }
 
 a {
   font-weight: 500;
-  color: #1d4ed8;
+  color: var(--primary);
   text-decoration: inherit;
 }
 a:hover {
-  color: #1e3a8a;
+  color: var(--primary);
 }
 
 body {
   margin: 0;
   min-width: 320px;
   min-height: 100vh;
+  background-color: var(--bg);
+  color: var(--text);
+}
+
+/* Unifica el tono de todas las lineas de contenedor */
+:where(
+  .border,
+  .border-t,
+  .border-b,
+  .border-l,
+  .border-r,
+  .border-x,
+  .border-y
+) {
+  border-color: var(--app-border-color);
+}
+
+hr {
+  background-color: var(--divider);
 }
 
 #root {
   width: 100%;
 }
 
-/* Controles legibles en modo oscuro */
-.dark input:not([type='checkbox']):not([type='radio']),
-.dark select,
-.dark textarea {
-  background-color: #111827;
-  color: #e5e7eb;
-  border: 1px solid #374151;
+button {
+  transition: transform 120ms ease, filter 120ms ease;
 }
 
-.dark input::placeholder,
-.dark textarea::placeholder {
-  color: #9ca3af;
+button:active {
+  transform: scale(0.98);
+  filter: brightness(0.97);
 }
 
-.dark option {
-  background-color: #111827;
-  color: #e5e7eb;
+input:not([type='checkbox']):not([type='radio']),
+select,
+textarea {
+  background-color: var(--input-bg);
+  color: var(--text);
+  border: 1px solid var(--border);
 }
 
-/* Botones neutros en modo oscuro (no pisa los de color) */
-.dark button:not(.bg-blue-500):not(.bg-red-500):not(.bg-green-500):not(.bg-orange-500) {
-  background-color: #111827;
-  color: #e5e7eb;
-  border: 1px solid #374151;
+input::placeholder,
+textarea::placeholder {
+  color: var(--text-faint);
 }
 
-.dark button:not(.bg-blue-500):not(.bg-red-500):not(.bg-green-500):not(.bg-orange-500):hover {
-  background-color: #0f172a;
+option {
+  background-color: var(--surface-2);
+  color: var(--text);
+}
+
+input:focus-visible,
+select:focus-visible,
+textarea:focus-visible {
+  outline: 2px solid var(--primary);
+  outline-offset: 2px;
+}
+
+/* Tooltips custom, sin delay */
+[data-tooltip]:not([data-tooltip='']) {
+  position: relative;
+}
+
+[data-tooltip]:not([data-tooltip=''])::after {
+  content: attr(data-tooltip);
+  position: absolute;
+  left: 50%;
+  bottom: calc(100% + 8px);
+  transform: translate(-50%, 4px);
+  opacity: 0;
+  background: var(--app-tooltip-bg);
+  color: var(--text);
+  padding: 6px 8px;
+  border-radius: 8px;
+  font-size: 11px;
+  line-height: 1.2;
+  white-space: pre-line;
+  max-width: 260px;
+  text-align: center;
+  z-index: 9999;
+  border: 1px solid var(--border);
+  box-shadow: 0 6px 18px rgba(0, 0, 0, 0.18);
+  transition: opacity 40ms ease, transform 40ms ease;
+  transition-delay: 0ms;
+  pointer-events: none;
+}
+
+[data-tooltip].tooltip-wide::after {
+  white-space: pre-line;
+  min-width: 280px;
+  max-width: 420px;
+  padding: 8px 12px;
+}
+
+@media (hover: hover) {
+  [data-tooltip]:not([data-tooltip='']):hover::after {
+    opacity: 1;
+    transform: translate(-50%, 0);
+  }
+}
+
+[data-tooltip]:not([data-tooltip='']):focus-visible::after {
+  opacity: 1;
+  transform: translate(-50%, 0);
 }

@@ -1,0 +1,206 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{db}/documents {
+    function signedIn() {
+      return request.auth != null;
+    }
+
+    function household(hid) {
+      return get(/databases/$(db)/documents/households/$(hid));
+    }
+
+    function isMember(hid) {
+      return signedIn() &&
+        household(hid).data.members.hasAny([request.auth.uid]);
+    }
+
+    function isOwner(hid) {
+      return signedIn() &&
+        household(hid).data.ownerUid == request.auth.uid;
+    }
+
+    function ownerUnchanged(hid) {
+      return request.resource.data.ownerUid == household(hid).data.ownerUid;
+    }
+
+    function ownerPresent(hid) {
+      return household(hid).data.ownerUid != null &&
+        request.resource.data.members.hasAny([household(hid).data.ownerUid]) &&
+        request.resource.data.memberInfo[household(hid).data.ownerUid] != null;
+    }
+
+    function membershipUnchanged() {
+      return request.resource.data.members == resource.data.members &&
+        request.resource.data.memberInfo == resource.data.memberInfo;
+    }
+
+    function budgetCutDayUnchanged() {
+      return request.resource.data.budgetCutDay == resource.data.budgetCutDay;
+    }
+
+    function selfRemovalAllowed(hid) {
+      return signedIn() &&
+        resource.data.members.hasAny([request.auth.uid]) &&
+        !request.resource.data.members.hasAny([request.auth.uid]) &&
+        request.resource.data.members.size() ==
+          resource.data.members.size() - 1 &&
+        resource.data.memberInfo[request.auth.uid] != null &&
+        request.resource.data.memberInfo[request.auth.uid] == null &&
+        request.resource.data.memberInfo.keys().size() ==
+          resource.data.memberInfo.keys().size() - 1 &&
+        request.resource.data.diff(resource.data).changedKeys()
+          .hasOnly(['members', 'memberInfo', 'updatedAt', 'updatedBy']);
+    }
+
+    function inviteData(hid, inviteId) {
+      return get(/databases/$(db)/documents/households/$(hid)/invites/$(inviteId))
+        .data;
+    }
+
+    function inviteNotExpired(data) {
+      return (data.expiresAt is timestamp && data.expiresAt > request.time) ||
+        (data.expiresAtMs is int && data.expiresAtMs > request.time.toMillis());
+    }
+
+    function inviteValid(hid, inviteId, tokenHash) {
+      let data = inviteData(hid, inviteId);
+      return data.status == 'pending' &&
+        data.tokenHash == tokenHash &&
+        inviteNotExpired(data);
+    }
+
+    function joinRequestData(hid, uid) {
+      return get(/databases/$(db)/documents/households/$(hid)/joinRequests/$(uid))
+        .data;
+    }
+
+    function joinRequestValid(hid, uid) {
+      let req = joinRequestData(hid, uid);
+      return req != null &&
+        req.uid == uid &&
+        req.status == 'pending' &&
+        req.inviteId is string &&
+        req.tokenHash is string &&
+        inviteValid(hid, req.inviteId, req.tokenHash);
+    }
+
+    function inviteAcceptedBySelf(hid, inviteId) {
+      let req = joinRequestData(hid, request.auth.uid);
+      return signedIn() &&
+        resource.data.status == 'pending' &&
+        request.resource.data.status == 'accepted' &&
+        request.resource.data.acceptedByUid == request.auth.uid &&
+        request.resource.data.acceptedAtMs is int &&
+        inviteNotExpired(resource.data) &&
+        req != null &&
+        req.uid == request.auth.uid &&
+        req.inviteId == inviteId &&
+        req.tokenHash == resource.data.tokenHash &&
+        req.status in ['pending', 'accepted'] &&
+        request.resource.data.diff(resource.data).changedKeys()
+          .hasOnly(['status', 'acceptedByUid', 'acceptedAtMs']);
+    }
+
+    function selfJoinAllowed(hid) {
+      return signedIn() &&
+        !resource.data.members.hasAny([request.auth.uid]) &&
+        request.resource.data.members.hasAny([request.auth.uid]) &&
+        request.resource.data.members.hasAll(resource.data.members) &&
+        request.resource.data.members.size() ==
+          resource.data.members.size() + 1 &&
+        resource.data.memberInfo[request.auth.uid] == null &&
+        request.resource.data.memberInfo[request.auth.uid] != null &&
+        request.resource.data.memberInfo.keys().size() ==
+          resource.data.memberInfo.keys().size() + 1 &&
+        joinRequestValid(hid, request.auth.uid) &&
+        ownerUnchanged(hid) &&
+        ownerPresent(hid) &&
+        request.resource.data.diff(resource.data).changedKeys()
+          .hasOnly(['members', 'memberInfo', 'updatedAt', 'updatedBy']);
+    }
+
+    function selfAcceptJoinRequest(hid, uid) {
+      return signedIn() &&
+        request.auth.uid == uid &&
+        resource.data.uid == uid &&
+        resource.data.status == 'pending' &&
+        request.resource.data.status == 'accepted' &&
+        request.resource.data.acceptedByUid == request.auth.uid &&
+        request.resource.data.acceptedAtMs is int &&
+        request.resource.data.inviteId == resource.data.inviteId &&
+        request.resource.data.tokenHash == resource.data.tokenHash &&
+        inviteValid(hid, resource.data.inviteId, resource.data.tokenHash) &&
+        request.resource.data.diff(resource.data).changedKeys()
+          .hasOnly(['status', 'acceptedByUid', 'acceptedAtMs']);
+    }
+
+    function selfDeleteJoinRequest(uid) {
+      return signedIn() &&
+        request.auth.uid == uid &&
+        resource.data.uid == uid;
+    }
+
+    match /profiles/{uid} {
+      allow read, write: if signedIn() && request.auth.uid == uid;
+    }
+
+    match /households/{hid} {
+      allow read: if isMember(hid);
+      allow create: if signedIn() &&
+        request.resource.data.ownerUid == request.auth.uid &&
+        request.resource.data.members.size() == 1 &&
+        request.resource.data.members.hasAny([request.auth.uid]) &&
+        request.resource.data.memberInfo[request.auth.uid] != null;
+      allow update: if (isMember(hid) &&
+        ownerUnchanged(hid) &&
+        ownerPresent(hid) &&
+        ((membershipUnchanged() && budgetCutDayUnchanged()) ||
+          isOwner(hid) ||
+          selfRemovalAllowed(hid))) ||
+        selfJoinAllowed(hid);
+      allow delete: if false;
+    }
+
+    match /households/{hid}/invites/{inviteId} {
+      allow read: if isOwner(hid);
+      allow create: if isOwner(hid) &&
+        request.resource.data.tokenHash is string &&
+        request.resource.data.status == 'pending' &&
+        request.resource.data.createdByUid == request.auth.uid &&
+        request.resource.data.expiresAt is timestamp &&
+        request.resource.data.expiresAt > request.time &&
+        !request.resource.data.keys().hasAny(['token']);
+      allow update: if (isOwner(hid) &&
+        request.resource.data.tokenHash == resource.data.tokenHash &&
+        request.resource.data.createdByUid == resource.data.createdByUid) ||
+        inviteAcceptedBySelf(hid, inviteId);
+      allow delete: if isOwner(hid) || selfDeleteJoinRequest(uid);
+    }
+
+    match /households/{hid}/joinRequests/{uid} {
+      allow read: if signedIn() &&
+        (request.auth.uid == uid || isOwner(hid));
+      allow create: if signedIn() &&
+        request.auth.uid == uid &&
+        request.resource.data.uid == request.auth.uid &&
+        request.resource.data.inviteId is string &&
+        request.resource.data.tokenHash is string &&
+        request.resource.data.status == 'pending' &&
+        !isMember(hid) &&
+        inviteValid(hid, request.resource.data.inviteId,
+          request.resource.data.tokenHash);
+      allow update: if (isOwner(hid) &&
+        request.resource.data.uid == resource.data.uid &&
+        request.resource.data.inviteId == resource.data.inviteId &&
+        request.resource.data.tokenHash == resource.data.tokenHash &&
+        request.resource.data.status in ['accepted', 'rejected']) ||
+        selfAcceptJoinRequest(hid, uid);
+      allow delete: if isOwner(hid) || selfDeleteJoinRequest(uid);
+    }
+
+    match /households/{hid}/{col}/{doc} {
+      allow read, write: if isMember(hid) &&
+        !(col in ['invites', 'joinRequests']);
+    }
+  }
+}

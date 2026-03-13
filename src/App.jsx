@@ -1,21 +1,19 @@
-﻿// Finanzas en Familia — App V2 (Firebase + Firestore, tiempo real)
+// Finanzas en Familia - App V2 (Firebase + Firestore, tiempo real)
 // - Autenticación email/contraseña
 // - Household compartido (código de hogar)
 // - Datos en Firestore con sincronización en tiempo real
 // - Validación de login con tooltip en caso de credenciales vacías o inválidas
 
-import React, { useEffect, useState } from 'react';
-import {
-  onAuthStateChanged,
-  signOut,
-  sendPasswordResetEmail,
-} from 'firebase/auth';
+import React, { useCallback, useEffect, useRef, useState } from 'react';
+import { onAuthStateChanged, signOut } from 'firebase/auth';
+import { doc, setDoc, serverTimestamp } from 'firebase/firestore';
 
 // Firebase
-import { auth } from './firebase';
+import { auth, db } from './firebase';
 
 // Layout
 import { Header } from './components/layout/header.jsx';
+import { Money } from './components/ui/money.jsx';
 
 // Módulos principales
 import { Dashboard } from './modules/dashboard/Dashboard.jsx';
@@ -38,6 +36,9 @@ import {
 // Config / estilos globales
 import './App.css';
 
+const INACTIVITY_TIMEOUT_MS = 20 * 60 * 1000;
+const ACTIVITY_SYNC_INTERVAL_MS = 6 * 60 * 60 * 1000;
+
 export default function App() {
   const [tab, setTab] = useState('dashboard');
   const [ctx, setCtx] = useState(null);
@@ -45,46 +46,53 @@ export default function App() {
   const [selectedMonth, setSelectedMonth] = useState(monthKey());
   const [hasInitMonthByCutDay, setHasInitMonthByCutDay] = useState(false);
 
-  const [selectedHouseholdUserId, setSelectedHouseholdUserId] = useState(
-    () => localStorage.getItem('activeHouseholdUserId') || null,
-  );
-  const [showUserSelector, setShowUserSelector] = useState(false);
-  const [loginUserId, setLoginUserId] = useState('');
-  const [loginPin, setLoginPin] = useState('');
-  const [loginError, setLoginError] = useState('');
-  const [hasForcedUserSelection, setHasForcedUserSelection] = useState(false);
-
-  // === MODO RECUPERACIÓN PIN ADMIN ===
-  const [isResettingPin, setIsResettingPin] = useState(false);
-  const [pinResetEmail, setPinResetEmail] = useState('');
-  const [pinResetAccepted, setPinResetAccepted] = useState(false);
-  const [pinResetError, setPinResetError] = useState('');
-  const [pinResetMsg, setPinResetMsg] = useState('');
-  const [isSendingReset, setIsSendingReset] = useState(false);
+  const [showTrashModal, setShowTrashModal] = useState(false);
+  const [showArchiveModal, setShowArchiveModal] = useState(false);
+  const [mobileMenuOpen, setMobileMenuOpen] = useState(false);
 
   const [authedUser, setAuthedUser] = useState(null);
+  const lastActivityRef = useRef(Date.now());
+  const lastSyncRef = useRef(0);
 
   // Datos del hogar
-  const h = useHouseholdData(ctx?.householdId) || {};
+  const h =
+    useHouseholdData(ctx?.householdId, ctx?.user, {
+      selectedMonthKey: selectedMonth,
+    }) || {};
   const todayStr = new Date().toISOString().slice(0, 10);
   const selectedHid = ctx?.householdId || null;
+  const trashItems = Array.isArray(h.trash) ? h.trash : [];
+  const archivedDebts = Array.isArray(h.debts)
+    ? h.debts.filter((d) => d && d.archived)
+    : [];
 
   const budgetsForSelectedMonth = (h.budgets && h.budgets[selectedMonth]) || {};
   const householdUsers = h.householdUsers || [];
-  const activeUser =
-    householdUsers.find((u) => u.id === selectedHouseholdUserId) || null;
-
-  const selectedLoginUser =
-    householdUsers.find((u) => u.id === loginUserId) || null;
-
-  // Persistir usuario activo en localStorage
-  useEffect(() => {
-    if (selectedHouseholdUserId) {
-      localStorage.setItem('activeHouseholdUserId', selectedHouseholdUserId);
-    } else {
-      localStorage.removeItem('activeHouseholdUserId');
+  const activeHouseholdUser = (() => {
+    if (!ctx?.user || !Array.isArray(householdUsers)) return null;
+    const uid = ctx.user.uid;
+    const emailLower = String(ctx.user.email || '').toLowerCase();
+    const byAuth = householdUsers.find((u) => u.authUid === uid);
+    if (byAuth) return byAuth;
+    if (emailLower) {
+      return (
+        householdUsers.find(
+          (u) => String(u.email || '').toLowerCase() === emailLower,
+        ) || null
+      );
     }
-  }, [selectedHouseholdUserId]);
+    return null;
+  })();
+  const activeUser =
+    activeHouseholdUser ||
+    (ctx?.user
+      ? {
+          id: ctx.user.uid,
+          name: ctx.user.displayName || ctx.user.email || 'Usuario',
+          email: ctx.user.email || '',
+          authUid: ctx.user.uid,
+        }
+      : null);
 
   // Estado de autenticación Firebase (email/contraseña)
   useEffect(() => {
@@ -92,186 +100,122 @@ export default function App() {
     return () => unsub();
   }, []);
 
-  // Prefijar correo para reset de PIN cuando se entra al modo de reseteo
-  useEffect(() => {
-    if (!isResettingPin) return;
-
-    const presetEmail =
-      authedUser?.email || selectedLoginUser?.email || h.superAdminEmail || '';
-
-    setPinResetEmail(presetEmail || '');
-  }, [
-    isResettingPin,
-    authedUser?.email,
-    selectedLoginUser?.email,
-    h.superAdminEmail,
-  ]);
-
   // Ajustar el mes seleccionado según el día de corte al entrar
   useEffect(() => {
     if (!h || !h.budgetCutDay) return;
+    if (h.budgets === null) return;
     if (!selectedHid) return;
     if (hasInitMonthByCutDay) return;
 
     const key = budgetMonthKeyForDate(todayStr, h.budgetCutDay || 1);
     setSelectedMonth(key);
     setHasInitMonthByCutDay(true);
-  }, [selectedHid, h.budgetCutDay, hasInitMonthByCutDay, todayStr]);
+  }, [selectedHid, h.budgetCutDay, h.budgets, hasInitMonthByCutDay, todayStr]);
 
-  // Lógica de selector de usuario de la casa (PIN / admin)
-  useEffect(() => {
-    if (!householdUsers.length) {
-      setShowUserSelector(false);
-      setSelectedHouseholdUserId(null);
-      return;
-    }
-
-    const superAdmin = householdUsers.find((u) => u.isSuperAdmin);
-    const superHasPin = !!(
-      superAdmin &&
-      superAdmin.pin &&
-      superAdmin.pin.trim()
-    );
-
-    // Si el admin no tiene PIN, no obligamos selector
-    if (!superHasPin) {
-      setShowUserSelector(false);
-      const exists = householdUsers.find(
-        (u) => u.id === selectedHouseholdUserId,
-      );
-      if (!exists) {
-        setSelectedHouseholdUserId(householdUsers[0].id);
-      }
-      return;
-    }
-
-    // Si ya se forzó selección antes
-    if (hasForcedUserSelection) {
-      const exists = householdUsers.find(
-        (u) => u.id === selectedHouseholdUserId,
-      );
-      if (exists) {
-        setLoginPin('');
-        setLoginError('');
-      }
-      return;
-    }
-
-    // Primera vez: obligamos a elegir usuario
-    setShowUserSelector(true);
-    setHasForcedUserSelection(true);
-    setSelectedHouseholdUserId(null);
-    setLoginUserId((superAdmin && superAdmin.id) || householdUsers[0].id);
-    setLoginPin('');
-    setLoginError('');
-  }, [
-    selectedHid,
-    householdUsers,
-    selectedHouseholdUserId,
-    hasForcedUserSelection,
-  ]);
-
-  useEffect(() => {
-    // Si cambia de hogar, forzamos nuevamente selección de usuario
-    setHasForcedUserSelection(false);
-  }, [selectedHid]);
-
-  async function handleUserLogin(e) {
-    e.preventDefault();
-    if (isResettingPin) return; // en modo recuperación no se loguea
-
-    const user = householdUsers.find((u) => u.id === loginUserId);
-    if (!user) {
-      setLoginError('Usuario no encontrado');
-      return;
-    }
-
-    if (user.pin && user.pin !== loginPin) {
-      setLoginError('PIN incorrecto');
-      return;
-    }
-
-    setSelectedHouseholdUserId(loginUserId);
-    setShowUserSelector(false);
-    setLoginPin('');
-    setLoginError('');
-  }
-
-  async function handlePinResetSubmit(e) {
-    e.preventDefault();
-    setPinResetError('');
-    setPinResetMsg('');
-
-    const mail = (pinResetEmail || '').trim();
-
-    if (!mail) {
-      setPinResetError('Por favor ingresa un correo válido.');
-      return;
-    }
-
-    if (!pinResetAccepted) {
-      setPinResetError(
-        'Debes aceptar recibir el enlace de restablecimiento en este correo.',
-      );
-      return;
-    }
-
-    try {
-      setIsSendingReset(true);
-      await sendPasswordResetEmail(auth, mail);
-      setPinResetMsg(
-        'Te enviamos un correo con el enlace para restablecer tu acceso. Revisa también tu carpeta de spam.',
-      );
-    } catch (err) {
-      console.error('Error enviando restablecimiento de PIN:', err);
-      const code = String(err?.code || '');
-      if (code.includes('invalid-email')) {
-        setPinResetError('El correo no es válido.');
-      } else if (code.includes('user-not-found')) {
-        setPinResetError('No encontramos un usuario con ese correo.');
-      } else if (code.includes('too-many-requests')) {
-        setPinResetError('Demasiados intentos. Intenta nuevamente más tarde.');
-      } else {
-        setPinResetError('No se pudo enviar el enlace. Intenta más tarde.');
-      }
-    } finally {
-      setIsSendingReset(false);
-    }
-  }
-
-  async function handleLogout() {
+  const handleLogout = useCallback(async () => {
     try {
       await signOut(auth);
     } catch (err) {
-      console.error('Error cerrando sesión:', err);
+      console.error('Error cerrando sesion:', err);
     }
     setCtx(null);
     setAuthedUser(null);
-    setSelectedHouseholdUserId(null);
-    setShowUserSelector(false);
-    // limpiar flujo de recuperación
-    setIsResettingPin(false);
-    setPinResetEmail('');
-    setPinResetError('');
-    setPinResetMsg('');
-    setPinResetAccepted(false);
-  }
+  }, []);
+
+  const syncActivity = useCallback(async () => {
+    if (!ctx?.user?.uid || !ctx?.householdId) return;
+    const now = Date.now();
+    if (now - lastSyncRef.current < ACTIVITY_SYNC_INTERVAL_MS) return;
+    lastSyncRef.current = now;
+    try {
+      await Promise.all([
+        setDoc(
+          doc(db, 'households', ctx.householdId),
+          {
+            lastActiveAt: serverTimestamp(),
+            lastActiveBy: ctx.user.uid,
+          },
+          { merge: true },
+        ),
+        setDoc(
+          doc(db, 'profiles', ctx.user.uid),
+          {
+            lastActiveAt: serverTimestamp(),
+            lastActiveHouseholdId: ctx.householdId,
+          },
+          { merge: true },
+        ),
+      ]);
+    } catch (err) {
+      console.error('Error actualizando actividad:', err);
+    }
+  }, [ctx?.householdId, ctx?.user?.uid]);
+
+  useEffect(() => {
+    if (!ctx?.user?.uid || !ctx?.householdId) return;
+    let timeoutId;
+
+    const resetTimer = () => {
+      if (timeoutId) clearTimeout(timeoutId);
+      timeoutId = setTimeout(() => {
+        const idleFor = Date.now() - lastActivityRef.current;
+        if (idleFor >= INACTIVITY_TIMEOUT_MS) {
+          handleLogout();
+        }
+      }, INACTIVITY_TIMEOUT_MS);
+    };
+
+    const onActivity = () => {
+      lastActivityRef.current = Date.now();
+      syncActivity();
+      resetTimer();
+    };
+
+    const events = ['mousemove', 'keydown', 'click', 'scroll', 'touchstart'];
+    events.forEach((event) =>
+      window.addEventListener(event, onActivity, { passive: true }),
+    );
+
+    lastActivityRef.current = Date.now();
+    syncActivity();
+    resetTimer();
+
+    return () => {
+      if (timeoutId) clearTimeout(timeoutId);
+      events.forEach((event) =>
+        window.removeEventListener(event, onActivity),
+      );
+    };
+  }, [ctx?.householdId, ctx?.user?.uid, handleLogout, syncActivity]);
 
   // Preferencias de usuario de la casa
-  const userPrefs = activeUser?.preferences || {};
+  const userPrefs = activeHouseholdUser?.preferences || {};
   const theme = userPrefs.ui?.theme || 'light';
   const density = userPrefs.ui?.density || 'normal';
+
+  useEffect(() => {
+    const root = document.documentElement;
+    if (theme === 'dark') {
+      root.classList.add('dark');
+    } else {
+      root.classList.remove('dark');
+    }
+  }, [theme]);
 
   // Datos compartidos a los módulos
   const data = {
     categories: h.categories,
     budgets: budgetsForSelectedMonth,
+    budgetsAll: h.budgets,
     transactions: h.transactions,
     debts: h.debts,
     savings: h.savings,
+    fixedCategories: h.fixedCategories,
     householdUsers: h.householdUsers,
-    superAdminEmail: h.superAdminEmail,
+    memberInfo: h.memberInfo,
+    ownerUid: h.ownerUid,
     budgetCutDay: h.budgetCutDay,
+    trash: h.trash,
   };
 
   const actions = {
@@ -280,6 +224,7 @@ export default function App() {
     setBudgetFunded: (monthKeyStrArg, cat, value) =>
       h.setBudgetFunded(monthKeyStrArg, cat, value),
     addTransaction: h.addTransaction,
+    updateTransaction: h.updateTransaction,
     removeTransaction: h.removeTransaction,
     addDebt: h.addDebt,
     updateDebt: h.updateDebt,
@@ -287,298 +232,489 @@ export default function App() {
     addSaving: h.addSaving,
     updateSaving: h.updateSaving,
     removeSaving: h.removeSaving,
+    addTrashItem: h.addTrashItem,
+    restoreTrashItem: h.restoreTrashItem,
+    purgeTrashItem: h.purgeTrashItem,
     addCategory: h.addCategory,
     removeCategory: h.removeCategory,
     renameCategory: h.renameCategory,
+    setCategoryFixed: h.setCategoryFixed,
+    moveCategoryInGroup: h.moveCategoryInGroup,
     addHouseholdUser: h.addHouseholdUser,
     updateHouseholdUser: h.updateHouseholdUser,
     removeHouseholdUser: h.removeHouseholdUser,
     setBudgetCutDay: h.setBudgetCutDay,
   };
 
-  const superAdminUser = householdUsers.find((u) => u.isSuperAdmin) || null;
-  const superAdminHasPin = !!(
-    superAdminUser &&
-    superAdminUser.pin &&
-    superAdminUser.pin.trim()
-  );
-
   const hasCtx = !!ctx;
+  const showTrashButton =
+    hasCtx &&
+    (tab === 'transactions' ||
+      tab === 'budgets' ||
+      tab === 'debts' ||
+      tab === 'savings');
+  const showArchiveButton = hasCtx && tab === 'debts';
   const headerUser = hasCtx ? ctx.user : authedUser;
   const headerHouseholdId = hasCtx ? selectedHid : null;
+  const sortedTrashItems = [...trashItems].sort(
+    (a, b) => Number(b?.deletedAt || 0) - Number(a?.deletedAt || 0),
+  );
+  const archiveSortKey = (item) => {
+    const raw = item?.archivedAt;
+    if (typeof raw === 'number') return raw;
+    const parsed = Date.parse(raw || '');
+    if (!Number.isNaN(parsed)) return parsed;
+    return Number(item?.updatedAt || item?.createdAt || 0);
+  };
+  const sortedArchivedDebts = [...archivedDebts].sort(
+    (a, b) => archiveSortKey(b) - archiveSortKey(a),
+  );
+
+  const trashTypeLabel = (item) => {
+    if (item?.type === 'debt') return 'Deuda';
+    if (item?.type === 'saving') return 'Ahorro';
+    if (item?.type === 'transaction') return 'Movimiento';
+    if (item?.type === 'budget-subcategory') return 'Subcategoria presupuesto';
+    return 'Elemento';
+  };
+
+  const trashTitle = (item) => {
+    const data = item?.data || {};
+    if (item?.type === 'debt') return data.name || 'Deuda sin nombre';
+    if (item?.type === 'saving') return data.name || 'Meta de ahorro';
+    if (item?.type === 'transaction') {
+      return data.description || data.category || 'Movimiento';
+    }
+    if (item?.type === 'budget-subcategory') {
+      const sub = data.item || {};
+      return sub.name || 'Subcategoria';
+    }
+    return 'Elemento eliminado';
+  };
+
+  const trashAmount = (item) => {
+    const data = item?.data || {};
+    if (item?.type === 'transaction') return Number(data.amount || 0);
+    if (item?.type === 'saving') return Number(data.goal || 0);
+    if (item?.type === 'debt') {
+      const remaining = Number(data.remaining || 0);
+      if (remaining) return remaining;
+      return Number(data.original || 0);
+    }
+    if (item?.type === 'budget-subcategory') {
+      const sub = data.item || {};
+      return Number(sub.amount || 0);
+    }
+    return 0;
+  };
+
+  const archivedDebtTitle = (debt) => debt?.name || 'Deuda sin nombre';
+  const archivedDebtAmount = (debt) => {
+    const remaining = Number(debt?.remaining || 0);
+    if (remaining > 0) return remaining;
+    return Number(debt?.original || 0);
+  };
+  const archivedDebtMeta = (debt) => {
+    const parts = [];
+    const card = String(debt?.cardName || '').trim();
+    const chargeDay = Number(debt?.chargeDay || 0);
+    if (card) parts.push(`Tarjeta: ${card}`);
+    if (chargeDay > 0) parts.push(`Cobro: ${chargeDay}`);
+    return parts.join(' - ');
+  };
+
+  const handleRestoreArchivedDebt = async (debt) => {
+    if (!h.updateDebt || !debt?.id) return;
+    await h.updateDebt(debt.id, { archived: false, archivedAt: null });
+  };
+
+  const handleDeleteArchivedDebt = async (debt) => {
+    if (!h.removeDebt || !debt?.id) return;
+    const name = String(debt?.name || '').trim();
+    const label = name ? ` "${name}"` : '';
+    const ok = window.confirm(
+      `Eliminar deuda archivada${label}? Se movera a la papelera.`,
+    );
+    if (!ok) return;
+    await h.removeDebt(debt.id);
+  };
+
+  const trashMetaText = (item) => {
+    const trashData = item?.data || {};
+    if (item?.type === 'transaction') {
+      const date = String(trashData.date || trashData.createdAt || '').slice(
+        0,
+        10,
+      );
+      const type = trashData.type ? String(trashData.type) : '';
+      const category = trashData.category ? String(trashData.category) : '';
+      return [type, category, date].filter(Boolean).join(' - ');
+    }
+    if (item?.type === 'saving') {
+      const target = String(trashData.targetDate || '');
+      return target ? `Meta: ${target}` : '';
+    }
+    if (item?.type === 'debt') {
+      const due = String(trashData.due || trashData.firstDue || '');
+      return due ? `Vence: ${due}` : '';
+    }
+    if (item?.type === 'budget-subcategory') {
+      const category = String(trashData.category || '').trim();
+      const periodKey = String(trashData.monthKey || '').trim();
+      const periodLabel = periodKey
+        ? formatBudgetPeriodLabel(periodKey, data.budgetCutDay || 1)
+        : '';
+      return [
+        category ? `Categoria: ${category}` : '',
+        periodLabel ? `Periodo: ${periodLabel}` : '',
+      ]
+        .filter(Boolean)
+        .join(' - ');
+    }
+    return '';
+  };
+
+  const handleRestoreTrash = async (item) => {
+    if (!actions.restoreTrashItem) return;
+    await actions.restoreTrashItem(item);
+  };
+
+  const handlePurgeTrash = async (item) => {
+    if (!actions.purgeTrashItem) return;
+    const ok = window.confirm(
+      'Eliminar definitivamente este elemento? Esta accion no se puede deshacer.',
+    );
+    if (!ok) return;
+    await actions.purgeTrashItem(item?.id);
+  };
+
+  if (!hasCtx) {
+    return (
+      <div className="min-h-screen bg-[color:var(--bg)] text-[color:var(--text)]">
+        <AuthGate onReady={(c) => setCtx(c)} />
+      </div>
+    );
+  }
 
   return (
-    <div
-      className={
-        theme === 'dark'
-          ? 'min-h-screen bg-gray-900 text-gray-100'
-          : 'min-h-screen bg-gray-50 dark:bg-gray-900 text-gray-900 dark:text-gray-100'
-      }
-    >
-      <Header
-        currentTab={tab}
-        setTab={setTab}
-        user={headerUser}
-        onLogout={handleLogout}
-        householdId={headerHouseholdId}
-      />
-
-      {hasCtx && showUserSelector && (
-        <div className="fixed inset-0 z-20 flex items-center justify-center bg-black/50">
-          <div className="bg-white dark:bg-gray-800 rounded-2xl shadow-lg p-6 w-full max-w-md text-gray-900 dark:text-gray-100">
-            <h2 className="text-lg font-semibold mb-3">
-              {isResettingPin
-                ? 'Restablecer PIN de administrador'
-                : '¿Quién está usando la app?'}
-            </h2>
-
-            {isResettingPin ? (
-              // ===== MODO RECUPERACIÓN PIN =====
-              <form
-                className="grid gap-3"
-                onSubmit={handlePinResetSubmit}
-                autoComplete="off"
-              >
-                <p className="text-sm text-gray-600 dark:text-gray-300">
-                  Ingresa el correo del administrador. Te enviaremos un enlace
-                  para restablecer tu acceso. Luego podrás cambiar tu PIN dentro
-                  de la app.
-                </p>
-
-                <div className="grid gap-1">
-                  <label className="text-sm">Correo del administrador</label>
-                  <input
-                    type="email"
-                    className="border rounded-lg p-2"
-                    value={pinResetEmail}
-                    onChange={(e) => setPinResetEmail(e.target.value)}
-                    placeholder="correo@ejemplo.com"
-                  />
-                </div>
-
-                <label className="flex items-start gap-2 text-sm">
-                  <input
-                    type="checkbox"
-                    className="mt-1"
-                    checked={pinResetAccepted}
-                    onChange={(e) => setPinResetAccepted(e.target.checked)}
-                  />
-                  <span>
-                    Acepto recibir un enlace de restablecimiento en este correo.
-                  </span>
-                </label>
-
-                {pinResetError && (
-                  <div className="text-xs text-red-600">{pinResetError}</div>
-                )}
-
-                {pinResetMsg && (
-                  <div className="text-xs text-green-600">{pinResetMsg}</div>
-                )}
-
-                <div className="flex justify-end gap-2 mt-2">
-                  <button
-                    type="button"
-                    className="px-3 py-1.5 text-xs text-blue-600 underline"
-                    onClick={() => {
-                      setIsResettingPin(false);
-                      setPinResetError('');
-                      setPinResetMsg('');
-                      setPinResetAccepted(false);
-                    }}
-                  >
-                    Volver a ingresar con PIN
-                  </button>
-                  <button
-                    type="submit"
-                    className="px-3 py-1.5 text-sm border rounded-lg bg-gray-900 text-white disabled:opacity-60"
-                    disabled={
-                      isSendingReset ||
-                      !pinResetEmail.trim() ||
-                      !pinResetAccepted
-                    }
-                  >
-                    {isSendingReset
-                      ? 'Enviando...'
-                      : 'Enviar enlace para restablecer'}
-                  </button>
-                </div>
-              </form>
-            ) : (
-              // ===== MODO NORMAL (USUARIO + PIN) =====
-              <>
-                {householdUsers.length === 0 ? (
-                  <p className="text-sm text-gray-600">
-                    No hay usuarios configurados aún. Ve a Ajustes &gt; Usuarios
-                    de la casa para crearlos.
-                  </p>
-                ) : (
-                  <form
-                    className="grid gap-3"
-                    onSubmit={handleUserLogin}
-                    autoComplete="off"
-                  >
-                    <div className="grid gap-1">
-                      <label className="text-sm">Usuario</label>
-                      <select
-                        className="border rounded-lg p-2"
-                        value={loginUserId}
-                        onChange={(e) => {
-                          setLoginUserId(e.target.value);
-                          setLoginError('');
-                          setLoginPin('');
-                        }}
-                      >
-                        {householdUsers.map((u) => (
-                          <option key={u.id} value={u.id}>
-                            {u.name} {u.isSuperAdmin ? '(Admin)' : ''}
-                          </option>
-                        ))}
-                      </select>
-                    </div>
-
-                    <div className="grid gap-1">
-                      <label className="text-sm">
-                        PIN (si el usuario no tiene PIN, deja en blanco)
-                      </label>
-                      <input
-                        type="text"
-                        inputMode="numeric"
-                        pattern="\d*"
-                        name="household-pin-login"
-                        autoComplete="off"
-                        data-lpignore="true"
-                        data-form-type="other"
-                        className="border rounded-lg p-2"
-                        value={loginPin}
-                        onChange={(e) => setLoginPin(e.target.value)}
-                        placeholder="PIN (si el usuario no tiene PIN, deja en blanco)"
-                        style={{ WebkitTextSecurity: 'disc' }}
-                      />
-                      <p className="text-xs text-gray-500">
-                        Si olvidaste tu PIN, pídele ayuda al administrador del
-                        hogar.
-                      </p>
-
-                      {selectedLoginUser?.isSuperAdmin && (
-                        <button
-                          type="button"
-                          className="mt-1 text-xs text-blue-600 underline text-left"
-                          onClick={() => {
-                            setIsResettingPin(true);
-                            setPinResetError('');
-                            setPinResetMsg('');
-                            setPinResetAccepted(false);
-                          }}
-                        >
-                          ¿Olvidaste tu PIN de admin? Restablece tu PIN
-                        </button>
-                      )}
-                    </div>
-
-                    {loginError && (
-                      <div className="text-xs text-red-600">{loginError}</div>
-                    )}
-
-                    <div className="flex justify-end gap-2 mt-2">
-                      {superAdminHasPin ? (
-                        <button
-                          type="button"
-                          className="px-3 py-1.5 text-sm border rounded-lg"
-                          onClick={handleLogout}
-                        >
-                          Cerrar sesión
-                        </button>
-                      ) : (
-                        <button
-                          type="button"
-                          className="px-3 py-1.5 text-sm border rounded-lg"
-                          onClick={() => {
-                            setShowUserSelector(false);
-                            setLoginError('');
-                          }}
-                        >
-                          Cancelar
-                        </button>
-                      )}
-                      <button
-                        type="submit"
-                        className="px-3 py-1.5 text-sm border rounded-lg bg-gray-900 text-white"
-                      >
-                        Entrar
-                      </button>
-                    </div>
-                  </form>
-                )}
-              </>
-            )}
-          </div>
-        </div>
-      )}
-
-      <div
-        className={
-          hasCtx && showUserSelector ? 'filter blur-sm pointer-events-none' : ''
-        }
-      >
-        {hasCtx && tab !== 'settings' && (
+    <div className="min-h-screen bg-[color:var(--bg)] text-[color:var(--text)]">
+      <div>
+        <div className="flex min-h-screen flex-col md:flex-row">
+          <Header
+            currentTab={tab}
+            setTab={setTab}
+            user={headerUser}
+            onLogout={handleLogout}
+            householdId={headerHouseholdId}
+            mobileOpen={mobileMenuOpen}
+            setMobileOpen={setMobileMenuOpen}
+            showMobileTopBar={tab === 'settings'}
+          />
           <div
-            className={`max-w-6xl mx-auto px-4 mt-2 mb-1 flex items-center justify-between text-sm ${
-              theme === 'dark'
-                ? 'text-gray-100'
-                : 'text-gray-900 dark:text-gray-100'
+            className={`flex-1 min-w-0 ${
+              tab === 'settings' ? 'with-mobile-header-offset' : ''
             }`}
           >
-            <div className="flex items-center gap-2">
-              <button
-                className="px-2 py-1 border rounded-lg"
-                onClick={() => setSelectedMonth((prev) => shiftMonth(prev, -1))}
-              >
-                ◄
-              </button>
-              <span className="font-medium">
-                {formatBudgetPeriodLabel(selectedMonth, data.budgetCutDay || 1)}
-              </span>
-              <button
-                className="px-2 py-1 border rounded-lg"
-                onClick={() => setSelectedMonth((prev) => shiftMonth(prev, 1))}
-              >
-                ►
-              </button>
+            {tab !== 'settings' && (() => {
+              const today = new Date().toISOString().slice(0, 10);
+              const currentBudgetKey = budgetMonthKeyForDate(
+                today,
+                data.budgetCutDay || 1,
+              );
+              const isCurrentPeriod = selectedMonth === currentBudgetKey;
+              return (
+                <div className="sticky top-0 z-30 border-b border-[color:var(--divider)] bg-[color:var(--surface-1)]/80 backdrop-blur">
+                  <div className="w-full max-w-none px-4 py-2 grid grid-cols-[auto_1fr] items-center gap-3 text-sm text-[color:var(--text)]">
+                    {headerUser && headerHouseholdId && (
+                      <button
+                        type="button"
+                        onClick={() => setMobileMenuOpen((prev) => !prev)}
+                        className="md:hidden flex items-center rounded-r-full bg-blue-900 text-blue-100 px-4 py-2 shadow-sm -ml-4 transition active:scale-95"
+                        aria-label={mobileMenuOpen ? 'Cerrar menu' : 'Abrir menu'}
+                        aria-expanded={mobileMenuOpen}
+                      >
+                        <img
+                          src="/logo-finanzas-en-familia.png"
+                          alt="Finanzas en Familia"
+                          className="h-7 w-7 object-contain"
+                          decoding="async"
+                        />
+                        <span className="sr-only">Finanzas en Familia</span>
+                      </button>
+                    )}
+                    <div className="flex flex-wrap items-center justify-end gap-2">
+                      <div className="grid min-w-0 grid-cols-[minmax(2rem,auto)_auto_minmax(2rem,auto)] items-center gap-2">
+                        <button
+                          className="period-nav-button w-full h-8 min-h-[32px] inline-flex items-center justify-center rounded-md border border-[color:var(--border)] bg-[color:var(--surface-2)] text-[color:var(--text)] shadow-sm transition-colors duration-150 hover:bg-[color:var(--surface-1)] active:bg-[color:var(--surface-2)] active:shadow-inner disabled:cursor-not-allowed disabled:opacity-50"
+                          onClick={() =>
+                            setSelectedMonth((prev) => shiftMonth(prev, -1))
+                          }
+                        >
+                          <svg
+                            className="h-4 w-4"
+                            viewBox="0 0 20 20"
+                            fill="none"
+                            stroke="currentColor"
+                            strokeWidth="2"
+                            strokeLinecap="round"
+                            strokeLinejoin="round"
+                            aria-hidden="true"
+                          >
+                            <path d="M12.5 5l-5 5 5 5" />
+                          </svg>
+                        </button>
+                        <span className="font-medium text-center text-[color:var(--text)] whitespace-nowrap">
+                          {formatBudgetPeriodLabel(
+                            selectedMonth,
+                            data.budgetCutDay || 1,
+                          )}
+                        </span>
+                        <button
+                          className="period-nav-button w-full h-8 min-h-[32px] inline-flex items-center justify-center rounded-md border border-[color:var(--border)] bg-[color:var(--surface-2)] text-[color:var(--text)] shadow-sm transition-colors duration-150 hover:bg-[color:var(--surface-1)] active:bg-[color:var(--surface-2)] active:shadow-inner disabled:cursor-not-allowed disabled:opacity-50"
+                          onClick={() =>
+                            setSelectedMonth((prev) => shiftMonth(prev, 1))
+                          }
+                        >
+                          <svg
+                            className="h-4 w-4"
+                            viewBox="0 0 20 20"
+                            fill="none"
+                            stroke="currentColor"
+                            strokeWidth="2"
+                            strokeLinecap="round"
+                            strokeLinejoin="round"
+                            aria-hidden="true"
+                          >
+                            <path d="M7.5 5l5 5-5 5" />
+                          </svg>
+                        </button>
+                      </div>
+                      <button
+                        className={`period-current-button px-2 sm:px-3 py-1 border rounded-lg shadow-sm transition active:scale-[0.98] active:brightness-95 whitespace-normal text-center leading-tight max-w-[140px] sm:max-w-none text-xs sm:text-sm ${
+                          isCurrentPeriod
+                            ? 'bg-[color:var(--primary)] text-[color:var(--primary-contrast)] border-[color:var(--primary)] hover:brightness-110'
+                            : 'bg-[color:var(--surface-2)] text-[color:var(--text)] border-[color:var(--border)] hover:bg-[color:var(--surface-1)]'
+                        }`}
+                        onClick={() => setSelectedMonth(currentBudgetKey)}
+                      >
+                        {isCurrentPeriod
+                          ? 'Periodo Actual'
+                          : 'Ir al periodo actual'}
+                      </button>
+                      {showTrashButton && (
+                        <>
+                          {showArchiveButton && (
+                            <button
+                              type="button"
+                              className="period-current-button h-9 w-9 inline-flex items-center justify-center border rounded-lg bg-[color:var(--surface-2)] text-[color:var(--text)] shadow-sm transition active:scale-[0.98] active:brightness-95 hover:bg-[color:var(--surface-1)]"
+                              onClick={() => setShowArchiveModal(true)}
+                              aria-label="Archivados"
+                              title="Archivados"
+                            >
+                              <svg
+                                className="h-5 w-5"
+                                viewBox="0 0 24 24"
+                                fill="none"
+                                stroke="currentColor"
+                                strokeWidth="2"
+                                strokeLinecap="round"
+                                strokeLinejoin="round"
+                                aria-hidden="true"
+                              >
+                                <rect x="3" y="4" width="18" height="5" rx="1" />
+                                <path d="M5 9v10a1 1 0 0 0 1 1h12a1 1 0 0 0 1-1V9" />
+                                <path d="M10 13h4" />
+                              </svg>
+                            </button>
+                          )}
+                          <button
+                            type="button"
+                            className="period-current-button h-9 w-9 inline-flex items-center justify-center border rounded-lg bg-[color:var(--surface-2)] text-[color:var(--text)] shadow-sm transition active:scale-[0.98] active:brightness-95 hover:bg-[color:var(--surface-1)]"
+                            onClick={() => setShowTrashModal(true)}
+                            aria-label="Papelera"
+                            title="Papelera"
+                          >
+                          <svg
+                            className="h-5 w-5"
+                            viewBox="0 0 24 24"
+                            fill="none"
+                            stroke="currentColor"
+                            strokeWidth="2"
+                            strokeLinecap="round"
+                            strokeLinejoin="round"
+                            aria-hidden="true"
+                          >
+                            <path d="M3 6h18" />
+                            <path d="M8 6V4h8v2" />
+                            <path d="M6 6l1 14a2 2 0 0 0 2 2h6a2 2 0 0 0 2-2l1-14" />
+                            <path d="M10 11v6" />
+                              <path d="M14 11v6" />
+                            </svg>
+                          </button>
+                        </>
+                      )}
+                    </div>
+                  </div>
+                </div>
+              );
+            })()}
+
+        {hasCtx && showTrashModal && (
+          <div className="fixed inset-0 z-30 flex items-start justify-center bg-black/40 px-4 py-10">
+            <div className="w-full max-w-3xl rounded-2xl bg-[color:var(--surface-1)] text-[color:var(--text)] shadow-xl">
+              <div className="flex items-center justify-between border-b border-[color:var(--divider)] px-5 py-3">
+                <h3 className="text-lg font-semibold">Papelera</h3>
+                <button
+                  type="button"
+                  className="text-sm text-[color:var(--text-muted)] hover:text-[color:var(--text)]"
+                  onClick={() => setShowTrashModal(false)}
+                >
+                  Cerrar
+                </button>
+              </div>
+              <div className="max-h-[70vh] overflow-y-auto px-5 py-4">
+                {sortedTrashItems.length ? (
+                  <div className="grid gap-3">
+                    {sortedTrashItems.map((item) => {
+                      const amount = trashAmount(item);
+                      const meta = trashMetaText(item);
+                      return (
+                        <div
+                          key={item.id}
+                          className="flex flex-col gap-3 rounded-xl border border-[color:var(--border)] p-4 sm:flex-row sm:items-center sm:justify-between bg-[color:var(--surface-2)]"
+                        >
+                          <div className="min-w-0">
+                            <div className="text-[11px] font-semibold uppercase tracking-wide text-[color:var(--text-muted)]">
+                              {trashTypeLabel(item)}
+                            </div>
+                            <div className="truncate font-semibold">
+                              {trashTitle(item)}
+                            </div>
+                            {meta && (
+                              <div className="text-xs text-[color:var(--text-muted)]">
+                                {meta}
+                              </div>
+                            )}
+                            {amount ? (
+                              <div className="text-xs text-[color:var(--text-muted)]">
+                                <Money n={amount} />
+                              </div>
+                            ) : null}
+                          </div>
+                          <div className="flex flex-wrap items-center gap-2">
+                            <button
+                              type="button"
+                              className="rounded-lg border border-[color:var(--success)]/30 bg-[color:var(--success)]/15 px-3 py-1.5 text-xs font-semibold text-[color:var(--success)] transition hover:bg-[color:var(--success)]/25"
+                              onClick={() => handleRestoreTrash(item)}
+                            >
+                              Recuperar
+                            </button>
+                            <button
+                              type="button"
+                              className="rounded-lg border border-[color:var(--danger)]/30 bg-[color:var(--danger)]/15 px-3 py-1.5 text-xs font-semibold text-[color:var(--danger)] transition hover:bg-[color:var(--danger)]/25"
+                              onClick={() => handlePurgeTrash(item)}
+                            >
+                              Eliminar definitivo
+                            </button>
+                          </div>
+                        </div>
+                      );
+                    })}
+                  </div>
+                ) : (
+                  <div className="text-sm text-[color:var(--text-muted)]">
+                    No hay elementos eliminados.
+                  </div>
+                )}
+              </div>
             </div>
-            <div className="flex items-center gap-2">
-              <button
-                className="px-2 py-1 border rounded-lg"
-                onClick={() => {
-                  const today = new Date().toISOString().slice(0, 10);
-                  const currentBudgetKey = budgetMonthKeyForDate(
-                    today,
-                    data.budgetCutDay || 1,
-                  );
-                  setSelectedMonth(currentBudgetKey);
-                }}
-              >
-                Ir al periodo actual
-              </button>
+          </div>
+        )}
+
+        {hasCtx && showArchiveModal && (
+          <div className="fixed inset-0 z-30 flex items-start justify-center bg-black/40 px-4 py-10">
+            <div className="w-full max-w-3xl rounded-2xl bg-[color:var(--surface-1)] text-[color:var(--text)] shadow-xl">
+              <div className="flex items-center justify-between border-b border-[color:var(--divider)] px-5 py-3">
+                <h3 className="text-lg font-semibold">Archivados</h3>
+                <button
+                  type="button"
+                  className="text-sm text-[color:var(--text-muted)] hover:text-[color:var(--text)]"
+                  onClick={() => setShowArchiveModal(false)}
+                >
+                  Cerrar
+                </button>
+              </div>
+              <div className="max-h-[70vh] overflow-y-auto px-5 py-4">
+                {sortedArchivedDebts.length ? (
+                  <div className="grid gap-3">
+                    {sortedArchivedDebts.map((debt) => {
+                      const meta = archivedDebtMeta(debt);
+                      return (
+                        <div
+                          key={debt.id}
+                          className="flex flex-col gap-3 rounded-xl border border-[color:var(--border)] p-4 sm:flex-row sm:items-center sm:justify-between bg-[color:var(--surface-2)]"
+                        >
+                          <div className="min-w-0">
+                            <div className="text-[11px] font-semibold uppercase tracking-wide text-[color:var(--text-muted)]">
+                              Deuda archivada
+                            </div>
+                            <div className="truncate font-semibold">
+                              {archivedDebtTitle(debt)}
+                            </div>
+                            {meta && (
+                              <div className="mt-1 text-xs text-[color:var(--text-muted)]">
+                                {meta}
+                              </div>
+                            )}
+                            <div className="mt-1 text-sm font-semibold">
+                              <Money n={archivedDebtAmount(debt)} />
+                            </div>
+                          </div>
+                          <div className="flex flex-wrap gap-2">
+                            <button
+                              className="rounded-lg border border-[color:var(--success)]/40 bg-[color:var(--success)]/10 px-3 py-1.5 text-xs font-semibold text-[color:var(--success)] transition hover:bg-[color:var(--success)]/20"
+                              onClick={() => handleRestoreArchivedDebt(debt)}
+                            >
+                              Recuperar
+                            </button>
+                            <button
+                              className="rounded-lg border border-[color:var(--danger)]/30 bg-[color:var(--danger)]/15 px-3 py-1.5 text-xs font-semibold text-[color:var(--danger)] transition hover:bg-[color:var(--danger)]/25"
+                              onClick={() => handleDeleteArchivedDebt(debt)}
+                            >
+                              Eliminar
+                            </button>
+                          </div>
+                        </div>
+                      );
+                    })}
+                  </div>
+                ) : (
+                  <div className="text-sm text-[color:var(--text-muted)]">
+                    No hay deudas archivadas.
+                  </div>
+                )}
+              </div>
             </div>
           </div>
         )}
 
         <main
-          className={`max-w-6xl mx-auto px-4 py-4 grid gap-4 ${
+          className={`${tab === 'debts' || tab === 'savings' ? 'w-full max-w-none' : 'max-w-6xl mx-auto'} px-4 py-4 grid gap-4 ${
             density === 'compact' ? 'text-xs' : 'text-sm'
           }`}
         >
           {!hasCtx && <AuthGate onReady={(c) => setCtx(c)} />}
 
-          {hasCtx && tab === 'dashboard' && (
+          {tab === 'dashboard' && (
             <Dashboard
               data={{
                 categories: data.categories,
                 budgets: data.budgets,
+                budgetsAll: data.budgetsAll,
                 transactions: data.transactions,
                 debts: data.debts,
                 savings: data.savings,
+                fixedCategories: data.fixedCategories,
                 budgetCutDay: data.budgetCutDay,
                 activeUserPreferences: userPrefs,
               }}
@@ -586,48 +722,67 @@ export default function App() {
             />
           )}
 
-          {hasCtx && tab === 'transactions' && (
+          {tab === 'transactions' && (
             <Transactions
               data={{
                 transactions: data.transactions,
                 categories: data.categories,
                 debts: data.debts,
+                savings: data.savings,
+                budgets: data.budgets,
+                budgetsAll: data.budgetsAll,
+                fixedCategories: data.fixedCategories,
+                householdUsers: data.householdUsers,
               }}
               actions={actions}
               activeUser={activeUser}
               monthKeyStr={selectedMonth}
-              superAdminEmail={data.superAdminEmail || ctx.user?.email || null}
               budgetCutDay={data.budgetCutDay}
             />
           )}
 
-          {hasCtx && tab === 'budgets' && (
+          {tab === 'budgets' && (
             <Budgets
               data={{
                 budgets: data.budgets,
+                budgetsAll: data.budgetsAll,
                 transactions: data.transactions,
                 categories: data.categories,
+                fixedCategories: data.fixedCategories,
                 budgetCutDay: data.budgetCutDay,
                 debts: data.debts,
+                savings: data.savings,
               }}
               actions={actions}
               monthKeyStr={selectedMonth}
             />
           )}
 
-          {hasCtx && tab === 'debts' && (
+          {tab === 'debts' && (
             <Debts
-              data={{ debts: data.debts, budgetCutDay: data.budgetCutDay }}
+              data={{
+                debts: data.debts,
+                transactions: data.transactions,
+                budgetCutDay: data.budgetCutDay,
+              }}
               actions={actions}
               monthKeyStr={selectedMonth}
             />
           )}
 
-          {hasCtx && tab === 'savings' && (
-            <Savings data={{ savings: data.savings }} actions={actions} />
+          {tab === 'savings' && (
+            <Savings
+              data={{
+                savings: data.savings,
+                transactions: data.transactions,
+                budgetCutDay: data.budgetCutDay,
+              }}
+              actions={actions}
+              monthKeyStr={selectedMonth}
+            />
           )}
 
-          {hasCtx && tab === 'settings' && (
+          {tab === 'settings' && (
             <Settings
               data={{
                 budgets: data.budgets,
@@ -635,22 +790,23 @@ export default function App() {
                 debts: data.debts,
                 savings: data.savings,
                 householdUsers: data.householdUsers,
-                superAdminEmail: data.superAdminEmail,
+                memberInfo: data.memberInfo,
+                ownerUid: data.ownerUid,
                 budgetCutDay: data.budgetCutDay,
+                fixedCategories: data.fixedCategories,
               }}
               householdId={selectedHid}
               user={ctx.user}
               categories={data.categories}
               actions={actions}
-              activeHouseholdUser={activeUser}
+              activeHouseholdUser={activeHouseholdUser}
             />
           )}
         </main>
 
-        <footer className="text-center text-xs text-gray-500 p-4">
-          V2 · Firebase/Firestore en tiempo real
-        </footer>
       </div>
     </div>
-  );
+  </div>
+</div>
+);
 }

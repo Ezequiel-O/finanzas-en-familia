@@ -1,5 +1,5 @@
-﻿// src/modules/savings/Savings.jsx
-import React, { useEffect, useMemo, useState } from 'react';
+// src/modules/savings/Savings.jsx
+import React, { useMemo, useState } from 'react';
 
 import { Card } from '../../components/ui/card.jsx';
 import { SectionTitle } from '../../components/ui/SectionTitle.jsx';
@@ -8,14 +8,43 @@ import { Progress } from '../../components/ui/Progress.jsx';
 import {
   monthKey,
   shiftMonth,
+  getBudgetPeriod,
   formatBudgetPeriodLabel,
   budgetMonthKeyForDate,
-  getBudgetPeriod,
+  dateKeyFromValue,
 } from '../../utils/budgetPeriod.js';
+
+const SAVINGS_CATEGORY = 'Ahorro';
+const DEFAULT_PLAN_PERIODS = 3;
 
 function toNumber(n) {
   const num = Number(n || 0);
   return Number.isNaN(num) ? 0 : num;
+}
+
+function normalizeName(value) {
+  return String(value || '').trim().toLowerCase();
+}
+
+function ensureScheduleArray(schedule) {
+  return Array.isArray(schedule)
+    ? schedule.map((q) => ({
+        id: q.id || Math.random().toString(36).slice(2, 10),
+        periodKey: q.periodKey || '',
+        plannedAmount: toNumber(q.plannedAmount),
+        paidAmount: toNumber(q.paidAmount),
+        dueDate: q.dueDate || '',
+        status: q.status || 'pending',
+      }))
+    : [];
+}
+
+function computePlanStatus(plannedAmount, paidAmount) {
+  const planned = toNumber(plannedAmount);
+  const paid = toNumber(paidAmount);
+  if (paid >= planned && planned > 0) return 'paid';
+  if (paid > 0) return 'partial';
+  return 'pending';
 }
 
 function periodsBetween(startPk, endPk) {
@@ -29,34 +58,147 @@ function periodsBetween(startPk, endPk) {
   return count;
 }
 
-function perPeriodPlanForSaving(s, periodKey, budgetCutDay) {
-  if (!periodKey) return { plan: 0, targetPk: '', monthsLeft: 0 };
-  const targetPk = s.targetDate
-    ? budgetMonthKeyForDate(s.targetDate, budgetCutDay)
-    : `${new Date().getFullYear()}-12`;
-  const remaining = Math.max(toNumber(s.goal) - toNumber(s.saved), 0);
-  const monthsLeft = targetPk >= periodKey ? periodsBetween(periodKey, targetPk) : 0;
-  const plan = monthsLeft > 0 ? remaining / monthsLeft : remaining;
-  return { plan, targetPk, monthsLeft };
+function savingStartPeriodKey(s, cutDay) {
+  const dateKey = dateKeyFromValue(s?.createdAt);
+  return dateKey ? budgetMonthKeyForDate(dateKey, cutDay) : '';
 }
 
-function savingsPaidFromTransactions(transactions, periodKey, cutDay) {
+function planForSavingLegacy(s, periodKey, cutDay) {
+  if (!periodKey) return { plan: 0, targetPk: '' };
+  const rawStartPk = savingStartPeriodKey(s, cutDay);
+  const startPk = rawStartPk || periodKey || monthKey(new Date());
+  const periods = Math.max(1, Number(DEFAULT_PLAN_PERIODS) || 1);
+  const targetPk = s?.targetDate
+    ? budgetMonthKeyForDate(s.targetDate, cutDay)
+    : shiftMonth(startPk, periods - 1);
+
+  const normalizedTarget =
+    targetPk && rawStartPk && rawStartPk > targetPk ? rawStartPk : targetPk;
+
+  if (rawStartPk && periodKey < rawStartPk) {
+    return { plan: 0, targetPk: normalizedTarget };
+  }
+
+  const remaining = Math.max(toNumber(s.goal) - toNumber(s.saved), 0);
+  if (remaining <= 0 || (normalizedTarget && periodKey > normalizedTarget)) {
+    return { plan: 0, targetPk: normalizedTarget };
+  }
+
+  const scheduleStartPk = rawStartPk || periodKey;
+  if (periodKey < scheduleStartPk) {
+    return { plan: 0, targetPk: normalizedTarget };
+  }
+
+  const totalPeriods = periodsBetween(
+    scheduleStartPk,
+    normalizedTarget || scheduleStartPk,
+  );
+  const basePlan =
+    totalPeriods > 0 ? Math.floor(remaining / totalPeriods) : remaining;
+  const delta = remaining - basePlan * totalPeriods;
+  const plan = periodKey === normalizedTarget ? basePlan + delta : basePlan;
+
+  return { plan, targetPk: normalizedTarget };
+}
+
+function resolveSchedulePeriodKey(entry, cutDay) {
+  if (entry?.periodKey) return entry.periodKey;
+  if (entry?.dueDate) {
+    return budgetMonthKeyForDate(entry.dueDate, cutDay);
+  }
+  return '';
+}
+
+function plannedForSavingPeriod(saving, periodKey, cutDay) {
+  if (!periodKey) return 0;
+  const schedule = ensureScheduleArray(saving?.schedule);
+  if (schedule.length) {
+    return schedule
+      .filter((q) => resolveSchedulePeriodKey(q, cutDay) === periodKey)
+      .reduce((sum, q) => sum + toNumber(q.plannedAmount), 0);
+  }
+  const { plan, targetPk } = planForSavingLegacy(saving, periodKey, cutDay);
+  if (!targetPk || periodKey > targetPk) return 0;
+  return plan;
+}
+function buildSavingSchedule({
+  goal,
+  saved,
+  targetDate,
+  createdAt,
+  budgetCutDay,
+  defaultPeriods = DEFAULT_PLAN_PERIODS,
+}) {
+  const remaining = Math.max(toNumber(goal) - toNumber(saved), 0);
+  if (remaining <= 0) return [];
+
+  const createdKey =
+    dateKeyFromValue(createdAt) || new Date().toISOString().slice(0, 10);
+  const startPk = budgetMonthKeyForDate(createdKey, budgetCutDay);
+  const periods = Math.max(1, Number(defaultPeriods) || DEFAULT_PLAN_PERIODS);
+
+  let targetPk = targetDate
+    ? budgetMonthKeyForDate(targetDate, budgetCutDay)
+    : shiftMonth(startPk, periods - 1);
+
+  if (!targetPk || targetPk < startPk) targetPk = startPk;
+
+  const totalPeriods = periodsBetween(startPk, targetPk);
+  const basePlan =
+    totalPeriods > 0 ? Math.floor(remaining / totalPeriods) : remaining;
+  const delta = remaining - basePlan * totalPeriods;
+
+  const schedule = [];
+  for (let i = 0; i < totalPeriods; i += 1) {
+    const pk = shiftMonth(startPk, i);
+    const planned = basePlan + (i === totalPeriods - 1 ? delta : 0);
+    const { end } = getBudgetPeriod(pk, budgetCutDay);
+    const endDate = new Date(end + 'T00:00:00');
+    endDate.setDate(endDate.getDate() - 1);
+    schedule.push({
+      id: `${Date.now()}-${i}-${Math.random().toString(36).slice(2, 6)}`,
+      periodKey: pk,
+      dueDate: endDate.toISOString().slice(0, 10),
+      plannedAmount: planned,
+      paidAmount: 0,
+      status: computePlanStatus(planned, 0),
+    });
+  }
+
+  return schedule;
+}
+
+function totalSavingsPaidFromTransactions(transactions, periodKey, cutDay) {
   const { start, end } = getBudgetPeriod(periodKey, cutDay);
   return (transactions || [])
-    .filter((t) => t.category === 'Ahorro')
+    .filter((t) => t.category === SAVINGS_CATEGORY)
     .filter((t) => {
       const d = (t.date || t.createdAt || '').slice(0, 10);
       return d >= start && d < end;
     })
-    .reduce((s, t) => s + toNumber(t.amount), 0);
+    .reduce((sum, t) => sum + toNumber(t.amount), 0);
+}
+
+function totalSavingsPlannedForPeriod(savings, periodKey, cutDay) {
+  return (savings || []).reduce(
+    (sum, s) => sum + plannedForSavingPeriod(s, periodKey, cutDay),
+    0,
+  );
 }
 
 export function Savings({ data, actions, monthKeyStr }) {
-  const savings = Array.isArray(data?.savings) ? data.savings : [];
-  const transactions = Array.isArray(data?.transactions) ? data.transactions : [];
+  const savingsRaw = data?.savings || [];
   const budgetCutDay = data?.budgetCutDay || 1;
+  const transactions = data?.transactions || [];
 
-  const { addSaving, updateSaving, removeSaving } = actions || {};
+  const savings = savingsRaw.map((s) => ({
+    ...s,
+    id: s.id || Math.random().toString(36).slice(2, 10),
+    schedule: ensureScheduleArray(s.schedule),
+  }));
+
+  const { addSaving, updateSaving, removeSaving, updateTransaction } =
+    actions || {};
 
   const [form, setForm] = useState({
     name: '',
@@ -64,366 +206,1049 @@ export function Savings({ data, actions, monthKeyStr }) {
     saved: '',
     targetDate: '',
   });
-  const [savingEdit, setSavingEdit] = useState(null); // {id,name,goal,targetDate}
 
-  const [currentPeriodKey, setCurrentPeriodKey] = useState(
-    monthKeyStr || monthKey(new Date()),
+  const [planModal, setPlanModal] = useState(null);
+  const [savingEditModal, setSavingEditModal] = useState(null);
+  const [hideCompletedSavings, setHideCompletedSavings] = useState(true);
+  const [showAddSavingModal, setShowAddSavingModal] = useState(false);
+
+  const currentPeriodKey = useMemo(
+    () => monthKeyStr || monthKey(new Date()),
+    [monthKeyStr],
   );
-
-  useEffect(() => {
-    if (monthKeyStr) {
-      setCurrentPeriodKey(monthKeyStr);
-    }
-  }, [monthKeyStr]);
 
   const trueCurrentPeriod = useMemo(() => {
     const todayStr = new Date().toISOString().slice(0, 10);
     return budgetMonthKeyForDate(todayStr, budgetCutDay);
   }, [budgetCutDay]);
 
-  const visiblePeriods = useMemo(() => {
-    const center = currentPeriodKey;
-    const list = [
-      shiftMonth(center, -1),
-      center,
-      shiftMonth(center, 1),
-      trueCurrentPeriod,
-    ];
-    return Array.from(new Set(list));
-  }, [currentPeriodKey, trueCurrentPeriod]);
-
-  const totals = savings.reduce(
-    (acc, s) => {
-      acc.goal += toNumber(s.goal);
-      acc.saved += toNumber(s.saved);
-      return acc;
-    },
-    { goal: 0, saved: 0 },
-  );
-  const totalRemaining = Math.max(totals.goal - totals.saved, 0);
-
-  const plannedThisPeriod = savings.reduce((sum, s) => {
-    const { plan, targetPk } = perPeriodPlanForSaving(
-      s,
+  const visiblePeriods = useMemo(
+    () => [
+      shiftMonth(currentPeriodKey, -1),
       currentPeriodKey,
-      budgetCutDay,
-    );
-    return targetPk && targetPk >= currentPeriodKey ? sum + plan : sum;
-  }, 0);
+      shiftMonth(currentPeriodKey, 1),
+    ],
+    [currentPeriodKey],
+  );
 
-  const paidThisPeriod = savingsPaidFromTransactions(
+  const savingNameLookup = useMemo(() => {
+    const counts = new Map();
+    const ids = new Map();
+    savings.forEach((s) => {
+      const key = normalizeName(s?.name);
+      if (!key || !s?.id) return;
+      counts.set(key, (counts.get(key) || 0) + 1);
+      ids.set(key, s.id);
+    });
+    const lookup = {};
+    counts.forEach((count, key) => {
+      if (count === 1) lookup[key] = ids.get(key);
+    });
+    return lookup;
+  }, [savings]);
+  const savingsPaidMap = useMemo(() => {
+    const bySavingId = {};
+    const bySavingPeriod = {};
+    (transactions || []).forEach((t) => {
+      if (t?.category !== SAVINGS_CATEGORY) return;
+      const amt = toNumber(t.amount);
+      if (!amt) return;
+      const dateStr = (t.date || t.createdAt || '').slice(0, 10);
+      const periodKey = dateStr
+        ? budgetMonthKeyForDate(dateStr, budgetCutDay)
+        : '';
+      let savingId = String(t?.meta?.savingId || '').trim();
+      if (!savingId) {
+        const nameKey = normalizeName(t?.meta?.savingName || '');
+        savingId = nameKey ? savingNameLookup[nameKey] : '';
+      }
+      if (!savingId) return;
+      bySavingId[savingId] = (bySavingId[savingId] || 0) + amt;
+      if (periodKey) {
+        const key = `${savingId}::${periodKey}`;
+        bySavingPeriod[key] = (bySavingPeriod[key] || 0) + amt;
+      }
+    });
+    return { bySavingId, bySavingPeriod };
+  }, [transactions, budgetCutDay, savingNameLookup]);
+
+  const paidForSavingPeriod = (savingId, periodKey) => {
+    if (!savingId || !periodKey) return 0;
+    return savingsPaidMap.bySavingPeriod[`${savingId}::${periodKey}`] ?? 0;
+  };
+
+  const totalSavedForSaving = (saving) => {
+    const base = toNumber(saving.saved);
+    const extra = saving.id ? savingsPaidMap.bySavingId[saving.id] || 0 : 0;
+    return base + extra;
+  };
+
+  async function handleRemoveSaving(saving) {
+    if (!removeSaving || !saving?.id) return;
+    const name = String(saving.name || '').trim();
+    const label = name ? ` "${name}"` : '';
+    const ok = window.confirm(
+      `Eliminar meta${label}? Se movera a la papelera para poder recuperarla.`,
+    );
+    if (!ok) return;
+
+    const nameKey = normalizeName(name);
+    const isUniqueName = savingNameLookup[nameKey] === saving.id;
+    const relatedTx =
+      updateTransaction && Array.isArray(transactions)
+        ? transactions.filter((tx) => {
+            if (!tx || tx.type !== 'gasto') return false;
+            if (tx.category !== SAVINGS_CATEGORY) return false;
+            const meta = tx.meta || {};
+            const metaId = String(meta.savingId || '').trim();
+            const metaName = normalizeName(meta.savingName || '');
+            const metaBudgetName = normalizeName(
+              meta.budgetSubcategoryName || '',
+            );
+            if (metaId) return metaId === saving.id;
+            if (!isUniqueName) return false;
+            return metaName === nameKey || metaBudgetName === nameKey;
+          })
+        : [];
+
+    if (relatedTx.length && updateTransaction) {
+      const wantsMigration = window.confirm(
+        `La meta${label} tiene ${relatedTx.length} movimiento${
+          relatedTx.length === 1 ? '' : 's'
+        } asociado${
+          relatedTx.length === 1 ? '' : 's'
+        }. ¿Deseas migrarlos a otra meta?`,
+      );
+      let targetSaving = null;
+      if (wantsMigration) {
+        const options = savings.filter((s) => s.id !== saving.id);
+        if (options.length === 0) {
+          const keepUnassigned = window.confirm(
+            'No hay otras metas para migrar. Los movimientos quedaran sin asignar. ¿Continuar?',
+          );
+          if (!keepUnassigned) return;
+        } else {
+          const list = options
+            .map((s, idx) => {
+              const baseName = s.name || 'Ahorro';
+              const labelName = s.targetDate
+                ? `${baseName} (${s.targetDate})`
+                : baseName;
+              return `${idx + 1}. ${labelName}`;
+            })
+            .join('\n');
+          const input = window.prompt(
+            `Meta destino (numero). Deja vacio para no migrar:\n${list}`,
+            '',
+          );
+          if (input === null) return;
+          const trimmed = String(input || '').trim();
+          if (trimmed) {
+            const index = Number(trimmed) - 1;
+            if (!Number.isInteger(index) || index < 0 || index >= options.length) {
+              alert('Opcion no valida.');
+              return;
+            }
+            targetSaving = options[index];
+          }
+        }
+      }
+
+      await Promise.all(
+        relatedTx.map((tx) => {
+          const nextMeta = { ...(tx.meta || {}) };
+          delete nextMeta.budgetSubcategoryIds;
+          delete nextMeta.budgetSubcategoryId;
+          delete nextMeta.budgetSubcategoryNames;
+          delete nextMeta.budgetSubcategoryName;
+          delete nextMeta.budgetSubcategoryAmounts;
+          delete nextMeta.budgetSubcategoryAllocations;
+          if (targetSaving) {
+            nextMeta.savingId = targetSaving.id;
+            nextMeta.savingName = targetSaving.name || '';
+            if (targetSaving.name) {
+              nextMeta.budgetSubcategoryName = targetSaving.name;
+            }
+          } else {
+            delete nextMeta.savingId;
+            delete nextMeta.savingName;
+          }
+          return updateTransaction(tx.id, { meta: nextMeta });
+        }),
+      );
+    }
+
+    await removeSaving(saving.id);
+  }
+
+  function handleFormChange(field, value) {
+    setForm((prev) => ({ ...prev, [field]: value }));
+  }
+
+  function resolveDueDate(planEntry, periodKey) {
+    if (planEntry?.dueDate) return planEntry.dueDate;
+    if (!periodKey) return '';
+    const { end } = getBudgetPeriod(periodKey, budgetCutDay);
+    const endDate = new Date(end + 'T00:00:00');
+    endDate.setDate(endDate.getDate() - 1);
+    return endDate.toISOString().slice(0, 10);
+  }
+
+  function planTooltip(saving, planEntry, periodKey) {
+    const planned = plannedForSavingPeriod(saving, periodKey, budgetCutDay);
+    const paid = saving.id ? paidForSavingPeriod(saving.id, periodKey) : 0;
+    const dueDate = resolveDueDate(planEntry, periodKey);
+    return `${saving.name || 'Ahorro'} | Planificado: ${planned} | Ahorrado: ${paid} | Fecha: ${dueDate || '-'}`;
+  }
+
+  function openPlanModal(saving, planEntry, defaultPeriodKey, fallbackPlanned) {
+    const basePeriodKey =
+      planEntry?.periodKey || defaultPeriodKey || monthKeyStr || monthKey();
+    const { end } = getBudgetPeriod(basePeriodKey, budgetCutDay);
+    const endDate = new Date(end + 'T00:00:00');
+    endDate.setDate(endDate.getDate() - 1);
+    const defaultDueDate =
+      planEntry?.dueDate || endDate.toISOString().slice(0, 10);
+    const plannedValue =
+      planEntry && planEntry.plannedAmount != null
+        ? String(planEntry.plannedAmount)
+        : fallbackPlanned && Number(fallbackPlanned) > 0
+          ? String(fallbackPlanned)
+          : '';
+
+    setPlanModal({
+      savingId: saving.id,
+      planId: planEntry?.id || null,
+      periodKey: basePeriodKey,
+      plannedAmount: plannedValue,
+      dueDate: defaultDueDate,
+    });
+  }
+
+  async function handleSavePlan(e) {
+    e.preventDefault();
+    if (!planModal || !updateSaving) return;
+
+    const { savingId, planId, periodKey, plannedAmount, dueDate } = planModal;
+    const saving = savings.find((s) => s.id === savingId);
+    if (!saving) {
+      setPlanModal(null);
+      return;
+    }
+
+    let schedule = ensureScheduleArray(saving.schedule);
+    if (!schedule.length) {
+      schedule = buildSavingSchedule({
+        goal: saving.goal,
+        saved: saving.saved,
+        targetDate: saving.targetDate,
+        createdAt: saving.createdAt,
+        budgetCutDay,
+        defaultPeriods: DEFAULT_PLAN_PERIODS,
+      });
+    }
+
+    const paidLinked = savingId ? paidForSavingPeriod(savingId, periodKey) : 0;
+    if (planId) {
+      const idx = schedule.findIndex((q) => q.id === planId);
+      if (idx !== -1) {
+        schedule[idx] = {
+          ...schedule[idx],
+          periodKey,
+          plannedAmount: toNumber(plannedAmount),
+          paidAmount: paidLinked,
+          dueDate,
+          status: computePlanStatus(plannedAmount, paidLinked),
+        };
+      } else {
+        schedule.push({
+          id: planId,
+          periodKey,
+          plannedAmount: toNumber(plannedAmount),
+          paidAmount: paidLinked,
+          dueDate,
+          status: computePlanStatus(plannedAmount, paidLinked),
+        });
+      }
+    } else {
+      const existingIdx = schedule.findIndex(
+        (q) => resolveSchedulePeriodKey(q, budgetCutDay) === periodKey,
+      );
+      if (existingIdx !== -1) {
+        schedule[existingIdx] = {
+          ...schedule[existingIdx],
+          periodKey,
+          plannedAmount: toNumber(plannedAmount),
+          paidAmount: paidLinked,
+          dueDate,
+          status: computePlanStatus(plannedAmount, paidLinked),
+        };
+      } else {
+        schedule.push({
+          id: `${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+          periodKey,
+          plannedAmount: toNumber(plannedAmount),
+          paidAmount: paidLinked,
+          dueDate,
+          status: computePlanStatus(plannedAmount, paidLinked),
+        });
+      }
+    }
+
+    await updateSaving(savingId, { schedule });
+    setPlanModal(null);
+  }
+  async function handleAddSaving(e) {
+    e.preventDefault();
+    const goal = toNumber(form.goal);
+    if (!goal || !addSaving) return;
+
+    const saved = toNumber(form.saved);
+    const createdAt = Date.now();
+    const targetDate = form.targetDate || '';
+    const schedule = buildSavingSchedule({
+      goal,
+      saved,
+      targetDate,
+      createdAt,
+      budgetCutDay,
+      defaultPeriods: DEFAULT_PLAN_PERIODS,
+    });
+
+    const payload = {
+      name: form.name || 'Ahorro',
+      goal,
+      saved,
+      targetDate,
+      createdAt,
+      schedule,
+    };
+
+    await addSaving(payload);
+    setForm({ name: '', goal: '', saved: '', targetDate: '' });
+  }
+
+  async function handleAddSavingFromModal(e) {
+    e.preventDefault();
+    const goal = toNumber(form.goal);
+    if (!goal || !addSaving) return;
+    await handleAddSaving(e);
+    setShowAddSavingModal(false);
+  }
+
+  function renderSavingForm({ onSubmit, dateInputType, submitLabel }) {
+    const datePlaceholder =
+      dateInputType === 'text'
+        ? 'Fecha meta (YYYY-MM-DD)'
+        : 'Fecha meta (opcional)';
+    return (
+      <form onSubmit={onSubmit} className="grid gap-3">
+        <input
+          className="border rounded-lg p-3 text-sm"
+          placeholder="Nombre (ej. Fondo de emergencia)"
+          value={form.name}
+          onChange={(e) => handleFormChange('name', e.target.value)}
+        />
+        <div className="grid grid-cols-2 gap-2">
+          <input
+            className="border rounded-lg p-3 text-sm"
+            type="number"
+            min={0}
+            step="1"
+            placeholder="Meta total"
+            value={form.goal}
+            onChange={(e) => handleFormChange('goal', e.target.value)}
+          />
+          <input
+            className="border rounded-lg p-3 text-sm"
+            type="number"
+            min={0}
+            step="1"
+            placeholder="Ahorro inicial (opcional)"
+            value={form.saved}
+            onChange={(e) => handleFormChange('saved', e.target.value)}
+          />
+        </div>
+        <input
+          className="border rounded-lg p-3 text-sm"
+          type={dateInputType}
+          placeholder={datePlaceholder}
+          value={form.targetDate}
+          onChange={(e) => handleFormChange('targetDate', e.target.value)}
+          inputMode={dateInputType === 'text' ? 'text' : undefined}
+        />
+        <button className="px-3 py-3 rounded-xl border bg-[color:var(--primary)] text-[color:var(--primary-contrast)] text-sm font-semibold">
+          {submitLabel}
+        </button>
+      </form>
+    );
+  }
+
+  function handleSaveSavingMeta(e) {
+    e.preventDefault();
+    if (!savingEditModal || !updateSaving) return;
+
+    const patch = {
+      name: (savingEditModal.name || '').trim() || 'Ahorro',
+      goal:
+        savingEditModal.goal !== undefined && savingEditModal.goal !== ''
+          ? Number(savingEditModal.goal)
+          : undefined,
+      targetDate: savingEditModal.targetDate || '',
+    };
+
+    updateSaving(savingEditModal.id, patch);
+    setSavingEditModal(null);
+  }
+
+  const summaryPlanned = totalSavingsPlannedForPeriod(
+    savings,
+    currentPeriodKey,
+    budgetCutDay,
+  );
+  const summaryPaid = totalSavingsPaidFromTransactions(
     transactions,
     currentPeriodKey,
     budgetCutDay,
   );
-  const pendingThisPeriod = Math.max(plannedThisPeriod - paidThisPeriod, 0);
+  const summaryPending = savings.reduce((sum, saving) => {
+    const schedule = ensureScheduleArray(saving.schedule);
+    if (!schedule.length) return sum;
+    const pending = schedule.reduce((acc, entry) => {
+      const planned = toNumber(entry.plannedAmount);
+      if (planned <= 0) return acc;
+      const periodKey = resolveSchedulePeriodKey(entry, budgetCutDay);
+      if (!periodKey || periodKey > currentPeriodKey) return acc;
+      const paid = saving.id ? paidForSavingPeriod(saving.id, periodKey) : 0;
+      const remaining = planned - paid;
+      return remaining > 0 ? acc + remaining : acc;
+    }, 0);
+    return sum + pending;
+  }, 0);
 
-  async function addSavingHandler(e) {
-    e.preventDefault();
-    if (!addSaving) return;
-    const s = {
-      name: form.name || 'Ahorro',
-      goal: toNumber(form.goal),
-      saved: toNumber(form.saved),
-      targetDate: form.targetDate || '',
-      createdAt: Date.now(),
-    };
-    await addSaving(s);
-    setForm({ name: '', goal: '', saved: '', targetDate: '' });
-  }
+  const plannedTotalsByPeriod = useMemo(() => {
+    const totals = {};
+    visiblePeriods.forEach((periodKey) => {
+      totals[periodKey] = totalSavingsPlannedForPeriod(
+        savings,
+        periodKey,
+        budgetCutDay,
+      );
+    });
+    return totals;
+  }, [savings, visiblePeriods, budgetCutDay]);
 
-  async function handleSaveEdit(e) {
-    e.preventDefault();
-    if (!savingEdit || !updateSaving) return;
-    const patch = {
-      name: savingEdit.name || 'Ahorro',
-      goal: toNumber(savingEdit.goal),
-      targetDate: savingEdit.targetDate || '',
-    };
-    await updateSaving(savingEdit.id, patch);
-    setSavingEdit(null);
-  }
+  const shouldHighlightPeriod = (periodKey) => {
+    if (periodKey !== currentPeriodKey) return false;
+    const plannedTotal = plannedTotalsByPeriod[periodKey] || 0;
+    return Math.abs(plannedTotal - summaryPlanned) < 0.5;
+  };
+
+  const todayStr = new Date().toISOString().slice(0, 10);
+
+  const paidInPeriodForModal =
+    planModal && planModal.periodKey
+      ? totalSavingsPaidFromTransactions(
+          transactions,
+          planModal.periodKey,
+          budgetCutDay,
+        )
+      : 0;
+
+  const linkedPaidForModal =
+    planModal && planModal.savingId
+      ? paidForSavingPeriod(planModal.savingId, planModal.periodKey)
+      : 0;
+
+  const plannedForModal = planModal ? toNumber(planModal.plannedAmount) : 0;
+  const isModalPlanPaid =
+    plannedForModal > 0 && linkedPaidForModal >= plannedForModal;
+
+  const visibleSavings = savings.filter((s) => {
+    if (!hideCompletedSavings) return true;
+    const goal = toNumber(s.goal);
+    if (!goal) return true;
+    const saved = totalSavedForSaving(s);
+    return saved < goal;
+  });
 
   return (
-    <div className="grid gap-4 lg:grid-cols-3">
-      {/* Columna izquierda: formulario */}
-      <Card className="h-full">
-        <SectionTitle>Nueva meta de ahorro</SectionTitle>
-        <form onSubmit={addSavingHandler} className="grid gap-3">
-          <input
-            className="border rounded-xl p-2"
-            placeholder="Nombre (ej. Fondo de emergencia)"
-            value={form.name}
-            onChange={(e) => setForm({ ...form, name: e.target.value })}
-          />
-          <input
-            className="border rounded-xl p-2"
-            type="number"
-            min={0}
-            step="1"
-            placeholder="Meta (CLP)"
-            value={form.goal}
-            onChange={(e) => setForm({ ...form, goal: e.target.value })}
-          />
-          <input
-            className="border rounded-xl p-2"
-            type="number"
-            min={0}
-            step="1"
-            placeholder="Ahorro inicial (CLP)"
-            value={form.saved}
-            onChange={(e) => setForm({ ...form, saved: e.target.value })}
-          />
-          <input
-            className="border rounded-xl p-2"
-            type="date"
-            placeholder="Fecha meta"
-            value={form.targetDate}
-            onChange={(e) => setForm({ ...form, targetDate: e.target.value })}
-          />
-          <button className="px-4 py-2 rounded-xl bg-gray-900 text-white hover:bg-gray-800">
-            Agregar meta
+    <>
+      <div className="md:hidden mb-4">
+        <button
+          type="button"
+          className="w-full px-4 py-3 rounded-xl border bg-[color:var(--primary)] text-[color:var(--primary-contrast)] text-sm font-semibold"
+          onClick={() => setShowAddSavingModal(true)}
+        >
+          Agregar Meta
+        </button>
+      </div>
+      <div className="grid gap-6 w-full lg:grid-cols-[minmax(0,320px)_minmax(0,1fr)]">
+        <Card className="p-5 hidden md:block">
+          <SectionTitle>Nueva meta de ahorro</SectionTitle>
+          {renderSavingForm({
+            onSubmit: handleAddSaving,
+            dateInputType: 'date',
+            submitLabel: 'Agregar meta',
+          })}
+        </Card>
+
+      <Card className="p-5 space-y-4">
+        <div className="flex items-center justify-between gap-3">
+          <SectionTitle>Calendario de ahorro</SectionTitle>
+          <button
+            type="button"
+            className="text-xs font-semibold px-3 py-1.5 rounded-full border border-[color:var(--border)] text-[color:var(--text)] hover:bg-[color:var(--surface-2)]"
+            onClick={() => setHideCompletedSavings((prev) => !prev)}
+          >
+            <span className="inline-flex items-center gap-2">
+              {hideCompletedSavings ? (
+                <svg
+                  className="h-4 w-4"
+                  viewBox="0 0 24 24"
+                  fill="none"
+                  stroke="currentColor"
+                  strokeWidth="2"
+                  strokeLinecap="round"
+                  strokeLinejoin="round"
+                  aria-hidden="true"
+                >
+                  <path d="M3 3l18 18" />
+                  <path d="M9.88 9.88A3 3 0 0 0 12 15a3 3 0 0 0 2.12-.88" />
+                  <path d="M5.88 5.88C4.1 7.24 2.75 9.2 2.036 11.678a1 1 0 0 0 0 .644C3.423 16.49 7.36 19.5 12 19.5c1.68 0 3.29-.41 4.72-1.14" />
+                  <path d="M10.73 5.08A10.95 10.95 0 0 1 12 4.5c4.639 0 8.576 3.01 9.964 7.178a1 1 0 0 1 0 .644 11.1 11.1 0 0 1-1.67 3.03" />
+                </svg>
+              ) : (
+                <svg
+                  className="h-4 w-4"
+                  viewBox="0 0 24 24"
+                  fill="none"
+                  stroke="currentColor"
+                  strokeWidth="2"
+                  strokeLinecap="round"
+                  strokeLinejoin="round"
+                  aria-hidden="true"
+                >
+                  <path d="M2.036 12.322a1 1 0 0 1 0-.644C3.423 7.51 7.36 4.5 12 4.5c4.638 0 8.576 3.01 9.964 7.178a1 1 0 0 1 0 .644C20.576 16.49 16.639 19.5 12 19.5c-4.638 0-8.576-3.01-9.964-7.178Z" />
+                  <path d="M15 12a3 3 0 1 1-6 0 3 3 0 0 1 6 0Z" />
+                </svg>
+              )}
+              <span>
+                {hideCompletedSavings ? 'Mostrar completados' : 'Ocultar completados'}
+              </span>
+            </span>
           </button>
-        </form>
-      </Card>
+        </div>
 
-      {/* Columna derecha: calendario / listado */}
-      <Card className="lg:col-span-2 space-y-3">
-        <SectionTitle>Calendario de ahorro</SectionTitle>
-
-        {/* KPIs */}
-        <div className="grid grid-cols-1 sm:grid-cols-3 gap-2 text-center text-sm">
-          <div className="border rounded-xl p-3 bg-white shadow-sm dark:bg-gray-800 dark:border-gray-700">
-            <div className="text-xs text-gray-500">Planificado</div>
+        <div className="grid grid-cols-3 gap-3">
+          <div className="border rounded-xl p-3 bg-[color:var(--surface-1)] shadow-sm  ">
+            <div className="text-xs text-[color:var(--text-muted)]">Planificado</div>
             <div className="text-lg font-semibold">
-              <Money n={plannedThisPeriod} />
+              <Money n={summaryPlanned} />
             </div>
           </div>
-          <div className="border rounded-xl p-3 bg-white shadow-sm dark:bg-gray-800 dark:border-gray-700">
-            <div className="text-xs text-gray-500">Ahorros (movimientos)</div>
+          <div className="border rounded-xl p-3 bg-[color:var(--surface-1)] shadow-sm  ">
+            <div className="text-xs text-[color:var(--text-muted)]">Ahorrado (movimientos)</div>
             <div className="text-lg font-semibold">
-              <Money n={paidThisPeriod} />
+              <Money n={summaryPaid} />
             </div>
           </div>
-          <div className="border rounded-xl p-3 bg-white shadow-sm dark:bg-gray-800 dark:border-gray-700">
-            <div className="text-xs text-gray-500">Pendiente</div>
+          <div className="border rounded-xl p-3 bg-[color:var(--surface-1)] shadow-sm  ">
+            <div className="text-xs text-[color:var(--text-muted)]">Pendiente</div>
             <div className="text-lg font-semibold">
-              <Money n={pendingThisPeriod} />
+              <Money n={summaryPending} />
             </div>
           </div>
         </div>
 
-        {/* Periodos */}
-        <div className="overflow-x-auto">
-          <div
-            className="grid text-[11px] font-semibold text-gray-700 border rounded-lg bg-gray-50 px-2 py-2 min-w-[520px] dark:bg-gray-800 dark:border-gray-700 dark:text-gray-200"
-            style={{
-              gridTemplateColumns: `160px repeat(${visiblePeriods.length}, minmax(90px, 1fr))`,
-            }}
-          >
-            <div
-              className="text-left px-2 cursor-help text-gray-700 dark:text-gray-200"
-              title="Ahorro: se planifica por fecha meta de la meta (no por cuotas de deudas)."
-            >
-              Periodos
+        {savings.length === 0 ? (
+          <div className="text-[color:var(--text-muted)]">Sin metas registradas.</div>
+        ) : (
+          <>
+            <div className="md:hidden space-y-3">
+              {visibleSavings.map((s) => {
+                const goal = toNumber(s.goal);
+                const saved = totalSavedForSaving(s);
+                const progress =
+                  goal > 0 ? (Math.min(saved, goal) / goal) * 100 : 0;
+                return (
+                  <div
+                    key={s.id || s.name + s.goal}
+                    className="rounded-xl border border-[color:var(--border)] bg-[color:var(--surface-1)] shadow-sm p-3"
+                  >
+                    <div className="flex items-center justify-between gap-2">
+                      <div className="font-semibold whitespace-normal break-words">
+                        {s.name || 'Ahorro'}
+                      </div>
+                      <div className="text-xs text-[color:var(--text-muted)]">
+                        {Math.round(progress)}%
+                      </div>
+                    </div>
+                    <div className="mt-2">
+                      <Progress value={progress} mode="good" />
+                    </div>
+                  </div>
+                );
+              })}
             </div>
-            {visiblePeriods.map((pk) => {
-              const isActual = pk === trueCurrentPeriod;
-              const isSelected = pk === currentPeriodKey;
-              return (
-                <div
-                  key={pk}
-                  onClick={() => setCurrentPeriodKey(pk)}
-                  className={`text-center px-2 py-1 rounded-lg border flex flex-col items-center justify-center gap-1 ${
-                    isActual
-                      ? 'bg-green-50 text-green-800 border-green-400 dark:bg-green-900/30 dark:text-green-200 dark:border-green-500'
-                      : 'border-transparent bg-white dark:bg-gray-800 dark:border-gray-700 dark:text-gray-200'
-                  } ${isSelected ? 'ring-1 ring-blue-400' : ''} cursor-pointer`}
-                >
-                  <span>{formatBudgetPeriodLabel(pk, budgetCutDay)}</span>
-                  {isSelected && (
-                    <span className="text-blue-500 text-[10px] leading-none">v</span>
-                  )}
-                </div>
-              );
+
+            <div className="hidden md:block overflow-visible">
+              <div className="overflow-x-hidden overflow-y-visible">
+                <table className="w-full text-sm border-collapse table-fixed min-w-0">
+                {[
+                  <thead key="head">
+                    <tr className="text-left text-xs text-[color:var(--text-muted)] border-b">
+                      <th className="px-1 py-2 sm:px-2 w-20 sm:w-32">
+                        Meta
+                      </th>
+                      <th className="hidden sm:table-cell px-1 py-2 sm:px-2 w-12 sm:w-16 text-center whitespace-normal break-words leading-tight">
+                        Meta total
+                      </th>
+                      <th className="hidden sm:table-cell px-1 py-2 sm:px-2 w-12 sm:w-16 text-center whitespace-normal break-words leading-tight">
+                        Ahorrado
+                      </th>
+                      <th className="hidden sm:table-cell px-1 py-2 sm:px-2 w-12 sm:w-16 text-center whitespace-normal break-words leading-tight">
+                        Restante
+                      </th>
+                      <th className="hidden md:table-cell px-1 py-2 sm:px-2 w-20 md:w-28 text-center">
+                        Progreso
+                      </th>
+                      {visiblePeriods.map((pk) => {
+                        const isCurrent = pk === trueCurrentPeriod;
+                        const plannedForHeader = plannedTotalsByPeriod[pk] || 0;
+                        const highlightColumn = shouldHighlightPeriod(pk);
+                        return (
+                          <th
+                            key={pk}
+                            className={`px-1 py-2 sm:px-2 text-center w-14 sm:w-20 ${
+                              highlightColumn ? 'bg-[color:var(--primary-muted)]/40' : ''
+                            }`}
+                          >
+                            <div className="flex flex-col items-center gap-1">
+                              <span className="text-[10px] leading-tight break-words text-[color:var(--text)]">
+                                <Money n={plannedForHeader} />
+                              </span>
+                              <span
+                                data-period-label="true"
+                                className={`inline-flex items-center justify-center px-1 py-0.5 rounded-md text-center whitespace-normal break-words leading-tight ${
+                                  isCurrent
+                                    ? 'bg-[color:var(--surface-2)] text-[color:var(--text)]'
+                                    : 'text-[color:var(--text-muted)]'
+                                }`}
+                              >
+                                {formatBudgetPeriodLabel(pk, budgetCutDay)}
+                              </span>
+                            </div>
+                          </th>
+                        );
+                      })}
+                      <th className="px-1 py-2 sm:px-2 text-right w-10 sm:w-12">
+                        Acciones
+                      </th>
+                    </tr>
+                  </thead>,
+                  <tbody key="body">
+                    {visibleSavings.map((s) => {
+                        const schedule = ensureScheduleArray(s.schedule);
+                        const goal = toNumber(s.goal);
+                        const saved = totalSavedForSaving(s);
+                        const remaining = Math.max(goal - saved, 0);
+                        const progress =
+                          goal > 0
+                            ? (Math.min(saved, goal) / goal) * 100
+                            : 0;
+
+                        return (
+                          <tr
+                            key={s.id || s.name + s.goal}
+                            className="border-b last:border-b-0"
+                          >
+                            <td className="px-1 py-2 sm:px-2 w-20 sm:w-32 font-semibold text-[color:var(--text)] whitespace-normal break-words">
+                              {s.name || 'Ahorro'}
+                            </td>
+                            <td className="hidden sm:table-cell px-1 py-2 sm:px-2 w-12 sm:w-16 text-center text-[color:var(--text)] break-words">
+                              <Money n={goal} />
+                            </td>
+                            <td className="hidden sm:table-cell px-1 py-2 sm:px-2 w-12 sm:w-16 text-center text-[color:var(--text)] break-words">
+                              <Money n={saved} />
+                            </td>
+                            <td className="hidden sm:table-cell px-1 py-2 sm:px-2 w-12 sm:w-16 text-center text-[color:var(--text)] break-words">
+                              <Money n={remaining} />
+                            </td>
+                            <td className="hidden md:table-cell px-1 py-2 sm:px-2 w-20 md:w-28 text-center">
+                              <div className="flex items-center justify-center gap-1">
+                                <div className="w-20">
+                                  <Progress value={progress} mode="good" />
+                                </div>
+                                <span className="text-[10px] text-[color:var(--text-muted)]">
+                                  {progress.toFixed(1)}%
+                                </span>
+                              </div>
+                            </td>
+                            {visiblePeriods.map((pk) => {
+                              const planned = plannedForSavingPeriod(
+                                s,
+                                pk,
+                                budgetCutDay,
+                              );
+                              const paid = s.id
+                                ? paidForSavingPeriod(s.id, pk)
+                                : 0;
+                              const planEntry = schedule.find(
+                                (q) =>
+                                  resolveSchedulePeriodKey(q, budgetCutDay) ===
+                                  pk,
+                              );
+                              const isEmpty = planned <= 0;
+                              const isPending = planned > 0 && paid < planned;
+                              const isPaid = planned > 0 && paid >= planned;
+                              const dueDate = resolveDueDate(planEntry, pk);
+                              const isOverdue =
+                                isPending && dueDate && dueDate < todayStr;
+                              const cellTone = isEmpty
+                                ? 'bg-[color:var(--surface-2)] border-[color:var(--border)]'
+                                : isPaid
+                                  ? 'bg-[color:var(--divider)] border-[color:var(--border)]'
+                                  : isOverdue
+                                    ? 'bg-[color:var(--danger)]/20 border-[color:var(--danger)]'
+                                    : 'bg-[color:var(--primary)]/20 border-[color:var(--primary)]';
+                              const textTone = isEmpty
+                                ? 'text-[color:var(--text-muted)]'
+                                : 'text-[color:var(--text)]';
+                              const highlightColumn = shouldHighlightPeriod(pk);
+                              return (
+                                <td
+                                  key={`${s.id}-${pk}`}
+                                  className={`px-1 py-2 sm:px-2 text-center w-14 sm:w-20 ${
+                                    highlightColumn ? 'bg-[color:var(--primary-muted)]/40' : ''
+                                  }`}
+                                >
+                                  <div
+                                    className={`flex items-center justify-center w-full rounded-md px-2 py-1.5 border ${cellTone}`}
+                                  >
+                                    {planned > 0 ? (
+                                      <button
+                                        type="button"
+                                        className={`w-full font-semibold break-words ${textTone} ${
+                                          isPaid
+                                            ? 'line-through decoration-2 hover:text-[color:var(--text)]'
+                                            : 'hover:text-[color:var(--text)]'
+                                        } tooltip-wide`}
+                                        onClick={() =>
+                                          openPlanModal(
+                                            s,
+                                            planEntry || null,
+                                            pk,
+                                            schedule.length ? null : planned,
+                                          )
+                                        }
+                                        data-tooltip={planTooltip(s, planEntry, pk)}
+                                      >
+                                        <Money n={planned} />
+                                      </button>
+                                    ) : (
+                                      <button
+                                        type="button"
+                                        className={`w-full ${textTone} hover:text-[color:var(--text-muted)]`}
+                                        data-tooltip="Agregar plan"
+                                        onClick={() =>
+                                          openPlanModal(s, null, pk, planned)
+                                        }
+                                      >
+                                        -
+                                      </button>
+                                    )}
+                                  </div>
+                                </td>
+                              );
+                            })}
+                            <td className="px-1 py-2 sm:px-2 w-10 sm:w-12 text-right">
+                              <div className="flex justify-end gap-3 text-xs">
+                                <button
+                                  className="text-[color:var(--text-muted)] hover:text-[color:var(--text)]"
+                                  aria-label="Editar meta"
+                                  data-tooltip="Editar meta"
+                                  onClick={() =>
+                                    setSavingEditModal({
+                                      id: s.id,
+                                      name: s.name || '',
+                                      goal: s.goal != null ? String(s.goal) : '',
+                                      targetDate: s.targetDate || '',
+                                    })
+                                  }
+                                >
+                                  <svg
+                                    className="h-5 w-5"
+                                    viewBox="0 0 24 24"
+                                    fill="none"
+                                    stroke="currentColor"
+                                    strokeWidth="2"
+                                    strokeLinecap="round"
+                                    strokeLinejoin="round"
+                                    aria-hidden="true"
+                                  >
+                                    <path d="M16.862 4.487a1.5 1.5 0 1 1 2.121 2.121L7.5 18.09l-4.5.9.9-4.5 12.962-12.003z" />
+                                  </svg>
+                                </button>
+                                <button
+                                  className="text-[color:var(--text-muted)] hover:text-[color:var(--text)]"
+                                  aria-label="Eliminar meta"
+                                  data-tooltip="Eliminar meta"
+                                  onClick={() => handleRemoveSaving(s)}
+                                >
+                                  <svg
+                                    className="h-5 w-5"
+                                    viewBox="0 0 24 24"
+                                    fill="none"
+                                    stroke="currentColor"
+                                    strokeWidth="2"
+                                    strokeLinecap="round"
+                                    strokeLinejoin="round"
+                                    aria-hidden="true"
+                                  >
+                                    <path d="M3 6h18" />
+                                    <path d="M8 6V4h8v2" />
+                                    <path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6" />
+                                    <path d="M10 11v6" />
+                                    <path d="M14 11v6" />
+                                  </svg>
+                                </button>
+                              </div>
+                            </td>
+                          </tr>
+                        );
+                      })}
+                  </tbody>,
+                ]}
+              </table>
+            </div>
+          </div>
+          </>
+        )}
+      </Card>
+      </div>
+      {showAddSavingModal && (
+        <div className="fixed inset-0 z-40 flex items-start justify-center bg-black/40 backdrop-blur-sm pt-16 px-4">
+          <div className="bg-[color:var(--surface-1)] rounded-2xl shadow-[var(--shadow)] p-5 w-full max-w-md">
+            <div className="flex items-center justify-between mb-4">
+              <h3 className="text-lg font-semibold">Agregar meta</h3>
+              <button
+                type="button"
+                className="text-sm text-[color:var(--text-muted)] hover:text-[color:var(--text)]"
+                onClick={() => setShowAddSavingModal(false)}
+              >
+                Cerrar
+              </button>
+            </div>
+            {renderSavingForm({
+              onSubmit: handleAddSavingFromModal,
+              dateInputType: 'text',
+              submitLabel: 'Agregar meta',
             })}
           </div>
         </div>
-
-        {/* Metas */}
-        <div className="space-y-3">
-          {savings.map((s) => {
-            const pct = s.goal > 0 ? (toNumber(s.saved) / toNumber(s.goal)) * 100 : 0;
-            const { plan: planPerPeriod, targetPk, monthsLeft } = perPeriodPlanForSaving(
-              s,
-              currentPeriodKey,
-              budgetCutDay,
-            );
-            return (
-              <div
-                key={s.id || s.name + s.goal}
-                className="rounded-xl border shadow-sm p-2 space-y-2 bg-white dark:bg-gray-800 dark:border-gray-700"
-              >
-                <div className="pt-2 overflow-x-auto">
-                  <div
-                    className="grid text-[11px] items-center gap-2 min-w-[520px]"
-                    style={{
-                      gridTemplateColumns: `160px repeat(${visiblePeriods.length}, minmax(90px, 1fr))`,
-                    }}
-                  >
-                    <div className="text-base font-semibold text-gray-800 dark:text-gray-200 px-2">
-                      {s.name || 'Ahorro'}
-                    </div>
-                    {visiblePeriods.map((pk) => {
-                      const planned = pk <= targetPk ? planPerPeriod : 0;
-                      const paid = savingsPaidFromTransactions(
-                        transactions,
-                        pk,
-                        budgetCutDay,
-                      );
-                      return (
-                        <div
-                          key={pk}
-                          className="h-10 min-w-[60px] px-2 flex flex-col justify-center border rounded-md bg-gray-50 text-center dark:bg-gray-800 dark:border-gray-700"
-                        >
-                          <span className="text-[10px] font-semibold">
-                            <Money n={planned} />
-                          </span>
-                          <span className="text-[9px] text-gray-500">
-                            Pagado: <Money n={paid} />
-                          </span>
-                        </div>
-                      );
-                    })}
-                  </div>
-                  <div className="text-[10px] text-gray-500 mt-1">
-                    Plan por periodo estimado para alcanzar la meta.
-                  </div>
-                </div>
-
-                <div className="mt-2">
-                  <Progress value={pct} mode="good" />
-                  <div className="text-[11px] text-gray-600 mt-1 text-right">
-                    Meta: {s.targetDate ? `hasta ${s.targetDate} (${monthsLeft || 0} periodos)` : 'sin fecha definida'}
-                    {' · '}Ahorrado: <Money n={s.saved} /> / Meta: <Money n={s.goal} />
-                  </div>
-                </div>
-
-                <div className="flex flex-col md:flex-row items-center gap-2">
-                  <button
-                    className="px-4 py-2 rounded-xl border bg-white hover:bg-gray-50 dark:bg-gray-800 dark:text-gray-100 dark:border-gray-700"
-                    onClick={() =>
-                      setSavingEdit({
-                        id: s.id,
-                        name: s.name,
-                        goal: s.goal,
-                        targetDate: s.targetDate || '',
-                      })
-                    }
-                  >
-                    Editar
-                  </button>
-                  <button
-                    className="ml-auto text-red-600 text-sm px-3 py-2 rounded-lg border border-red-500 hover:bg-red-50 dark:hover:bg-red-900/10"
-                    onClick={() => removeSaving && removeSaving(s.id)}
-                  >
-                    Eliminar
-                  </button>
-                </div>
-              </div>
-            );
-          })}
-          {savings.length === 0 && (
-            <div className="text-gray-500">Sin metas registradas.</div>
-          )}
-        </div>
-
-        {/* Resumen general */}
-        <div className="grid grid-cols-3 gap-2 text-xs text-gray-600 pt-2">
-          <div className="border rounded-lg p-2 bg-gray-50 text-center">
-            Meta total: <Money n={totals.goal} />
-          </div>
-          <div className="border rounded-lg p-2 bg-gray-50 text-center">
-            Ahorrado: <Money n={totals.saved} />
-          </div>
-          <div className="border rounded-lg p-2 bg-gray-50 text-center">
-            Restante: <Money n={totalRemaining} />
-          </div>
-        </div>
-      </Card>
-
-      {savingEdit && (
-        <div className="fixed inset-0 z-40 bg-black/40 flex items-start justify-center pt-16 px-4">
-          <div className="bg-white dark:bg-gray-900 rounded-2xl shadow-xl p-5 w-full max-w-md">
+      )}
+      {planModal && (
+        <div className="fixed inset-0 z-30 flex items-start justify-center bg-black/30 pt-16">
+          <div className="bg-[color:var(--surface-1)] rounded-2xl shadow-xl p-5 w-full max-w-md">
             <div className="flex items-center justify-between mb-3">
-              <h3 className="text-lg font-semibold">Editar meta</h3>
+              <h3 className="text-lg font-semibold">
+                {planModal.planId ? 'Editar aporte' : 'Nuevo aporte'}
+              </h3>
               <button
                 type="button"
-                className="text-sm text-gray-500 hover:text-gray-800 dark:text-gray-300 dark:hover:text-white"
-                onClick={() => setSavingEdit(null)}
+                className="text-sm text-[color:var(--text-muted)] hover:text-[color:var(--text)]"
+                onClick={() => setPlanModal(null)}
               >
                 x
               </button>
             </div>
-            <form onSubmit={handleSaveEdit} className="grid gap-3 text-sm">
+
+            <form onSubmit={handleSavePlan} className="grid gap-3 text-sm">
               <div className="grid gap-1">
-                <label>Nombre</label>
-                <input
-                  className="border rounded-lg p-2 bg-white dark:bg-gray-800"
-                  value={savingEdit.name}
+                <label>Periodo</label>
+                <select
+                  className="border rounded-lg p-2"
+                  value={planModal.periodKey}
                   onChange={(e) =>
-                    setSavingEdit((prev) => ({ ...prev, name: e.target.value }))
+                    setPlanModal((prev) => ({
+                      ...prev,
+                      periodKey: e.target.value,
+                    }))
                   }
-                  required
-                />
+                >
+                  {visiblePeriods.map((pk) => (
+                    <option key={pk} value={pk}>
+                      {formatBudgetPeriodLabel(pk, budgetCutDay)}
+                    </option>
+                  ))}
+                </select>
               </div>
+
               <div className="grid gap-1">
-                <label>Meta</label>
+                <label>Monto planificado</label>
                 <input
                   type="number"
                   min={0}
                   step="1"
-                  className="border rounded-lg p-2 bg-white dark:bg-gray-800"
-                  value={savingEdit.goal}
+                  className="border rounded-lg p-2"
+                  value={planModal.plannedAmount}
                   onChange={(e) =>
-                    setSavingEdit((prev) => ({ ...prev, goal: e.target.value }))
+                    setPlanModal((prev) => ({
+                      ...prev,
+                      plannedAmount: e.target.value,
+                    }))
                   }
                   required
                 />
               </div>
+
               <div className="grid gap-1">
-                <label>Fecha meta</label>
+                <label>Ahorrado (desde Movimientos)</label>
+                <div className="border rounded-lg p-2 bg-[color:var(--surface-2)]  text-right">
+                  <Money n={paidInPeriodForModal} />
+                </div>
+                <p className="text-xs text-[color:var(--text-muted)]">
+                  El monto real proviene de las transacciones con categoria{' '}
+                  {`"${SAVINGS_CATEGORY}"`} en el periodo.
+                </p>
+              </div>
+
+              {planModal.savingId && (
+                <div className="grid gap-1">
+                  <label>Ahorrado vinculado a esta meta</label>
+                  <div className="border rounded-lg p-2 bg-[color:var(--surface-2)]  text-right">
+                    <Money n={linkedPaidForModal} />
+                  </div>
+                  <div
+                    className={`text-xs font-semibold ${
+                      isModalPlanPaid ? 'text-[color:var(--success)]' : 'text-[color:var(--warning)]'
+                    }`}
+                  >
+                    {isModalPlanPaid ? 'Cumplido' : 'Pendiente por ahorrar'}
+                  </div>
+                </div>
+              )}
+
+              <div className="grid gap-1">
+                <label>Fecha de aporte (opcional)</label>
                 <input
                   type="date"
-                  className="border rounded-lg p-2 bg-white dark:bg-gray-800"
-                  value={savingEdit.targetDate}
+                  className="border rounded-lg p-2"
+                  value={planModal.dueDate}
                   onChange={(e) =>
-                    setSavingEdit((prev) => ({
+                    setPlanModal((prev) => ({
                       ...prev,
-                      targetDate: e.target.value,
+                      dueDate: e.target.value,
                     }))
                   }
                 />
               </div>
-              <div className="flex justify-end gap-2">
+
+              <div className="flex justify-end gap-2 mt-2">
                 <button
                   type="button"
-                  className="px-4 py-2 rounded-lg border text-gray-700 hover:bg-gray-50 dark:text-gray-200 dark:border-gray-700 dark:hover:bg-gray-800"
-                  onClick={() => setSavingEdit(null)}
+                  className="px-3 py-1.5 text-sm border rounded-lg"
+                  onClick={() => setPlanModal(null)}
                 >
                   Cancelar
                 </button>
                 <button
                   type="submit"
-                  className="px-4 py-2 rounded-lg bg-gray-900 text-white hover:bg-gray-800 dark:bg-gray-100 dark:text-gray-900 dark:hover:bg-white"
+                  className="px-3 py-1.5 text-sm border rounded-lg bg-[color:var(--primary)] text-[color:var(--primary-contrast)]"
                 >
-                  Guardar
+                  Guardar plan
                 </button>
               </div>
             </form>
           </div>
         </div>
       )}
-    </div>
+
+      {savingEditModal && (
+        <div className="fixed inset-0 z-30 flex items-start justify-center bg-black/30 pt-16">
+          <div className="bg-[color:var(--surface-1)] rounded-2xl shadow-xl p-5 w-full max-w-md">
+            <div className="flex items-center justify-between mb-3">
+              <h3 className="text-lg font-semibold">Editar meta</h3>
+              <button
+                type="button"
+                className="text-sm text-[color:var(--text-muted)] hover:text-[color:var(--text)]"
+                onClick={() => setSavingEditModal(null)}
+              >
+                x
+              </button>
+            </div>
+
+            <form onSubmit={handleSaveSavingMeta} className="grid gap-3 text-sm">
+              <div className="grid gap-1">
+                <label>Nombre</label>
+                <input
+                  className="border rounded-lg p-2"
+                  value={savingEditModal.name}
+                  onChange={(e) =>
+                    setSavingEditModal((prev) => ({
+                      ...prev,
+                      name: e.target.value,
+                    }))
+                  }
+                />
+              </div>
+
+              <div className="grid gap-1">
+                <label>Meta total</label>
+                <input
+                  type="number"
+                  min={0}
+                  step="1"
+                  className="border rounded-lg p-2"
+                  value={savingEditModal.goal}
+                  onChange={(e) =>
+                    setSavingEditModal((prev) => ({
+                      ...prev,
+                      goal: e.target.value,
+                    }))
+                  }
+                />
+              </div>
+
+              <div className="grid gap-1">
+                <label>Fecha meta (opcional)</label>
+                <input
+                  type="date"
+                  className="border rounded-lg p-2"
+                  value={savingEditModal.targetDate}
+                  onChange={(e) =>
+                    setSavingEditModal((prev) => ({
+                      ...prev,
+                      targetDate: e.target.value,
+                    }))
+                  }
+                />
+              </div>
+
+              <div className="flex justify-end gap-2 mt-2">
+                <button
+                  type="button"
+                  className="px-3 py-1.5 text-sm border rounded-lg"
+                  onClick={() => setSavingEditModal(null)}
+                >
+                  Cancelar
+                </button>
+                <button
+                  type="submit"
+                  className="px-3 py-1.5 text-sm border rounded-lg bg-[color:var(--primary)] text-[color:var(--primary-contrast)]"
+                >
+                  Guardar cambios
+                </button>
+              </div>
+            </form>
+          </div>
+        </div>
+      )}
+    </>
   );
 }
+
+
+
+

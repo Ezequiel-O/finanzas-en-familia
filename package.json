@@ -7,12 +7,18 @@
     "dev": "vite",
     "build": "vite build",
     "lint": "eslint .",
-    "preview": "vite preview"
+    "preview": "vite preview",
+    "migrate:fix-encoding": "node scripts/firestore-fix-encoding.mjs"
   },
   "dependencies": {
+    "date-fns": "^4.1.0",
+    "fflate": "^0.8.2",
     "firebase": "^10.14.1",
+    "firebase-admin": "^13.6.0",
     "react": "^19.1.1",
-    "react-dom": "^19.1.1"
+    "react-date-range": "^2.0.1",
+    "react-dom": "^19.1.1",
+    "xlsx": "^0.18.5"
   },
   "devDependencies": {
     "@eslint/js": "^9.32.0",

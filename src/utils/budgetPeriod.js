@@ -47,7 +47,7 @@ export function formatBudgetPeriodLabel(monthKeyStr, cutDay = 1) {
       })
       .replace('.', '');
 
-  return `${fmt(startDate)} al ${fmt(endExclusive)}`;
+  return `${fmt(startDate)}/${fmt(endExclusive)}`;
 }
 
 // Dado un día y el día de corte, devuelve el "mes de presupuesto"
@@ -62,4 +62,36 @@ export function budgetMonthKeyForDate(dateStr, cutDay = 1) {
 
   const base = new Date(d.getFullYear(), d.getMonth() + offset, 1);
   return monthKey(base);
+}
+
+export function dateKeyFromValue(value) {
+  if (!value) return '';
+  if (value instanceof Date) {
+    if (Number.isNaN(value.getTime())) return '';
+    return value.toISOString().slice(0, 10);
+  }
+  if (typeof value === 'number') {
+    const d = new Date(value);
+    if (Number.isNaN(d.getTime())) return '';
+    return d.toISOString().slice(0, 10);
+  }
+  if (typeof value === 'object') {
+    if (typeof value.toDate === 'function') {
+      const d = value.toDate();
+      if (!d || Number.isNaN(d.getTime())) return '';
+      return d.toISOString().slice(0, 10);
+    }
+    if (typeof value.seconds === 'number') {
+      const d = new Date(value.seconds * 1000);
+      if (Number.isNaN(d.getTime())) return '';
+      return d.toISOString().slice(0, 10);
+    }
+  }
+  const raw = String(value || '').trim();
+  if (!raw) return '';
+  const match = raw.match(/^\d{4}-\d{2}-\d{2}/);
+  if (match) return match[0];
+  const d = new Date(raw);
+  if (Number.isNaN(d.getTime())) return '';
+  return d.toISOString().slice(0, 10);
 }

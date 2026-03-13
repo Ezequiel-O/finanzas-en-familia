@@ -1,30 +1,39 @@
 // src/components/ui/Progress.jsx
 
-export function Progress({ value, mode = 'risk' }) {
+export function Progress({
+  value,
+  mode = 'risk',
+  danger = false,
+  success = false,
+}) {
   const raw = Number.isFinite(Number(value)) ? Number(value) : 0;
   const v = Math.max(0, raw);
   const width = Math.min(100, v);
 
-  let color = 'bg-green-600';
+  let color = 'bg-[color:var(--primary)]';
 
-  if (mode === 'good') {
-    // Bueno cuando el porcentaje es ALTO (deudas pagadas, ahorro, ROI)
-    if (v >= 90) color = 'bg-green-600';
-    else if (v >= 60) color = 'bg-amber-500';
-    else color = 'bg-red-500';
+  if (mode === 'flat') {
+    if (danger) color = 'bg-[color:var(--danger)]';
+    else if (success) color = 'bg-[color:var(--success)]';
+    else color = 'bg-[color:var(--primary)]';
+  } else if (mode === 'good') {
+    // Verde solo cuando se cumple la meta.
+    if (v >= 100) color = 'bg-[color:var(--success)]';
+    else color = 'bg-[color:var(--primary)]';
   } else {
-    // Riesgo: rojo solo si te pasas del 100%
-    if (v > 100) color = 'bg-red-500';
-    else if (v >= 90) color = 'bg-amber-500';
-    else color = 'bg-green-600';
+    // Riesgo: warning cerca del limite, rojo si se pasa.
+    if (v > 100) color = 'bg-[color:var(--danger)]';
+    else if (v >= 80) color = 'bg-[color:var(--warning)]';
+    else color = 'bg-[color:var(--primary)]';
   }
 
   return (
-    <div className="w-full h-3 rounded-full bg-gray-200">
+    <div className="w-full h-3 rounded-full bg-[color:var(--divider)]">
       <div
         className={`h-3 rounded-full ${color}`}
         style={{ width: `${width}%` }}
-        title={`${v.toFixed(0)}%`}
+        data-tooltip={`${v.toFixed(0)}%`}
+        aria-label={`${v.toFixed(0)}%`}
       />
     </div>
   );
