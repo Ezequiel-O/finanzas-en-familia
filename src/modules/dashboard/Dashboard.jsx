@@ -1,24 +1,24 @@
 // src/modules/dashboard/Dashboard.jsx
-import { Card } from '../../components/ui/card.jsx';
+import { categorySpent, periodLedger } from '../../domain/ledger.js';
+import { plannedForSavingPeriod } from '../../domain/commitments.js';
+import { annualSummary } from '../../domain/annualSummary.js';
+import { useState } from 'react';
+import { Card } from '../../components/ui/Card.jsx';
 import { SectionTitle } from '../../components/ui/SectionTitle.jsx';
-import { Money } from '../../components/ui/money.jsx';
+import { Money } from '../../components/ui/Money.jsx';
 import { Progress } from '../../components/ui/Progress.jsx';
-import { CATEGORIES, DEBT_CATEGORY } from '../../constants.js';
-import { filterTransactionsByPeriodAndUser } from '../../utils/transactions.js';
+import { CATEGORIES, DEBT_CATEGORY, SAVINGS_CATEGORY } from '../../constants.js';
 import {
-  budgetMonthKeyForDate,
-  dateKeyFromValue,
-  shiftMonth,
-} from '../../utils/budgetPeriod.js';
+  buildDebtPaidIndex,
+  debtProgress as getDebtProgress,
+} from '../../domain/commitments.js';
+import { filterTransactionsByPeriodAndUser } from '../../utils/transactions.js';
 import {
   getFixedCarryoverForSubcategory,
   resolveFixedCategory,
 } from '../../utils/fixedBudgets.js';
 import { getSubcategoryAllocationsForTransaction } from '../../utils/subcategoryAllocations.js';
 
-const SAVINGS_CATEGORY = 'Ahorro';
-const DEFAULT_SAVINGS_PERIODS = 3;
-const MS_PER_DAY = 24 * 60 * 60 * 1000;
 const SHORT_MONTHS = [
   'Ene',
   'Feb',
@@ -33,12 +33,6 @@ const SHORT_MONTHS = [
   'Nov',
   'Dic',
 ];
-
-// Helper: extract year from a budget month key "YYYY-MM"
-function yearFromMonthKey(mk) {
-  const y = Number((mk || '').split('-')[0]);
-  return Number.isNaN(y) ? new Date().getFullYear() : y;
-}
 
 function shortMonthLabelFromKey(mk) {
   const [yStr, mStr] = (mk || '').split('-');
@@ -161,95 +155,12 @@ function plannedDebtsForPeriod(debts, periodKey) {
     .reduce((s, q) => s + Number(q.plannedAmount || 0), 0);
 }
 
-function savingStartPeriodKey(s, cutDay) {
-  const dateKey = dateKeyFromValue(s?.createdAt);
-  return dateKey ? budgetMonthKeyForDate(dateKey, cutDay) : '';
-}
-
-function periodsBetween(startPk, endPk) {
-  if (!startPk || !endPk) return 0;
-  let count = 1;
-  let cursor = startPk;
-  while (cursor < endPk && count < 120) {
-    cursor = shiftMonth(cursor, 1);
-    count += 1;
-  }
-  return count;
-}
-
-function planForSavingLegacy(s, periodKey, cutDay) {
-  if (!periodKey) return { plan: 0, targetPk: '' };
-  const rawStartPk = savingStartPeriodKey(s, cutDay);
-  const startPk = rawStartPk || periodKey;
-  const periods = Math.max(1, Number(DEFAULT_SAVINGS_PERIODS) || 1);
-  const targetPk = s?.targetDate
-    ? budgetMonthKeyForDate(s.targetDate, cutDay)
-    : shiftMonth(startPk, periods - 1);
-
-  const normalizedTarget =
-    targetPk && rawStartPk && rawStartPk > targetPk ? rawStartPk : targetPk;
-
-  if (rawStartPk && periodKey < rawStartPk) {
-    return { plan: 0, targetPk: normalizedTarget };
-  }
-
-  const goal = Number(s.goal || 0);
-  const saved = Number(s.saved || 0);
-  const remaining = Math.max(goal - saved, 0);
-  if (remaining <= 0 || (normalizedTarget && periodKey > normalizedTarget)) {
-    return { plan: 0, targetPk: normalizedTarget };
-  }
-
-  const scheduleStartPk = rawStartPk || periodKey;
-  if (periodKey < scheduleStartPk) {
-    return { plan: 0, targetPk: normalizedTarget };
-  }
-  const totalPeriods = periodsBetween(
-    scheduleStartPk,
-    normalizedTarget || scheduleStartPk,
-  );
-  const basePlan =
-    totalPeriods > 0 ? Math.floor(remaining / totalPeriods) : remaining;
-  const delta = remaining - basePlan * totalPeriods;
-  const plan = periodKey === normalizedTarget ? basePlan + delta : basePlan;
-  return { plan, targetPk: normalizedTarget };
-}
-
-function resolveSchedulePeriodKey(entry, cutDay) {
-  if (entry?.periodKey) return entry.periodKey;
-  if (entry?.dueDate) {
-    return budgetMonthKeyForDate(entry.dueDate, cutDay);
-  }
-  return '';
-}
-
-function plannedForSavingPeriod(s, periodKey, cutDay) {
-  if (!periodKey) return 0;
-  const schedule = Array.isArray(s?.schedule) ? s.schedule : [];
-  if (schedule.length) {
-    return schedule
-      .filter((q) => resolveSchedulePeriodKey(q, cutDay) === periodKey)
-      .reduce((sum, q) => sum + Number(q.plannedAmount || 0), 0);
-  }
-  const { plan, targetPk } = planForSavingLegacy(s, periodKey, cutDay);
-  if (!targetPk || periodKey > targetPk) return 0;
-  return plan;
-}
-
 function plannedSavingsForPeriod(savings, periodKey, cutDay) {
   if (!periodKey) return 0;
   return (savings || []).reduce(
     (sum, s) => sum + plannedForSavingPeriod(s, periodKey, cutDay),
     0,
   );
-}
-
-const CLP_FORMATTER = new Intl.NumberFormat('es-CL');
-function formatCLP(value) {
-  const safe = Number(value || 0);
-  const abs = Math.abs(safe);
-  const formatted = CLP_FORMATTER.format(Math.round(abs));
-  return `${safe < 0 ? '-' : ''}$${formatted}`;
 }
 
 export function Dashboard({ data, monthKeyStr }) {
@@ -264,6 +175,7 @@ export function Dashboard({ data, monthKeyStr }) {
     budgetCutDay = 1,
     activeUserPreferences,
   } = data || {};
+  const [showAnnualMobile, setShowAnnualMobile] = useState(false);
 
   const mk = monthKeyStr;
   const currentYear =
@@ -278,15 +190,14 @@ export function Dashboard({ data, monthKeyStr }) {
     false,
   );
 
-  const totalIngresos = monthTx
-    .filter((t) => t.type === 'ingreso')
-    .reduce((a, b) => a + Number(b.amount || 0), 0);
-
-  const totalGastos = monthTx
-    .filter((t) => t.type === 'gasto')
-    .reduce((a, b) => a + Number(b.amount || 0), 0);
-
-  const balance = totalIngresos - totalGastos;
+  // Mismo libro que Plan del mes y Movimientos (base caja): ingresos sin ajustes ni
+  // retiros de ahorro; salidas separadas en consumo, cuotas y ahorro.
+  const ledger = periodLedger({ transactions, periodKey: mk, cutDay: budgetCutDay, debts });
+  const totalIngresos = ledger.income;
+  const totalConsumo = ledger.consumptionNet;
+  const totalGastos = ledger.outflows - ledger.refunds;
+  const flujoMes = ledger.netCashFlow;
+  const balance = ledger.closing;
 
   const cats = categories && categories.length ? categories : CATEGORIES;
   const catsWithSavings = cats.includes(SAVINGS_CATEGORY)
@@ -305,9 +216,8 @@ export function Dashboard({ data, monthKeyStr }) {
         ? plannedSavingsForPeriod(savings, mk, budgetCutDay)
         : 0;
 
-    const spent = monthTx
-      .filter((t) => t.type === 'gasto' && t.category === c)
-      .reduce((a, b) => a + Number(b.amount || 0), 0);
+    // Gastos menos reembolsos de la categoría (misma fórmula en todas las pantallas).
+    const spent = categorySpent(monthTx, c);
 
     const b = budgets?.[c];
     let plan = 0;
@@ -361,14 +271,20 @@ export function Dashboard({ data, monthKeyStr }) {
   const pctIngresosVsGastos =
     totalIngresos > 0 ? (totalGastos / totalIngresos) * 100 : 0;
 
-  const debtTotals = debts.reduce(
-    (acc, d) => {
-      acc.original += Number(d.original || 0);
-      acc.remaining += Number(d.remaining || 0);
-      return acc;
-    },
-    { original: 0, remaining: 0 },
-  );
+  // Saldo real calculado desde los pagos registrados (no desde el campo guardado `remaining`,
+  // que queda desactualizado si se edita o borra un movimiento). Excluye suscripciones y archivadas.
+  const debtPaidIndex = buildDebtPaidIndex(transactions);
+  const debtTotals = debts
+    .filter((d) => d && !d.archived && !d.isSubscription)
+    .reduce(
+      (acc, d) => {
+        const p = getDebtProgress(d, debtPaidIndex);
+        acc.original += p.total;
+        acc.remaining += p.remaining;
+        return acc;
+      },
+      { original: 0, remaining: 0 },
+    );
 
   const debtProgress =
     debtTotals.original > 0
@@ -408,7 +324,9 @@ export function Dashboard({ data, monthKeyStr }) {
         savingId = nameKey ? savingsNameLookup[nameKey] : '';
       }
       if (!savingId) return;
-      map.set(savingId, (map.get(savingId) || 0) + amt);
+      // Aporte suma, retiro (ingreso) resta.
+      const signed = t.type === 'ingreso' ? -amt : amt;
+      map.set(savingId, (map.get(savingId) || 0) + signed);
     });
     return map;
   })();
@@ -700,243 +618,18 @@ export function Dashboard({ data, monthKeyStr }) {
     return { rows, periods };
   })();
 
-  // === Resumen anual ===
-  function txPeriodMonthKey(tx) {
-    const dateStr = (tx.date || tx.createdAt || '').slice(0, 10);
-    return budgetMonthKeyForDate(dateStr, budgetCutDay);
-  }
-
-  const txWithYear = transactions.map((t) => {
-    const mkTx = txPeriodMonthKey(t);
-    return { ...t, __mk: mkTx, __year: yearFromMonthKey(mkTx) };
+  // === Resumen anual (por periodos de presupuesto) ===
+  const annual = annualSummary({
+    year: currentYear,
+    categories: cats.includes(SAVINGS_CATEGORY) ? cats : [...cats, SAVINGS_CATEGORY],
+    budgetsAll,
+    transactions,
+    debts,
+    savings,
+    cutDay: budgetCutDay,
+    fixedCategories,
   });
-
-  const txCurrentYear = txWithYear.filter((t) => t.__year === currentYear);
-
-  const sumBudgetForMonth = (mkKey) => {
-    const catsMap = hasMonthlyBudgets
-      ? budgetsAll?.[mkKey] || {}
-      : budgetsAll || budgets || {};
-    return Object.entries(catsMap).reduce((s, [cat, entry]) => {
-      const isMainCategory =
-        categories.includes(cat) ||
-        cat === DEBT_CATEGORY ||
-        cat === SAVINGS_CATEGORY;
-      if (!isMainCategory) return s;
-      const norm = normalizeBudgetEntry(entry);
-      let val = Number(norm.funded || norm.plan || 0);
-      if ((!val || val === 0) && cat === DEBT_CATEGORY) {
-        val = plannedDebtsForPeriod(debts, mkKey);
-      }
-      if ((!val || val === 0) && cat === SAVINGS_CATEGORY) {
-        val = plannedSavingsForPeriod(savings, mkKey, budgetCutDay);
-      }
-      return s + val;
-    }, 0);
-  };
-
-  // Presupuesto anual: suma de funded (o plan) por categoria en los 12 meses del anio
-  const budgetTotalYear = Object.entries(budgetsAll || {}).reduce(
-    (sumYear, [mkKey]) => {
-      if (yearFromMonthKey(mkKey) !== currentYear) return sumYear;
-      return sumYear + sumBudgetForMonth(mkKey);
-    },
-    0,
-  );
-
-  const annualProjection = (() => {
-    const yearStart = new Date(currentYear, 0, 1);
-    const yearEnd = new Date(currentYear + 1, 0, 1);
-    const totalDays = Math.max(
-      0,
-      Math.round((yearEnd - yearStart) / MS_PER_DAY),
-    );
-    if (!totalDays) return null;
-
-    const dailySpent = new Array(totalDays).fill(0);
-    const dailyIncome = new Array(totalDays).fill(0);
-
-    txCurrentYear.forEach((t) => {
-      const dateStr = (t.date || t.createdAt || '').slice(0, 10);
-      if (!dateStr) return;
-      const day = new Date(`${dateStr}T00:00:00`);
-      const idx = Math.floor((day - yearStart) / MS_PER_DAY);
-      if (idx < 0 || idx >= totalDays) return;
-      const amt = Number(t.amount || 0);
-      if (Number.isNaN(amt)) return;
-      if (t.type === 'gasto') dailySpent[idx] += amt;
-      if (t.type === 'ingreso') dailyIncome[idx] += amt;
-    });
-
-    const cumulativeSpent = [];
-    const cumulativeIncome = [];
-    let runningSpent = 0;
-    let runningIncome = 0;
-    for (let i = 0; i < totalDays; i += 1) {
-      runningSpent += dailySpent[i];
-      runningIncome += dailyIncome[i];
-      cumulativeSpent.push(runningSpent);
-      cumulativeIncome.push(runningIncome);
-    }
-
-    const today = new Date();
-    const todayDate = new Date(
-      today.getFullYear(),
-      today.getMonth(),
-      today.getDate(),
-    );
-    let daysElapsed = Math.floor((todayDate - yearStart) / MS_PER_DAY) + 1;
-    if (daysElapsed < 0) daysElapsed = 0;
-    if (daysElapsed > totalDays) daysElapsed = totalDays;
-
-    const spentSoFar = daysElapsed > 0 ? cumulativeSpent[daysElapsed - 1] : 0;
-    const incomeSoFar = daysElapsed > 0 ? cumulativeIncome[daysElapsed - 1] : 0;
-    const remainingDays = Math.max(totalDays - daysElapsed, 0);
-    const avgDailySpent = daysElapsed > 0 ? spentSoFar / daysElapsed : 0;
-    const avgDailyIncome = daysElapsed > 0 ? incomeSoFar / daysElapsed : 0;
-
-    const projectedSpent = spentSoFar + avgDailySpent * remainingDays;
-    const projectedIncome = incomeSoFar + avgDailyIncome * remainingDays;
-    const availableTotal = projectedIncome;
-
-    const availableLine = Array.from({ length: totalDays }, (_, idx) =>
-      availableTotal > 0 ? (availableTotal / totalDays) * (idx + 1) : 0,
-    );
-
-    const maxLine = Math.max(
-      projectedSpent,
-      cumulativeSpent[cumulativeSpent.length - 1] || 0,
-      availableTotal || 0,
-      budgetTotalYear || 0,
-      0,
-    );
-
-    const monthLabels = [
-      'Ene',
-      'Feb',
-      'Mar',
-      'Abr',
-      'May',
-      'Jun',
-      'Jul',
-      'Ago',
-      'Sep',
-      'Oct',
-      'Nov',
-      'Dic',
-    ];
-    const monthEndIndices = monthLabels.map((_, idx) => {
-      const nextMonthStart = new Date(currentYear, idx + 1, 1);
-      const endIdx =
-        Math.floor((nextMonthStart - yearStart) / MS_PER_DAY) - 1;
-      return Math.min(Math.max(endIdx, 0), totalDays - 1);
-    });
-    const monthlySpent = monthEndIndices.map(
-      (idx) => cumulativeSpent[idx] || 0,
-    );
-    const monthlyIncome = monthEndIndices.map(
-      (idx) => cumulativeIncome[idx] || 0,
-    );
-    const monthlyAvailable = monthEndIndices.map(
-      (idx) => availableLine[idx] || 0,
-    );
-    const monthlySpentDelta = monthlySpent.map(
-      (value, idx) => value - (monthlySpent[idx - 1] || 0),
-    );
-    const monthlyIncomeDelta = monthlyIncome.map(
-      (value, idx) => value - (monthlyIncome[idx - 1] || 0),
-    );
-    const monthBudgetTotals = monthLabels.map((_, idx) => {
-      const monthEndDate = new Date(currentYear, idx + 1, 0);
-      const dateKey = `${currentYear}-${String(idx + 1).padStart(
-        2,
-        '0',
-      )}-${String(monthEndDate.getDate()).padStart(2, '0')}`;
-      const mkMonth = budgetMonthKeyForDate(dateKey, budgetCutDay);
-      return sumBudgetForMonth(mkMonth);
-    });
-    const monthlyBudget = monthBudgetTotals.reduce((acc, value) => {
-      const next = (acc.length ? acc[acc.length - 1] : 0) + value;
-      acc.push(next);
-      return acc;
-    }, []);
-    const monthlyMax = Math.max(
-      ...monthBudgetTotals,
-      ...monthlySpentDelta,
-      ...monthlyIncomeDelta,
-      0,
-    );
-    const monthsWithMovements = monthlySpentDelta.reduce((acc, value, idx) => {
-      if (value > 0 || (monthlyIncomeDelta[idx] || 0) > 0) return acc + 1;
-      return acc;
-    }, 0);
-    const monthsOverBudget = monthlySpentDelta.reduce((acc, value, idx) => {
-      if (value > (monthBudgetTotals[idx] || 0)) return acc + 1;
-      return acc;
-    }, 0);
-    const safeDayIndex = Math.max(daysElapsed - 1, 0);
-    const projectionMonthIndex = Math.min(
-      11,
-      Math.max(
-        0,
-        new Date(yearStart.getTime() + safeDayIndex * MS_PER_DAY).getMonth(),
-      ),
-    );
-    const currentDate = new Date(
-      yearStart.getTime() + safeDayIndex * MS_PER_DAY,
-    );
-    const daysInCurrentMonth = new Date(
-      currentDate.getFullYear(),
-      currentDate.getMonth() + 1,
-      0,
-    ).getDate();
-    const dayOfMonth = currentDate.getDate();
-    const budgetBefore =
-      projectionMonthIndex > 0 ? monthlyBudget[projectionMonthIndex - 1] : 0;
-    const currentMonthBudget = monthBudgetTotals[projectionMonthIndex] || 0;
-    const monthFraction =
-      daysElapsed > 0
-        ? Math.min(dayOfMonth / Math.max(daysInCurrentMonth, 1), 1)
-        : 0;
-    const budgetToDate = budgetBefore + currentMonthBudget * monthFraction;
-    const monthsElapsed = daysElapsed > 0 ? projectionMonthIndex + 1 : 0;
-
-    return {
-      totalDays,
-      cumulativeSpent,
-      availableLine,
-      monthLabels,
-      monthlySpent,
-      monthlyIncome,
-      monthlyAvailable,
-      monthlyBudget,
-      monthlySpentDelta,
-      monthlyIncomeDelta,
-      monthBudgetTotals,
-      monthlyMax,
-      monthsWithMovements,
-      monthsOverBudget,
-      monthsElapsed,
-      budgetToDate,
-      projectionMonthIndex,
-      daysElapsed,
-      remainingDays,
-      projectedSpent,
-      projectedIncome,
-      spentSoFar,
-      avgDailySpent,
-      maxLine,
-    };
-  })();
-
-  const annualProjectedDelta = annualProjection
-    ? annualProjection.projectedIncome - annualProjection.projectedSpent
-    : 0;
-  const isAnnualProjectedSurplus = annualProjectedDelta >= 0;
-  const annualAvailableToDate = annualProjection
-    ? annualProjection.budgetToDate - annualProjection.spentSoFar
-    : 0;
-  const monthsCoverageTotal = 12;
+  const annualTotals = annual.totals;
   const cardsPrefs = activeUserPreferences?.dashboardCards || {};
   const showResumenMes = cardsPrefs.resumenMes ?? true;
   const showGastosFijos = cardsPrefs.gastosFijos ?? true;
@@ -959,9 +652,27 @@ export function Dashboard({ data, monthKeyStr }) {
               </strong>
             </div>
             <div className="flex justify-between">
-              <span>Gastos</span>
+              <span>Consumo</span>
               <strong>
-                <Money n={totalGastos} />
+                <Money n={totalConsumo} />
+              </strong>
+            </div>
+            <div className="flex justify-between">
+              <span>Cuotas de deudas</span>
+              <strong>
+                <Money n={ledger.debtPayments} />
+              </strong>
+            </div>
+            <div className="flex justify-between">
+              <span>Ahorro neto</span>
+              <strong>
+                <Money n={ledger.savingsNet} />
+              </strong>
+            </div>
+            <div className="flex justify-between text-[color:var(--text-muted)]">
+              <span>Flujo del mes</span>
+              <strong>
+                <Money n={flujoMes} />
               </strong>
             </div>
             <div
@@ -969,13 +680,13 @@ export function Dashboard({ data, monthKeyStr }) {
                 balance >= 0 ? 'text-[color:var(--success)]' : 'text-[color:var(--danger)]'
               }`}
             >
-              <span>Balance</span>
+              <span>Saldo actual (con lo que sobró antes)</span>
               <strong>
                 <Money n={balance} />
               </strong>
             </div>
             <div>
-              <div className="text-sm mb-1">% Gastado sobre ingresos</div>
+              <div className="text-sm mb-1">% de ingresos ya usado (consumo + cuotas + ahorro)</div>
               <Progress
                 value={pctIngresosVsGastos}
                 mode="flat"
@@ -1136,7 +847,7 @@ export function Dashboard({ data, monthKeyStr }) {
                     No hay pagos pendientes.
                   </div>
                 ) : (
-                  <div className="overflow-auto max-h-56">
+                  <div className="hidden md:block overflow-auto max-h-56">
                     <table className="w-full text-xs border-collapse min-w-[420px]">
                       <thead>
                         <tr className="text-left text-[color:var(--text-muted)] border-b">
@@ -1226,320 +937,155 @@ export function Dashboard({ data, monthKeyStr }) {
       )}
 
       {/* Resumen anual */}
-      <Card className="hidden md:block md:col-span-2 lg:col-span-3">
-        <SectionTitle>Resumen anual {currentYear}</SectionTitle>
-        <div className="rounded-lg border border-[color:var(--divider)] bg-[color:var(--surface-1)]/80 px-3 py-3 space-y-3">
-          {annualProjection && annualProjection.totalDays > 1 ? (
+      <Card className="md:col-span-2 lg:col-span-3">
+        <SectionTitle
+          right={
+            <button
+              type="button"
+              className="md:hidden h-7 w-7 inline-flex items-center justify-center rounded-md border border-[color:var(--border)] text-[color:var(--text-muted)] transition hover:bg-[color:var(--surface-2)]"
+              onClick={() => setShowAnnualMobile((prev) => !prev)}
+              aria-expanded={showAnnualMobile}
+              aria-label="Mostrar resumen anual"
+            >
+              <span
+                className={`inline-block transition-transform ${
+                  showAnnualMobile ? 'rotate-90' : ''
+                }`}
+              >
+                &gt;
+              </span>
+            </button>
+          }
+        >
+          Resumen anual {currentYear}
+        </SectionTitle>
+        <div
+          className={`rounded-lg border border-[color:var(--divider)] bg-[color:var(--surface-1)]/80 px-3 py-3 space-y-3 ${
+            showAnnualMobile ? '' : 'hidden'
+          } md:block`}
+        >
+          {annual.periods.length > 0 ? (
             <>
-              <div className="text-xs font-semibold text-[color:var(--text-muted)] uppercase">
-                Proyeccion anual
+              <div className="text-xs text-[color:var(--text-muted)]">
+                Por periodos de presupuesto (corte día {budgetCutDay}). El periodo en curso cuenta hasta hoy.
               </div>
-              <div className="grid gap-2 grid-cols-2 md:grid-cols-3 lg:grid-cols-5 text-xs">
+              <div className="grid gap-2 grid-cols-2 lg:grid-cols-4 text-xs">
                 <div className="rounded-md border border-[color:var(--divider)] bg-[color:var(--surface-1)]/80 px-2 py-2">
-                  <div className="text-[11px] text-[color:var(--text-muted)]">
-                    Meses con movimientos
-                  </div>
+                  <div className="text-[11px] text-[color:var(--text-muted)]">Ingresos del año</div>
                   <div className="text-sm font-semibold">
-                    {annualProjection.monthsWithMovements}/{monthsCoverageTotal}
+                    <Money n={annualTotals.income} />
                   </div>
                 </div>
                 <div className="rounded-md border border-[color:var(--divider)] bg-[color:var(--surface-1)]/80 px-2 py-2">
-                  <div className="text-[11px] text-[color:var(--text-muted)]">
-                    Meses sobre presupuesto
+                  <div className="text-[11px] text-[color:var(--text-muted)]">Gastado del año</div>
+                  <div className="text-sm font-semibold">
+                    <Money n={annualTotals.spent} />
                   </div>
+                  <div className="text-[10px] text-[color:var(--text-faint)]">
+                    de <Money n={annualTotals.budget} /> presupuestado
+                  </div>
+                </div>
+                <div className="rounded-md border border-[color:var(--divider)] bg-[color:var(--surface-1)]/80 px-2 py-2">
+                  <div className="text-[11px] text-[color:var(--text-muted)]">Te quedó</div>
                   <div
                     className={`text-sm font-semibold ${
-                      annualProjection.monthsOverBudget > 0
+                      annualTotals.result < 0
                         ? 'text-[color:var(--danger)]'
                         : 'text-[color:var(--success)]'
                     }`}
                   >
-                    {annualProjection.monthsOverBudget}
+                    <Money n={annualTotals.result} />
                   </div>
-                </div>
-                <div className="rounded-md border border-[color:var(--divider)] bg-[color:var(--surface-1)]/80 px-2 py-2">
-                  <div className="text-[11px] text-[color:var(--text-muted)]">Gastado YTD</div>
-                  <div className="text-sm font-semibold">
-                    <Money n={annualProjection.spentSoFar} />
-                  </div>
-                </div>
-                <div className="rounded-md border border-[color:var(--divider)] bg-[color:var(--surface-1)]/80 px-2 py-2">
-                  <div className="text-[11px] text-[color:var(--text-muted)]">
-                    Presupuesto YTD
-                  </div>
-                  <div className="text-sm font-semibold">
-                    <Money n={annualProjection.budgetToDate} />
+                  <div className="text-[10px] text-[color:var(--text-faint)]">
+                    {annualTotals.savingsRate === null
+                      ? 'ingresos − gastos'
+                      : `${Math.round(annualTotals.savingsRate * 100)}% de tus ingresos`}
                   </div>
                 </div>
                 <div className="rounded-md border border-[color:var(--divider)] bg-[color:var(--surface-1)]/80 px-2 py-2">
                   <div className="text-[11px] text-[color:var(--text-muted)]">
-                    Disponible YTD
+                    Periodos sobre presupuesto
                   </div>
                   <div
                     className={`text-sm font-semibold ${
-                      annualAvailableToDate < 0
+                      annualTotals.overBudgetCount > 0
                         ? 'text-[color:var(--danger)]'
                         : 'text-[color:var(--success)]'
                     }`}
                   >
-                    <Money n={annualAvailableToDate} />
+                    {annualTotals.overBudgetCount} de {annualTotals.periodsCount}
                   </div>
                 </div>
               </div>
-              <div className="flex flex-wrap gap-3 text-[11px] text-[color:var(--text-muted)]">
-                <span className="flex items-center gap-1">
-                  <span className="w-2 h-2 rounded-full bg-[color:var(--primary)]" />
-                  Ingreso
-                </span>
-                <span className="flex items-center gap-1">
-                  <span className="w-2 h-2 rounded-full bg-[color:var(--success)]" />
-                  Presupuesto
-                </span>
-                <span className="flex items-center gap-1">
-                  <span className="w-2 h-2 rounded-full bg-[color:var(--warning)]" />
-                  Gastado
-                </span>
-              </div>
-              <div className="w-full">
-                {(() => {
-                  const chartWidth = 320;
-                  const chartHeight = 140;
-                  const padding = {
-                    left: 28,
-                    right: 12,
-                    top: 10,
-                    bottom: 18,
-                  };
-                  const innerWidth =
-                    chartWidth - padding.left - padding.right;
-                  const innerHeight =
-                    chartHeight - padding.top - padding.bottom;
-                  const maxY = Math.max(annualProjection.monthlyMax * 1.2, 1);
-                  const totalPoints = annualProjection.monthLabels.length;
-                  const groupWidth = innerWidth / Math.max(totalPoints, 1);
-                  const barCount = 3;
-                  const barGap = 2;
-                  const rawBarWidth =
-                    (groupWidth - barGap * (barCount - 1)) / barCount;
-                  const barWidth = Math.max(3, Math.min(12, rawBarWidth));
-                  const groupInnerWidth =
-                    barWidth * barCount + barGap * (barCount - 1);
-                  const groupOffset = Math.max(
-                    (groupWidth - groupInnerWidth) / 2,
-                    0,
-                  );
-                  const xForIndex = (idx) =>
-                    padding.left + groupWidth * idx + groupWidth / 2;
-                  const barHeight = (value) =>
-                    (Math.max(value, 0) / maxY) * innerHeight;
-                  const incomeValues = annualProjection.monthlyIncomeDelta;
-                  const budgetValues = annualProjection.monthBudgetTotals;
-                  const spentValues = annualProjection.monthlySpentDelta;
-                  const currentMonthX = xForIndex(
-                    annualProjection.projectionMonthIndex,
-                  );
-                  const labelPaddingLeft = `${(
-                    (padding.left / chartWidth) *
-                    100
-                  ).toFixed(2)}%`;
-                  const labelPaddingRight = `${(
-                    (padding.right / chartWidth) *
-                    100
-                  ).toFixed(2)}%`;
-
-                  return (
-                    <>
-                      <svg
-                        className="w-full h-40"
-                        viewBox={`0 0 ${chartWidth} ${chartHeight}`}
-                        preserveAspectRatio="none"
-                        role="img"
-                        aria-label="Grafico de barras mensuales de ingreso, presupuesto y gasto"
-                      >
-                        <line
-                          x1={padding.left}
-                          y1={padding.top + innerHeight}
-                          x2={chartWidth - padding.right}
-                          y2={padding.top + innerHeight}
-                          stroke="var(--divider)"
-                          strokeWidth="1"
-                        />
-                        <line
-                          x1={padding.left}
-                          y1={padding.top}
-                          x2={padding.left}
-                          y2={padding.top + innerHeight}
-                          stroke="var(--divider)"
-                          strokeWidth="1"
-                        />
-                        <line
-                          x1={currentMonthX}
-                          y1={padding.top}
-                          x2={currentMonthX}
-                          y2={padding.top + innerHeight}
-                          stroke="var(--divider)"
-                          strokeWidth="1"
-                          strokeDasharray="3 3"
-                        />
-                        {annualProjection.monthLabels.map((label, idx) => {
-                          const baseX =
-                            padding.left + groupWidth * idx + groupOffset;
-                          const incomeValue = incomeValues[idx] || 0;
-                          const budgetValue = budgetValues[idx] || 0;
-                          const spentValue = spentValues[idx] || 0;
-                          const balanceValue = incomeValue - spentValue;
-                          const ejecucionPct =
-                            budgetValue > 0
-                              ? `${Math.round(
-                                  (spentValue / budgetValue) * 100,
-                                )}%`
-                              : '-';
-                          const tooltip = `Mes: ${label}\nIngreso: ${formatCLP(
-                            incomeValue,
-                          )}\nPresupuesto: ${formatCLP(
-                            budgetValue,
-                          )}\nGastado: ${formatCLP(
-                            spentValue,
-                          )}\nBalance: ${formatCLP(
-                            balanceValue,
-                          )}\nEjecucion: ${ejecucionPct}`;
-                          return (
-                            <g key={`bars-${label}-${idx}`}>
-                              <rect
-                                x={baseX}
-                                y={
-                                  padding.top +
-                                  innerHeight -
-                                  barHeight(incomeValue)
-                                }
-                                width={barWidth}
-                                height={barHeight(incomeValue)}
-                                fill="var(--primary)"
-                                className="cursor-pointer"
-                                pointerEvents="all"
-                              >
-                                <title>{tooltip}</title>
-                              </rect>
-                              <rect
-                                x={baseX + barWidth + barGap}
-                                y={
-                                  padding.top +
-                                  innerHeight -
-                                  barHeight(budgetValue)
-                                }
-                                width={barWidth}
-                                height={barHeight(budgetValue)}
-                                fill="var(--text-faint)"
-                                className="cursor-pointer"
-                                pointerEvents="all"
-                              >
-                                <title>{tooltip}</title>
-                              </rect>
-                              <rect
-                                x={baseX + (barWidth + barGap) * 2}
-                                y={
-                                  padding.top +
-                                  innerHeight -
-                                  barHeight(spentValue)
-                                }
-                                width={barWidth}
-                                height={barHeight(spentValue)}
-                                fill="var(--text-muted)"
-                                className="cursor-pointer"
-                                pointerEvents="all"
-                              >
-                                <title>{tooltip}</title>
-                              </rect>
-                            </g>
-                          );
-                        })}
-                      </svg>
-                      <div
-                        className="mt-2 grid grid-cols-12 text-xs sm:text-sm md:text-base font-semibold text-[color:var(--text-faint)]"
-                        style={{
-                          paddingLeft: labelPaddingLeft,
-                          paddingRight: labelPaddingRight,
-                        }}
-                      >
-                        {annualProjection.monthLabels.map((label, idx) => {
-                          const isFirst = idx === 0;
-                          const isLast = idx === totalPoints - 1;
-                          const isCurrent =
-                            idx === annualProjection.projectionMonthIndex;
-                          const alignClass = isFirst
-                            ? 'text-left'
-                            : isLast
-                              ? 'text-right'
-                              : 'text-center';
-                          return (
-                            <div
-                              key={`month-label-${label}-${idx}`}
-                              className={`${alignClass} ${
-                                isCurrent ? 'text-[color:var(--primary)]' : ''
-                              }`}
-                            >
-                              {label}
+              <div className="overflow-x-auto">
+                <table className="min-w-full text-xs sm:text-sm">
+                  <thead>
+                    <tr className="text-left text-[11px] text-[color:var(--text-muted)] border-b">
+                      <th className="py-2 pr-3">Periodo</th>
+                      <th className="py-2 px-3 text-right">Ingresos</th>
+                      <th className="py-2 px-3 text-right">Presupuesto</th>
+                      <th className="py-2 px-3 text-right">Gastado</th>
+                      <th className="py-2 px-3 text-right">Presupuesto − Gastado</th>
+                      <th className="py-2 pl-3 text-right">Te quedó</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {annual.periods.map((p) => {
+                      const isFuture = p.status === 'future';
+                      return (
+                        <tr
+                          key={p.periodKey}
+                          className={`border-b last:border-0 ${
+                            p.status === 'current' ? 'bg-[color:var(--surface-2)]/60' : ''
+                          } ${isFuture ? 'text-[color:var(--text-muted)]' : ''}`}
+                        >
+                          <td className="py-2 pr-3">
+                            <div className="font-semibold">{p.label}</div>
+                            <div className="text-[10px] text-[color:var(--text-faint)]">
+                              {p.status === 'current' ? 'en curso' : isFuture ? 'planificado' : 'cerrado'}
                             </div>
-                          );
-                        })}
-                      </div>
-                    </>
-                  );
-                })()}
+                          </td>
+                          <td className="py-2 px-3 text-right">
+                            {isFuture ? '—' : <Money n={p.income} />}
+                          </td>
+                          <td className="py-2 px-3 text-right">
+                            <Money n={p.budget} />
+                          </td>
+                          <td className="py-2 px-3 text-right">
+                            {isFuture ? '—' : <Money n={p.spent} />}
+                          </td>
+                          <td
+                            className={`py-2 px-3 text-right ${
+                              !isFuture && p.budgetLeft < 0 ? 'text-[color:var(--danger)]' : ''
+                            }`}
+                          >
+                            {isFuture ? '—' : <Money n={p.budgetLeft} />}
+                          </td>
+                          <td
+                            className={`py-2 pl-3 text-right font-semibold ${
+                              !isFuture && p.result < 0 ? 'text-[color:var(--danger)]' : ''
+                            }`}
+                          >
+                            {isFuture ? '—' : <Money n={p.result} />}
+                          </td>
+                        </tr>
+                      );
+                    })}
+                  </tbody>
+                </table>
               </div>
-              <div className="flex items-start gap-3">
-                <div
-                  className={`w-12 h-12 rounded-full flex items-center justify-center ${
-                    isAnnualProjectedSurplus
-                      ? 'bg-[color:var(--success)]/15 text-[color:var(--success)]'
-                      : 'bg-[color:var(--danger)]/15 text-[color:var(--danger)]'
-                  }`}
-                >
-                  <svg
-                    className="w-6 h-6"
-                    viewBox="0 0 24 24"
-                    fill="none"
-                    stroke="currentColor"
-                    strokeWidth="2"
-                    strokeLinecap="round"
-                    strokeLinejoin="round"
-                    aria-hidden="true"
-                  >
-                    {isAnnualProjectedSurplus ? (
-                      <>
-                        <path d="M12 19V5" />
-                        <path d="M6 11l6-6 6 6" />
-                      </>
-                    ) : (
-                      <>
-                        <path d="M12 5v14" />
-                        <path d="M6 13l6 6 6-6" />
-                      </>
-                    )}
-                  </svg>
+              {annualTotals.closedCount > 0 && (
+                <div className="text-xs text-[color:var(--text-muted)]">
+                  En tus {annualTotals.closedCount}{' '}
+                  {annualTotals.closedCount === 1 ? 'periodo cerrado' : 'periodos cerrados'} ingresaste en promedio{' '}
+                  <strong className="text-[color:var(--text)]"><Money n={annualTotals.avgClosedIncome} /></strong> y gastaste{' '}
+                  <strong className="text-[color:var(--text)]"><Money n={annualTotals.avgClosedSpent} /></strong> por periodo.
                 </div>
-                <div>
-                  <div
-                    className={`text-sm font-semibold ${
-                      isAnnualProjectedSurplus
-                        ? 'text-[color:var(--success)]'
-                        : 'text-[color:var(--danger)]'
-                    }`}
-                  >
-                    Si mantienes el ritmo actual, terminaras con{' '}
-                    {annualProjectedDelta >= 0 ? '+' : '-'}
-                    <Money n={Math.abs(annualProjectedDelta)} />
-                  </div>
-                  <div className="text-xs text-[color:var(--text-muted)]">
-                    Ritmo diario: <Money n={annualProjection.avgDailySpent} />
-                    /dia - Dias restantes: {annualProjection.remainingDays}
-                  </div>
-                </div>
-              </div>
+              )}
             </>
           ) : (
             <div className="text-xs text-[color:var(--text-muted)]">
-              No hay datos suficientes para la proyeccion anual.
+              Aún no hay movimientos ni presupuestos en {currentYear}.
             </div>
           )}
         </div>

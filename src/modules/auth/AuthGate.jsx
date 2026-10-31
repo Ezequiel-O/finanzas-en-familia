@@ -1,6 +1,6 @@
 import React, { useState, useEffect } from 'react';
 
-import { Card } from '../../components/ui/card.jsx';
+import { Card } from '../../components/ui/Card.jsx';
 
 import {
   onAuthStateChanged,
@@ -150,7 +150,7 @@ export function AuthGate({ onReady }) {
       if (!snap.exists()) return false;
       const members = snap.data()?.members || [];
       return Array.isArray(members) && members.includes(uid);
-    } catch (err) {
+    } catch {
       return false;
     }
   }
@@ -227,7 +227,7 @@ export function AuthGate({ onReady }) {
       if ((current.inviteId || '') !== invite) {
         try {
           await deleteDoc(reqRef);
-        } catch (err) {
+        } catch {
           throw new Error('invite-mismatch');
         }
       } else {
@@ -475,7 +475,7 @@ export function AuthGate({ onReady }) {
 
     try {
       if (isRegister || inviteMode) {
-        const cred = await createUserWithEmailAndPassword(
+        await createUserWithEmailAndPassword(
           auth,
           loginEmail,
           pass,

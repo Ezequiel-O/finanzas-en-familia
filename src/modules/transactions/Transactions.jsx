@@ -1,4 +1,9 @@
 // src/modules/transactions/Transactions.jsx
+import { isAdjustment, periodBalances, periodLedger, txDateKey } from '../../domain/ledger.js';
+import { extractDebtQuotaIds, plannedForSavingPeriod } from '../../domain/commitments.js';
+import { toast, confirmDialog } from '../../components/feedback/feedback.js';
+import { confirmWithinCash } from '../../features/cash/confirmWithinCash.js';
+import { todayKey, toLocalDateKey } from '../../domain/dates.js';
 import React, { useState, useMemo, useEffect, useRef } from 'react';
 import {
   monthKey,
@@ -6,7 +11,6 @@ import {
   formatBudgetPeriodLabel,
   getBudgetPeriod,
   budgetMonthKeyForDate,
-  dateKeyFromValue,
 } from '../../utils/budgetPeriod.js';
 import { filterTransactionsByPeriodAndUser } from '../../utils/transactions.js';
 import {
@@ -14,88 +18,22 @@ import {
   resolveFixedCategory,
 } from '../../utils/fixedBudgets.js';
 import { getSubcategoryAllocationsForTransaction } from '../../utils/subcategoryAllocations.js';
-import { Card } from '../../components/ui/card.jsx';
+import { Card } from '../../components/ui/Card.jsx';
 import { SectionTitle } from '../../components/ui/SectionTitle.jsx';
-import { Money } from '../../components/ui/money.jsx';
-import { CATEGORIES, DEBT_CATEGORY } from '../../constants.js';
-import * as XLSX from 'xlsx';
-import { zipSync, unzipSync } from 'fflate';
+import { Money } from '../../components/ui/Money.jsx';
+import { CATEGORIES, DEBT_CATEGORY, SAVINGS_CATEGORY } from '../../constants.js';
+
+// SheetJS (~400 KB) y fflate solo se descargan al exportar o importar Excel.
+let XLSX = null;
+let FFLATE = null;
+async function loadExcelLibs() {
+  if (!XLSX) XLSX = await import('xlsx');
+  if (!FFLATE) FFLATE = await import('fflate');
+}
 
 const DEFAULT_UNBUDGETED_LABEL = 'gasto no presupuestado';
 const DEFAULT_UNBUDGETED_KEY = DEFAULT_UNBUDGETED_LABEL.toLowerCase();
 const UNBUDGETED_FILTER_VALUE = DEFAULT_UNBUDGETED_KEY;
-const SAVINGS_CATEGORY = 'Ahorro';
-const DEFAULT_SAVINGS_PERIODS = 3;
-
-function monthsBetween(startPk, endPk) {
-  if (!startPk || !endPk) return 0;
-  const [sy, sm] = startPk.split('-').map(Number);
-  const [ey, em] = endPk.split('-').map(Number);
-  if (!sy || !sm || !ey || !em) return 0;
-  return Math.max(0, (ey - sy) * 12 + (em - sm) + 1);
-}
-
-function savingStartPeriodKey(s, cutDay) {
-  const dateKey = dateKeyFromValue(s?.createdAt);
-  return dateKey ? budgetMonthKeyForDate(dateKey, cutDay) : '';
-}
-
-function planForSavingLegacy(s, periodKey, cutDay) {
-  if (!periodKey) return { plan: 0, targetPk: '' };
-  const rawStartPk = savingStartPeriodKey(s, cutDay);
-  const startPk = rawStartPk || periodKey || monthKey(new Date());
-  const periods = Math.max(1, Number(DEFAULT_SAVINGS_PERIODS) || 1);
-  const targetPk = s.targetDate
-    ? budgetMonthKeyForDate(s.targetDate, cutDay)
-    : shiftMonth(startPk, periods - 1);
-
-  const normalizedTarget =
-    targetPk && rawStartPk && rawStartPk > targetPk ? rawStartPk : targetPk;
-
-  if (rawStartPk && periodKey < rawStartPk) {
-    return { plan: 0, targetPk: normalizedTarget };
-  }
-
-  const remaining = Math.max(Number(s.goal || 0) - Number(s.saved || 0), 0);
-  if (remaining <= 0 || (normalizedTarget && periodKey > normalizedTarget)) {
-    return { plan: 0, targetPk: normalizedTarget };
-  }
-
-  const scheduleStartPk = rawStartPk || periodKey;
-  if (periodKey < scheduleStartPk) {
-    return { plan: 0, targetPk: normalizedTarget };
-  }
-  const totalPeriods = monthsBetween(
-    scheduleStartPk,
-    normalizedTarget || scheduleStartPk,
-  );
-  const basePlan =
-    totalPeriods > 0 ? Math.floor(remaining / totalPeriods) : remaining;
-  const delta = remaining - basePlan * totalPeriods;
-  const plan = periodKey === normalizedTarget ? basePlan + delta : basePlan;
-  return { plan, targetPk: normalizedTarget };
-}
-
-function resolveSchedulePeriodKey(entry, cutDay) {
-  if (entry?.periodKey) return entry.periodKey;
-  if (entry?.dueDate) {
-    return budgetMonthKeyForDate(entry.dueDate, cutDay);
-  }
-  return '';
-}
-
-function plannedForSavingPeriod(s, periodKey, cutDay) {
-  if (!periodKey) return 0;
-  const schedule = Array.isArray(s?.schedule) ? s.schedule : [];
-  if (schedule.length) {
-    return schedule
-      .filter((q) => resolveSchedulePeriodKey(q, cutDay) === periodKey)
-      .reduce((sum, q) => sum + Number(q.plannedAmount || 0), 0);
-  }
-  const { plan, targetPk } = planForSavingLegacy(s, periodKey, cutDay);
-  if (!targetPk || periodKey > targetPk) return 0;
-  return plan;
-}
 
 export function Transactions({
   data,
@@ -122,16 +60,7 @@ export function Transactions({
     () => monthKeyStr || monthKey(new Date()),
     [monthKeyStr],
   );
-  const trueCurrentPeriod = useMemo(
-    () =>
-      budgetMonthKeyForDate(
-        new Date().toISOString().slice(0, 10),
-        budgetCutDay,
-      ),
-    [budgetCutDay],
-  );
-
-  const { addTransaction, updateTransaction, removeTransaction } =
+  const { addTransaction, updateTransaction, removeTransaction, restoreTrashItem } =
     actions || {};
   const hasContextActions =
     !!updateTransaction || !!removeTransaction || !!addTransaction;
@@ -150,9 +79,9 @@ export function Transactions({
   const [type, setType] = useState('gasto'); // gasto | ingreso
   const [amount, setAmount] = useState('');
   const [category, setCategory] = useState(categories[0] || '');
-  const [date, setDate] = useState(() => new Date().toISOString().slice(0, 10));
+  const [date, setDate] = useState(() => todayKey());
   const [description, setDescription] = useState('');
-  const [showOnlyMine, setShowOnlyMine] = useState(false);
+  const [showOnlyMine] = useState(false);
   const [filterType, setFilterType] = useState('todos'); // todos | ingresos | gastos
   const [filterCategories, setFilterCategories] = useState([]);
   const [filterSubcategories, setFilterSubcategories] = useState([]);
@@ -196,9 +125,7 @@ export function Transactions({
   const [debitInput, setDebitInput] = useState('');
   const [debitFormatted, setDebitFormatted] = useState('');
   const [adjustType, setAdjustType] = useState('ingreso'); // ingreso | gasto
-  const [adjustCategory, setAdjustCategory] = useState(
-    categories[0] || CATEGORIES[0] || '',
-  );
+  const [adjustPeriod, setAdjustPeriod] = useState('previous');
   const [adjustNote, setAdjustNote] = useState('');
   const [adjustError, setAdjustError] = useState('');
 
@@ -264,20 +191,6 @@ export function Transactions({
     periodKeyForBudget,
     fixedCategories,
   ]);
-
-  const debtPeriodKey = formPeriodKey || currentPeriodKey;
-  const suggestedDebtAmount = useMemo(() => {
-    if (!debtPeriodKey) return 0;
-    return debtsArray
-      .flatMap((d) => (Array.isArray(d.schedule) ? d.schedule : []))
-      .filter((q) => q.periodKey && q.periodKey <= debtPeriodKey)
-      .reduce((sum, q) => {
-        const planned = Number(q.plannedAmount || 0);
-        const paid = Number(q.paidAmount || 0);
-        const remaining = planned - paid;
-        return remaining > 0 ? sum + remaining : sum;
-      }, 0);
-  }, [debtsArray, debtPeriodKey]);
 
   const suggestedSavingsAmount = useMemo(() => {
     if (!formPeriodKey) return 0;
@@ -562,6 +475,10 @@ export function Transactions({
     !isDebtCategory(category) &&
     !isSavingsCategory(category) &&
     selectedSubcategoryIds.length > 1;
+  const shouldLockDebtAmount =
+    type === 'gasto' &&
+    isDebtCategory(category) &&
+    selectedDebtQuotaIds.length > 1;
 
   const debtQuotasForPeriod = useMemo(() => {
     if (!formPeriodKey) return [];
@@ -595,6 +512,69 @@ export function Transactions({
     });
     return map;
   }, [debtQuotasForPeriod]);
+
+  const debtExcelOptions = useMemo(() => {
+    const debtsById = new Map();
+    const debtsByName = new Map();
+    const quotasById = new Map();
+    const quotasByLabel = new Map();
+    const quotaRows = [];
+    const debtRows = [];
+
+    debtsArray.forEach((debt) => {
+      if (!debt?.id) return;
+      const debtName = String(debt.name || 'Deuda').trim() || 'Deuda';
+      const debtKey = debtName.toLowerCase();
+      debtsById.set(debt.id, debt);
+      if (!debtsByName.has(debtKey)) debtsByName.set(debtKey, debt);
+      debtRows.push({ id: debt.id, name: debtName });
+
+      const schedule = Array.isArray(debt.schedule) ? debt.schedule : [];
+      schedule.forEach((quota) => {
+        if (!quota?.id) return;
+        const periodKey =
+          quota.periodKey ||
+          (quota.dueDate
+            ? budgetMonthKeyForDate(quota.dueDate, budgetCutDay)
+            : '');
+        const planned = Math.round(Number(quota.plannedAmount || 0));
+        const paid = paidAmountForQuotaId(quota.id, debt.id);
+        const remaining = Math.max(planned - paid, 0);
+        const dueDate = quota.dueDate || '';
+        const labelParts = [
+          debtName,
+          periodKey || 'sin periodo',
+          dueDate || 'sin vencimiento',
+          planned ? `$${currencyFormatter.format(planned)}` : '',
+        ].filter(Boolean);
+        const label = labelParts.join(' | ');
+        const row = {
+          id: quota.id,
+          debtId: debt.id,
+          debtName,
+          label,
+          periodKey,
+          dueDate,
+          planned,
+          paid,
+          remaining,
+        };
+        quotasById.set(quota.id, row);
+        quotasByLabel.set(label.toLowerCase(), row);
+        quotaRows.push(row);
+      });
+    });
+
+    debtRows.sort((a, b) =>
+      a.name.localeCompare(b.name, 'es', { sensitivity: 'base' }),
+    );
+    quotaRows.sort((a, b) => {
+      if (a.periodKey !== b.periodKey) return a.periodKey < b.periodKey ? -1 : 1;
+      return a.label.localeCompare(b.label, 'es', { sensitivity: 'base' });
+    });
+
+    return { debtRows, quotaRows, debtsById, debtsByName, quotasById, quotasByLabel };
+  }, [debtsArray, budgetCutDay, transactions, currencyFormatter]);
 
   const selectedDebtQuotas = useMemo(
     () =>
@@ -636,35 +616,7 @@ export function Transactions({
     });
   }, [savingsArray, formPeriodKey, budgetCutDay]);
 
-  // Autocompletar monto de Deuda en modal de gasto
-  useEffect(() => {
-    const debtSelected = isDebtCategory(category);
-    const modalOpen = showGastoModal;
-
-    if (!modalOpen) return;
-    if (type !== 'gasto') return;
-    if (!debtSelected) return;
-    if (suggestedDebtAmount <= 0) return;
-    if (selectedDebtQuotaIds.length) return;
-    if (amountEditedByUser) return;
-    if (editingTx) return;
-
-    const n = Math.round(suggestedDebtAmount);
-    const digits = String(n);
-    const formatted = currencyFormatter.format(n);
-
-    setAmount(digits);
-    setAmountFormatted(formatted);
-  }, [
-    showGastoModal,
-    type,
-    category,
-    suggestedDebtAmount,
-    selectedDebtQuotaIds,
-    amountEditedByUser,
-    editingTx,
-    currencyFormatter,
-  ]);
+  // Autocompletar monto de Deuda solo cuando el usuario selecciona cuotas.
 
   useEffect(() => {
     const savingsSelected = isSavingsCategory(category);
@@ -790,9 +742,6 @@ export function Transactions({
     setCategory((prev) =>
       prev && categoryOptions.includes(prev) ? prev : categoryOptions[0],
     );
-    setAdjustCategory((prev) =>
-      prev && categoryOptions.includes(prev) ? prev : categoryOptions[0],
-    );
   }, [categoryOptions]);
 
   useEffect(() => {
@@ -881,7 +830,7 @@ export function Transactions({
     }
 
     return list;
-  }, [subcategoryMap, periodTx]);
+  }, [subcategoryMap, periodTx, debts]);
 
   const subcategoryFilterLabel = useMemo(() => {
     if (!filterSubcategories.length) return 'Todas las subcategorias';
@@ -942,7 +891,7 @@ export function Transactions({
 
     if (filterFromDate || filterToDate) {
       base = base.filter((tx) => {
-        const txDate = (tx.date || tx.createdAt || '').slice(0, 10);
+        const txDate = txDateKey(tx);
         if (filterFromDate && txDate < filterFromDate) return false;
         if (filterToDate && txDate > filterToDate) return false;
         return true;
@@ -978,6 +927,7 @@ export function Transactions({
     filterFromDate,
     filterToDate,
     filterUserId,
+    debts,
   ]);
 
   const canExport = filtered.length > 0;
@@ -999,57 +949,26 @@ export function Transactions({
     };
   }, [filtered]);
 
-  const periodTotals = useMemo(() => {
-    let ingresos = 0;
-    let gastos = 0;
-
-    for (const tx of periodTx) {
-      const amt = Number(tx.amount || 0);
-      if (tx.type === 'ingreso') ingresos += amt;
-      if (tx.type === 'gasto') gastos += amt;
-    }
-
-    return {
-      ingresos,
-      gastos,
-      balance: ingresos - gastos,
-    };
-  }, [periodTx]);
-
-  const prevPeriodKey = useMemo(
-    () => shiftMonth(currentPeriodKey, -1),
-    [currentPeriodKey],
+  // Mismo libro que Inicio y Plan del mes (base caja). Los traspasos entre miembros
+  // no cambian el saldo del hogar; los ajustes sí, pero no son ingreso ni gasto.
+  const ledger = useMemo(
+    () => periodLedger({ transactions, periodKey: currentPeriodKey, cutDay: budgetCutDay, debts }),
+    [transactions, currentPeriodKey, budgetCutDay, debts],
   );
-  const prevPeriodTx = useMemo(
-    () =>
-      filterTransactionsByPeriodAndUser(
-        transactions,
-        prevPeriodKey,
-        budgetCutDay,
-        null,
-        false,
-      ),
-    [transactions, prevPeriodKey, budgetCutDay],
+  const periodTotals = {
+    ingresos: ledger.income,
+    gastos: ledger.outflows - ledger.refunds,
+    balance: ledger.netCashFlow,
+  };
+  const saldoAnterior = ledger.opening;
+  // Balance a hoy (lo que debería estar en tus cuentas) y proyectado al cierre del periodo,
+  // que suma los movimientos registrados con fecha futura.
+  const balances = useMemo(
+    () => periodBalances({ transactions, periodKey: currentPeriodKey, cutDay: budgetCutDay, today: todayKey() }),
+    [transactions, currentPeriodKey, budgetCutDay],
   );
-  const prevPeriodTotals = useMemo(() => {
-    let ingresos = 0;
-    let gastos = 0;
-
-    for (const tx of prevPeriodTx) {
-      const amt = Number(tx.amount || 0);
-      if (tx.type === 'ingreso') ingresos += amt;
-      if (tx.type === 'gasto') gastos += amt;
-    }
-
-    return {
-      ingresos,
-      gastos,
-      balance: ingresos - gastos,
-    };
-  }, [prevPeriodTx]);
-
-  const saldoAnterior = prevPeriodTotals.balance;
-  const balanceDisponible = saldoAnterior + periodTotals.balance;
+  const balanceDisponible = balances.atToday;
+  const balanceProyectado = balances.projected;
 
   const totalBudgeted = useMemo(() => {
     const source = budgetsForPeriod || {};
@@ -1107,6 +1026,19 @@ export function Transactions({
     if (tx.ownerEmail) return tx.ownerEmail.split('@')[0];
     return 'Usuario';
   }
+  // Nombre de la deuda de un pago de cuota (cuotas de cualquier periodo, no solo el del formulario).
+  function getDebtPaymentLabel(tx) {
+    const meta = tx?.meta || {};
+    const quotaIds = extractDebtQuotaIds(meta);
+    if (!quotaIds.length && !meta.debtId) return '';
+    const debt =
+      debtsArray.find((d) => d?.id && d.id === meta.debtId) ||
+      debtsArray.find((d) =>
+        (Array.isArray(d?.schedule) ? d.schedule : []).some((q) => quotaIds.includes(q?.id)),
+      );
+    return debt?.name || 'Pago de deuda';
+  }
+
   function getSubcategoryLabel(tx) {
     const meta = tx?.meta || {};
     const names = String(meta.budgetSubcategoryNames || '').trim();
@@ -1137,7 +1069,7 @@ export function Transactions({
       const name = subcategoryMap.byId.get(ids[0]);
       if (name) return name;
     }
-    return '';
+    return getDebtPaymentLabel(tx);
   }
 
   function getSubcategoryLabels(tx) {
@@ -1177,7 +1109,8 @@ export function Transactions({
         .map((id) => subcategoryMap.byId.get(id))
         .filter(Boolean);
     }
-    return [];
+    const debtLabel = getDebtPaymentLabel(tx);
+    return debtLabel ? [debtLabel] : [];
   }
 
   function isDefaultUnbudgetedTx(tx) {
@@ -1197,6 +1130,9 @@ export function Transactions({
     if (isSavingsCategory(tx?.category)) {
       if (meta.savingId || meta.savingName) return false;
     }
+    // Los pagos de cuotas ya están presupuestados en Compromisos; los ajustes no son gasto.
+    if (extractDebtQuotaIds(meta).length || meta.debtId) return false;
+    if (isAdjustment(tx)) return false;
     return Boolean(tx.category);
   }
 
@@ -1286,8 +1222,15 @@ export function Transactions({
     const endMinusOne = new Date(endDate);
     endMinusOne.setDate(endMinusOne.getDate() - 1);
     if (today < startDate) return start;
-    if (today > endMinusOne) return endMinusOne.toISOString().slice(0, 10);
-    return today.toISOString().slice(0, 10);
+    if (today > endMinusOne) return toLocalDateKey(endMinusOne);
+    return toLocalDateKey(today);
+  }
+
+  function getPeriodEndDate(monthKeyValue) {
+    const { end } = getBudgetPeriod(monthKeyValue, budgetCutDay);
+    const endDate = new Date(end + 'T00:00:00');
+    endDate.setDate(endDate.getDate() - 1);
+    return toLocalDateKey(endDate);
   }
 
   function formatAmountForInput(value) {
@@ -1300,16 +1243,46 @@ export function Transactions({
     return { digits, formatted: currencyFormatter.format(rounded) };
   }
 
-  function handleMoneyInput(raw, setters) {
-    const digits = raw.replace(/\D/g, '');
-    if (!digits) {
+  function parseCalculatorSum(raw) {
+    const text = String(raw || '').trim();
+    if (!text) return { sum: '', isExpression: false, isValid: false };
+    const cleaned = text.replace(/[.,\s]/g, '');
+    if (!cleaned) return { sum: '', isExpression: false, isValid: false };
+    const isExpression = cleaned.includes('+');
+    const parts = cleaned.split('+').filter(Boolean);
+    if (!parts.length || parts.some((p) => /\D/.test(p))) {
+      return { sum: '', isExpression, isValid: false };
+    }
+    const total = parts.reduce((acc, p) => acc + Number(p), 0);
+    return { sum: String(Math.round(total)), isExpression, isValid: true };
+  }
+
+  function handleCalculatorInput(raw, setters) {
+    const text = String(raw || '');
+    if (!text.trim()) {
       setters.setFormatted('');
       setters.setValue('');
       return;
     }
-    const formatted = currencyFormatter.format(Number(digits));
+    const parsed = parseCalculatorSum(text);
+    if (!parsed.isValid) {
+      setters.setFormatted(text);
+      setters.setValue('');
+      return;
+    }
+    const formatted = currencyFormatter.format(Number(parsed.sum || 0));
+    setters.setFormatted(parsed.isExpression ? text : formatted);
+    setters.setValue(parsed.sum);
+  }
+
+  function commitCalculatorInput(raw, setters) {
+    const parsed = parseCalculatorSum(raw);
+    if (!parsed.isValid || !parsed.sum) {
+      return;
+    }
+    const formatted = currencyFormatter.format(Number(parsed.sum || 0));
     setters.setFormatted(formatted);
-    setters.setValue(digits);
+    setters.setValue(parsed.sum);
   }
 
   function paidAmountForQuotaId(quotaId, debtId) {
@@ -1419,6 +1392,7 @@ export function Transactions({
     setCashFormatted('');
     setDebitInput('');
     setDebitFormatted('');
+    setAdjustPeriod('previous');
     setAdjustNote('');
     setAdjustError('');
   }
@@ -1469,28 +1443,36 @@ export function Transactions({
     });
   }
 
-  function confirmRemoveTransaction(tx) {
+  // Borra al tiro y ofrece "Deshacer": el movimiento queda en la papelera.
+  async function confirmRemoveTransaction(tx) {
     if (!removeTransaction || !tx?.id) return;
-    const label = tx.description || 'movimiento';
-    const ok = window.confirm(
-      `Eliminar ${label}? Esta accion no se puede deshacer.`,
-    );
-    if (!ok) return;
-    removeTransaction(tx.id);
+    const label = tx.description || 'Movimiento';
+    try {
+      const removed = await removeTransaction(tx.id);
+      toast.success(`${label} eliminado.`, {
+        action:
+          removed && restoreTrashItem
+            ? { label: 'Deshacer', onClick: () => restoreTrashItem(removed.item) }
+            : null,
+      });
+    } catch (err) {
+      console.error('Error eliminando movimiento', { code: err?.code });
+      toast.error('No se pudo eliminar el movimiento.');
+    }
   }
 
 
   async function duplicateTransaction(tx) {
     if (!addTransaction || !tx) return;
     const typeValue = tx.type === 'ingreso' ? 'ingreso' : 'gasto';
-    const baseDate = (tx.date || tx.createdAt || '').toString().slice(0, 10);
+    const baseDate = txDateKey(tx);
     const normalized = {
       type: typeValue,
       amount: Math.round(Number(tx.amount || 0)),
       category:
         typeValue === 'ingreso' ? incomeCategoryLabel : tx.category || '',
       description: String(tx.description || '').trim(),
-      date: baseDate || new Date().toISOString().slice(0, 10),
+      date: baseDate || todayKey(),
       ownerId: tx.ownerId || activeUser?.id || null,
       ownerName: tx.ownerName || activeUser?.name || null,
       ownerEmail: tx.ownerEmail || activeUser?.email || null,
@@ -1503,7 +1485,7 @@ export function Transactions({
       await addTransaction(normalized);
     } catch (err) {
       console.error('Error al duplicar movimiento:', err);
-      alert('No se pudo duplicar el movimiento.');
+      toast.error('No se pudo duplicar el movimiento.');
     }
   }
 
@@ -1616,7 +1598,7 @@ export function Transactions({
     const baseType = tx.type === 'ingreso' ? 'ingreso' : 'gasto';
     const { digits, formatted } = formatAmountForInput(tx.amount);
     const baseDate = clampDateToPeriod(
-      (tx.date || tx.createdAt || new Date().toISOString().slice(0, 10)).slice(
+      (tx.date || tx.createdAt || todayKey()).slice(
         0,
         10,
       ),
@@ -1663,7 +1645,7 @@ export function Transactions({
     const isEditing = !!editingTx;
     const handler = isEditing ? updateTransaction : addTransaction;
     if (!n || n <= 0 || !handler) {
-      alert('Ingresa un monto valido.');
+      toast.warning('Ingresa un monto válido.');
       return;
     }
 
@@ -1679,7 +1661,7 @@ export function Transactions({
     const ownerGasto = editingOwner || activeUser || null;
     const owner = type === 'ingreso' ? ownerIngreso : ownerGasto;
 
-    const rawDate = date || new Date().toISOString().slice(0, 10);
+    const rawDate = date || todayKey();
     const normalized = {
       type,
       amount: n,
@@ -1701,7 +1683,7 @@ export function Transactions({
     if (isDebtTx) {
       const periodDate = clampDateToPeriod(rawDate);
       if (periodDate !== rawDate) {
-        const todayStr = new Date().toISOString().slice(0, 10);
+        const todayStr = todayKey();
         normalized.date = clampDateToPeriod(todayStr);
       } else {
         normalized.date = periodDate;
@@ -1830,6 +1812,13 @@ export function Transactions({
         delete baseMeta.budgetSubcategoryName;
       }
     }
+    // Traspasos, reembolsos y retiros de ahorro conservan su tipo y categoría al editarse:
+    // de eso depende cómo se contabilizan (ver domain/ledger.js).
+    if (['transfer', 'refund', 'saving_withdrawal'].includes(editingTx?.meta?.kind)) {
+      normalized.type = editingTx.type;
+      normalized.category = editingTx.category;
+    }
+
     const shouldPersistMeta =
       isDebtTx ||
       selectedDebtQuotaIds.length > 0 ||
@@ -1840,14 +1829,24 @@ export function Transactions({
       normalized.meta = baseMeta;
     }
 
+    // Gasto nuevo o edición que sube el monto: avisar si supera la plata que hay hoy.
+    if (normalized.type === 'gasto' && normalized.meta?.kind !== 'transfer') {
+      const prevAmount =
+        isEditing && editingTx.type === 'gasto' ? Number(editingTx.amount || 0) : 0;
+      const increase = Number(normalized.amount || 0) - prevAmount;
+      if (increase > 0 && !(await confirmWithinCash({ amount: increase, transactions }))) return;
+    }
+
     try {
       if (isEditing) {
         await updateTransaction(editingTx.id, normalized);
       } else {
-        await addTransaction({
+        const createdId = await addTransaction({
           ...normalized,
           createdAt: new Date().toISOString(),
         });
+        // Si no se guardó, se conserva lo escrito para reintentar (el aviso ya se mostró).
+        if (!createdId) return;
       }
       setAmount('');
       setAmountFormatted('');
@@ -1861,7 +1860,7 @@ export function Transactions({
       setShowGastoModal(false);
     } catch (err) {
       console.error('Error al guardar movimiento:', err);
-      alert('No se pudo guardar el movimiento.');
+      toast.error('No se pudo guardar el movimiento.');
     }
   }
 
@@ -1892,13 +1891,14 @@ export function Transactions({
       return;
     }
 
-    const todayStr = new Date().toISOString().slice(0, 10);
-    const txDate = clampDateToPeriod(todayStr);
+    const adjustmentPeriodKey =
+      adjustPeriod === 'current' ? monthKeyStr : shiftMonth(monthKeyStr, -1);
+    const txDate =
+      adjustPeriod === 'current'
+        ? clampDateToPeriod(todayKey())
+        : getPeriodEndDate(adjustmentPeriodKey);
 
-    const fallbackCategory =
-      adjustType === 'gasto'
-        ? adjustCategory || 'Ajuste Balance'
-        : 'Ajuste Balance';
+    const fallbackCategory = 'Ajuste Balance';
 
     const adjustmentTx = {
       type: adjustType,
@@ -1916,6 +1916,8 @@ export function Transactions({
         platformBalance,
         realBalance,
         delta,
+        adjustmentPeriod: adjustPeriod,
+        adjustmentPeriodKey,
         source: 'balance-calculator',
       },
     };
@@ -2111,7 +2113,7 @@ export function Transactions({
     const str = String(value || '').trim();
     const iso = str.match(/^\d{4}-\d{2}-\d{2}/);
     if (iso) return iso[0];
-    const dmy = str.match(/^(\d{1,2})[\/.-](\d{1,2})[\/.-](\d{2,4})$/);
+    const dmy = str.match(/^(\d{1,2})[/.-](\d{1,2})[/.-](\d{2,4})$/);
     if (dmy) {
       const day = String(dmy[1]).padStart(2, '0');
       const month = String(dmy[2]).padStart(2, '0');
@@ -2177,8 +2179,220 @@ export function Transactions({
     return owner || activeUser || null;
   }
 
-  function handleExportExcel() {
+  function extractDebtQuotaIdsFromMeta(meta) {
+    const ids = Array.isArray(meta?.debtQuotaIds)
+      ? meta.debtQuotaIds
+      : meta?.debtQuotaId
+      ? [meta.debtQuotaId]
+      : [];
+    return Array.from(
+      new Set(ids.map((id) => String(id || '').trim()).filter(Boolean)),
+    );
+  }
+
+  function getDebtExcelFields(tx) {
+    const meta = tx?.meta || {};
+    const quotaIds = extractDebtQuotaIdsFromMeta(meta);
+    const quotaRows = quotaIds
+      .map((id) => debtExcelOptions.quotasById.get(id))
+      .filter(Boolean);
+    const debtIds = Array.from(
+      new Set(
+        quotaRows
+          .map((q) => q.debtId)
+          .concat(String(meta.debtId || '').trim())
+          .filter(Boolean),
+      ),
+    );
+    const debtNames = Array.from(
+      new Set(
+        quotaRows
+          .map((q) => q.debtName)
+          .concat(String(meta.debtName || '').trim())
+          .filter(Boolean),
+      ),
+    );
+    return {
+      debtName: debtNames.join('; '),
+      quotaLabel: quotaRows.map((q) => q.label).join('; '),
+      debtId: debtIds.join('; '),
+      quotaId: quotaIds.join('; '),
+    };
+  }
+
+  function splitExcelMultiValue(value) {
+    return String(value || '')
+      .split(';')
+      .map((item) => item.trim())
+      .filter(Boolean);
+  }
+
+  function resolveDebtSelectionFromRow({
+    rawDebtId,
+    rawDebtName,
+    rawQuotaId,
+    rawQuotaLabel,
+  }) {
+    const quotaIds = [];
+    const debtIdMap = {};
+    let selectedDebtId = '';
+    let selectedDebtName = '';
+
+    const quotaLabels = splitExcelMultiValue(rawQuotaLabel);
+    quotaLabels.forEach((label) => {
+      const quota = debtExcelOptions.quotasByLabel.get(label.toLowerCase());
+      if (!quota) return;
+      if (!quotaIds.includes(quota.id)) quotaIds.push(quota.id);
+      debtIdMap[quota.id] = quota.debtId;
+      selectedDebtId = selectedDebtId || quota.debtId;
+      selectedDebtName = selectedDebtName || quota.debtName;
+    });
+
+    if (!quotaIds.length) {
+      splitExcelMultiValue(rawQuotaId).forEach((id) => {
+        const quota = debtExcelOptions.quotasById.get(id);
+        if (!quota) return;
+        quotaIds.push(quota.id);
+        debtIdMap[quota.id] = quota.debtId;
+        selectedDebtId = selectedDebtId || quota.debtId;
+        selectedDebtName = selectedDebtName || quota.debtName;
+      });
+    }
+
+    const debtNames = splitExcelMultiValue(rawDebtName);
+    debtNames.forEach((name) => {
+      const debt = debtExcelOptions.debtsByName.get(name.toLowerCase());
+      if (!debt) return;
+      selectedDebtId = selectedDebtId || debt.id;
+      selectedDebtName = selectedDebtName || debt.name || 'Deuda';
+    });
+
+    if (!selectedDebtId && !debtNames.length) {
+      splitExcelMultiValue(rawDebtId).forEach((id) => {
+        const debt = debtExcelOptions.debtsById.get(id);
+        if (!debt) return;
+        selectedDebtId = selectedDebtId || debt.id;
+        selectedDebtName = selectedDebtName || debt.name || 'Deuda';
+      });
+    }
+
+    return {
+      quotaIds: Array.from(new Set(quotaIds)),
+      debtIdMap,
+      debtId: selectedDebtId,
+      debtName: selectedDebtName,
+    };
+  }
+
+  function buildDebtQuotaAmountMapFromIds(totalAmount, quotaIds) {
+    const ids = Array.isArray(quotaIds) ? quotaIds : [];
+    const safeTotal = Math.round(Number(totalAmount || 0));
+    if (!ids.length || safeTotal <= 0) return null;
+    if (ids.length === 1) return { [ids[0]]: safeTotal };
+
+    const weights = {};
+    ids.forEach((id) => {
+      const quota = debtExcelOptions.quotasById.get(id);
+      const remaining = Number(quota?.remaining || quota?.planned || 0);
+      weights[id] = Math.max(Math.round(remaining), 0);
+    });
+    const weightSum = Object.values(weights).reduce(
+      (sum, value) => sum + value,
+      0,
+    );
+    const allocations = {};
+    if (weightSum > 0) {
+      const raw = ids.map((id) => ({
+        id,
+        raw: (Number(weights[id] || 0) / weightSum) * safeTotal,
+      }));
+      const floors = raw.map((item) => ({
+        id: item.id,
+        value: Math.floor(item.raw),
+        frac: item.raw - Math.floor(item.raw),
+      }));
+      let remainder =
+        safeTotal - floors.reduce((sum, item) => sum + item.value, 0);
+      floors.sort((a, b) => b.frac - a.frac);
+      for (let i = 0; i < floors.length && remainder > 0; i += 1) {
+        floors[i].value += 1;
+        remainder -= 1;
+      }
+      floors.forEach((item) => {
+        allocations[item.id] = item.value;
+      });
+      return allocations;
+    }
+
+    const base = Math.floor(safeTotal / ids.length);
+    let remainder = safeTotal - base * ids.length;
+    ids.forEach((id) => {
+      allocations[id] = base + (remainder > 0 ? 1 : 0);
+      if (remainder > 0) remainder -= 1;
+    });
+    return allocations;
+  }
+
+  function applyDebtMeta(meta, debtSelection, amount) {
+    const nextMeta = meta && typeof meta === 'object' ? { ...meta } : {};
+    const quotaIds = debtSelection?.quotaIds || [];
+    if (quotaIds.length) {
+      nextMeta.debtQuotaIds = quotaIds;
+      if (quotaIds.length === 1) {
+        nextMeta.debtQuotaId = quotaIds[0];
+        delete nextMeta.debtQuotaAmounts;
+      } else {
+        delete nextMeta.debtQuotaId;
+        const allocationMap = buildDebtQuotaAmountMapFromIds(amount, quotaIds);
+        if (allocationMap) nextMeta.debtQuotaAmounts = allocationMap;
+        else delete nextMeta.debtQuotaAmounts;
+      }
+      nextMeta.debtQuotaDebtIds = debtSelection.debtIdMap || {};
+      if (debtSelection.debtId) nextMeta.debtId = debtSelection.debtId;
+      else delete nextMeta.debtId;
+      if (debtSelection.debtName) {
+        nextMeta.debtName = debtSelection.debtName;
+        nextMeta.budgetSubcategoryName = debtSelection.debtName;
+      } else {
+        delete nextMeta.debtName;
+        nextMeta.budgetSubcategoryName = 'pago de deudas';
+      }
+      delete nextMeta.budgetSubcategoryNames;
+      delete nextMeta.budgetSubcategoryIds;
+      delete nextMeta.budgetSubcategoryAmounts;
+      delete nextMeta.budgetSubcategoryId;
+      return nextMeta;
+    }
+
+    delete nextMeta.debtQuotaIds;
+    delete nextMeta.debtQuotaId;
+    delete nextMeta.debtQuotaAmounts;
+    delete nextMeta.debtQuotaDebtIds;
+    if (debtSelection?.debtId) nextMeta.debtId = debtSelection.debtId;
+    else delete nextMeta.debtId;
+    if (debtSelection?.debtName) {
+      nextMeta.debtName = debtSelection.debtName;
+      nextMeta.budgetSubcategoryName = debtSelection.debtName;
+    } else {
+      delete nextMeta.debtName;
+      nextMeta.budgetSubcategoryName = 'pago de deudas';
+    }
+    delete nextMeta.budgetSubcategoryNames;
+    delete nextMeta.budgetSubcategoryIds;
+    delete nextMeta.budgetSubcategoryAmounts;
+    delete nextMeta.budgetSubcategoryId;
+    return nextMeta;
+  }
+
+  async function handleExportExcel() {
     if (!canExport) return;
+    try {
+      await loadExcelLibs();
+    } catch (err) {
+      console.error('No se pudo cargar el exportador de Excel', { message: err?.message });
+      toast.error('No se pudo preparar el Excel. Revisa tu conexión.');
+      return;
+    }
     const excelCategories = categoryOptions.includes(incomeCategoryLabel)
       ? categoryOptions
       : [incomeCategoryLabel, ...categoryOptions];
@@ -2188,10 +2402,14 @@ export function Transactions({
       'Tipo',
       'Categoria',
       'Subcategoria',
+      'CuentaDeuda',
+      'CuotaDeuda',
       'Descripcion',
       'Monto',
       'Usuario',
       'UsuarioId',
+      'DeudaId',
+      'CuotaDeudaId',
     ];
     const exportRows = [...filtered].sort((a, b) => {
       const aKey = getTransactionSortKey(a);
@@ -2204,17 +2422,24 @@ export function Transactions({
       }
       return 0;
     });
-    const rows = exportRows.map((tx) => [
-      tx.id || '',
-      (tx.date || tx.createdAt || '').slice(0, 10),
-      tx.type === 'ingreso' ? 'Ingreso' : tx.type === 'gasto' ? 'Gasto' : '',
-      tx.type === 'ingreso' ? incomeCategoryLabel : tx.category || '',
-      getSubcategoryLabel(tx),
-      tx.description || '',
-      Number(tx.amount || 0),
-      tx.ownerName || getOwnerName(tx),
-      tx.ownerId || '',
-    ]);
+    const rows = exportRows.map((tx) => {
+      const debtFields = getDebtExcelFields(tx);
+      return [
+        tx.id || '',
+        txDateKey(tx),
+        tx.type === 'ingreso' ? 'Ingreso' : tx.type === 'gasto' ? 'Gasto' : '',
+        tx.type === 'ingreso' ? incomeCategoryLabel : tx.category || '',
+        getSubcategoryLabel(tx),
+        debtFields.debtName,
+        debtFields.quotaLabel,
+        tx.description || '',
+        Number(tx.amount || 0),
+        tx.ownerName || getOwnerName(tx),
+        tx.ownerId || '',
+        debtFields.debtId,
+        debtFields.quotaId,
+      ];
+    });
 
     const sheet = XLSX.utils.aoa_to_sheet([headers, ...rows]);
     sheet['!rows'] = [{ hpt: 20 }];
@@ -2226,7 +2451,12 @@ export function Transactions({
       sheet['!ref'] = XLSX.utils.encode_range(range);
     }
     sheet['!cols'] = headers.map((header) => {
-      if (header === 'UsuarioId' || header === 'Id') {
+      if (
+        header === 'UsuarioId' ||
+        header === 'Id' ||
+        header === 'DeudaId' ||
+        header === 'CuotaDeudaId'
+      ) {
         return { hidden: true };
       }
       if (header === 'Descripcion') {
@@ -2237,6 +2467,12 @@ export function Transactions({
       }
       if (header === 'Subcategoria') {
         return { wch: 24 };
+      }
+      if (header === 'CuentaDeuda') {
+        return { wch: 28 };
+      }
+      if (header === 'CuotaDeuda') {
+        return { wch: 48 };
       }
       return { wch: 16 };
     });
@@ -2261,6 +2497,36 @@ export function Transactions({
       ['Gasto'],
     ]);
     typesSheet['!protect'] = { password: 'finanzas-password-control' };
+    const debtsSheet = XLSX.utils.aoa_to_sheet([
+      ['CuentaDeuda', 'DeudaId'],
+      ...debtExcelOptions.debtRows.map((d) => [d.name, d.id]),
+    ]);
+    debtsSheet['!protect'] = { password: 'finanzas-password-control' };
+    const debtQuotasSheet = XLSX.utils.aoa_to_sheet([
+      [
+        'CuotaDeuda',
+        'CuotaDeudaId',
+        'CuentaDeuda',
+        'DeudaId',
+        'Periodo',
+        'Vencimiento',
+        'Planificado',
+        'Pendiente',
+      ],
+      ...debtExcelOptions.quotaRows.map((q) => [
+        q.label,
+        q.id,
+        q.debtName,
+        q.debtId,
+        q.periodKey,
+        q.dueDate,
+        q.planned,
+        q.remaining,
+      ]),
+    ]);
+    debtQuotasSheet['!protect'] = {
+      password: 'finanzas-password-control',
+    };
     const usedRangeNames = new Set();
     const subcategoryColumns = [];
     const subcategoryMapRows = [['Categoria', 'Rango']];
@@ -2301,6 +2567,8 @@ export function Transactions({
     XLSX.utils.book_append_sheet(book, subcategoryMapSheet, 'SubcatMap');
     XLSX.utils.book_append_sheet(book, usersSheet, 'Usuarios');
     XLSX.utils.book_append_sheet(book, typesSheet, 'Tipos');
+    XLSX.utils.book_append_sheet(book, debtsSheet, 'Deudas');
+    XLSX.utils.book_append_sheet(book, debtQuotasSheet, 'CuotasDeuda');
     XLSX.utils.book_append_sheet(book, controlSheet, 'Control');
     const namedRanges = subcategoryColumns.map((col, index) => {
       const rangeName = col[0];
@@ -2319,6 +2587,8 @@ export function Transactions({
         { name: 'SubcatMap', Hidden: 1 },
         { name: 'Usuarios', Hidden: 1 },
         { name: 'Tipos', Hidden: 1 },
+        { name: 'Deudas', Hidden: 1 },
+        { name: 'CuotasDeuda', Hidden: 1 },
         { name: 'Control', Hidden: 1 },
       ],
       Names: namedRanges,
@@ -2335,6 +2605,8 @@ export function Transactions({
     const typeIndex = headers.indexOf('Tipo');
     const categoryIndex = headers.indexOf('Categoria');
     const subcategoryIndex = headers.indexOf('Subcategoria');
+    const debtAccountIndex = headers.indexOf('CuentaDeuda');
+    const debtQuotaIndex = headers.indexOf('CuotaDeuda');
     const amountIndex = headers.indexOf('Monto');
     const userIndex = headers.indexOf('Usuario');
     const rowStart = 2;
@@ -2413,7 +2685,27 @@ export function Transactions({
       );
     }
 
-    const zipped = unzipSync(new Uint8Array(output));
+    if (debtAccountIndex >= 0 && debtExcelOptions.debtRows.length > 0) {
+      const debtCol = columnIndexToLetter(debtAccountIndex);
+      const debtRange = `Deudas!$A$2:$A$${debtExcelOptions.debtRows.length + 1}`;
+      validations.push(
+        `<dataValidation type="list" allowBlank="1" showInputMessage="1" showErrorMessage="1" sqref="${debtCol}${rowStart}:${debtCol}${rowEnd}">` +
+          `<formula1>${escapeXml(debtRange)}</formula1>` +
+          '</dataValidation>',
+      );
+    }
+
+    if (debtQuotaIndex >= 0 && debtExcelOptions.quotaRows.length > 0) {
+      const quotaCol = columnIndexToLetter(debtQuotaIndex);
+      const quotaRange = `CuotasDeuda!$A$2:$A$${debtExcelOptions.quotaRows.length + 1}`;
+      validations.push(
+        `<dataValidation type="list" allowBlank="1" showInputMessage="1" showErrorMessage="1" sqref="${quotaCol}${rowStart}:${quotaCol}${rowEnd}">` +
+          `<formula1>${escapeXml(quotaRange)}</formula1>` +
+          '</dataValidation>',
+      );
+    }
+
+    const zipped = FFLATE.unzipSync(new Uint8Array(output));
     const sheetPath = 'xl/worksheets/sheet1.xml';
     const stylesPath = 'xl/styles.xml';
     const decoder = new TextDecoder();
@@ -2483,7 +2775,7 @@ export function Transactions({
       zipped[sheetPath] = encoder.encode(sheetXml);
     }
 
-    output = zipSync(zipped);
+    output = FFLATE.zipSync(zipped);
 
     const blob = new Blob([output], {
       type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
@@ -2503,6 +2795,7 @@ export function Transactions({
     setIsImporting(true);
 
     try {
+      await loadExcelLibs();
       const data = await file.arrayBuffer();
       const workbook = XLSX.read(data, { type: 'array', cellDates: true });
       if (!projectId) {
@@ -2552,10 +2845,14 @@ export function Transactions({
         'tipo',
         'categoria',
         'subcategoria',
+        'cuentadeuda',
+        'cuotadeuda',
         'descripcion',
         'monto',
         'usuario',
         'usuarioid',
+        'deudaid',
+        'cuotadeudaid',
         'instrucciones',
       ]);
 
@@ -2627,6 +2924,16 @@ export function Transactions({
           'subcategoria',
           'subcat',
         ]);
+        const rawDebtAccount = normalizeRowValue(normalized, [
+          'cuentadeuda',
+          'cuenta deuda',
+          'deuda',
+        ]);
+        const rawDebtQuota = normalizeRowValue(normalized, [
+          'cuotadeuda',
+          'cuota deuda',
+          'cuota',
+        ]);
         const rawDescription = normalizeRowValue(normalized, [
           'descripcion',
           'description',
@@ -2658,6 +2965,18 @@ export function Transactions({
           'user email',
           'email',
           'correo',
+        ]);
+        const rawDebtId = normalizeRowValue(normalized, [
+          'deudaid',
+          'deuda id',
+          'debtid',
+          'debt id',
+        ]);
+        const rawDebtQuotaId = normalizeRowValue(normalized, [
+          'cuotadeudaid',
+          'cuota deuda id',
+          'debtquotaid',
+          'debt quota id',
         ]);
 
         const typeValue = normalizeTypeValue(rawType);
@@ -2705,7 +3024,10 @@ export function Transactions({
         }
 
         let subcategoryId = '';
-        if (normalizedCategoryValue && normalizedSubcategoryValue) {
+        const isDebtRow = typeValue === 'gasto' && isDebtCategory(
+          normalizedCategoryValue,
+        );
+        if (normalizedCategoryValue && normalizedSubcategoryValue && !isDebtRow) {
           const nameMap = subcategoryMap.byCategoryName.get(
             normalizedCategoryValue,
           );
@@ -2719,6 +3041,24 @@ export function Transactions({
           subcategoryId = candidate;
         }
 
+        const debtSelection = isDebtRow
+          ? resolveDebtSelectionFromRow({
+              rawDebtId,
+              rawDebtName: rawDebtAccount,
+              rawQuotaId: rawDebtQuotaId,
+              rawQuotaLabel: rawDebtQuota,
+            })
+          : { quotaIds: [], debtIdMap: {}, debtId: '', debtName: '' };
+        if (isDebtRow) {
+          const hasDebtInput = String(
+            rawDebtAccount || rawDebtQuota || rawDebtId || rawDebtQuotaId || '',
+          ).trim();
+          if (hasDebtInput && !debtSelection.quotaIds.length && !debtSelection.debtId) {
+            fatalError = `Deuda o cuota no valida en fila ${rowNumber}`;
+            break;
+          }
+        }
+
         const rowData = {
           rowNumber,
           id: String(rawId || '').trim(),
@@ -2728,6 +3068,7 @@ export function Transactions({
           category: normalizedCategoryValue,
           subcategory: normalizedSubcategoryValue,
           subcategoryId,
+          debtSelection,
           description: String(rawDescription || '').trim(),
           owner,
         };
@@ -2746,6 +3087,17 @@ export function Transactions({
           )
             .trim()
             .toLowerCase();
+          const existingDebtFields = getDebtExcelFields(existing);
+          const existingDebtId = String(existingDebtFields.debtId || '').trim();
+          const existingQuotaId = String(existingDebtFields.quotaId || '').trim();
+          const rowDebtId = Array.from(
+            new Set(
+              [rowData.debtSelection.debtId]
+                .concat(Object.values(rowData.debtSelection.debtIdMap || {}))
+                .filter(Boolean),
+            ),
+          ).join('; ');
+          const rowQuotaId = rowData.debtSelection.quotaIds.join('; ');
           const existingAmount = Math.round(Number(existing.amount || 0));
           const existingDescription = String(existing.description || '').trim();
           const existingOwnerId = String(existing.ownerId || '').trim();
@@ -2757,8 +3109,11 @@ export function Transactions({
           const sameOwner = !existingOwnerId || existingOwnerId === rowOwnerId;
           const sameCategory = existingCategory === rowData.category;
           const sameSubcategory =
+            isDebtCategory(rowData.category) ||
             existingSubcategory === rowSubcategory ||
             (!existingSubcategory && !rowSubcategory);
+          const sameDebt =
+            existingDebtId === rowDebtId && existingQuotaId === rowQuotaId;
           const sameAmount = existingAmount === Math.round(rowData.amount || 0);
           const sameDescription = existingDescription === rowData.description;
           const sameType = existingType === rowData.type;
@@ -2768,6 +3123,7 @@ export function Transactions({
             !sameOwner ||
             !sameCategory ||
             !sameSubcategory ||
+            !sameDebt ||
             !sameAmount ||
             !sameDescription ||
             !sameType ||
@@ -2798,7 +3154,7 @@ export function Transactions({
         });
         const msg =
           'Faltan datos en columnas obligatorias:\n' + parts.join('\n');
-        window.alert(msg);
+        toast.warning(msg);
         setImportError('Faltan datos en columnas obligatorias.');
         return;
       }
@@ -2822,7 +3178,7 @@ export function Transactions({
         const msg =
           'Los movimientos nuevos deben agregarse al final y con Id vacio. ' +
           `Revisa las filas: ${orderErrors.join(', ')}`;
-        window.alert(msg);
+        toast.warning(msg);
         setImportError('Orden incorrecto de filas.');
         return;
       }
@@ -2831,7 +3187,7 @@ export function Transactions({
         const msg =
           'No modifiques la columna Id. Para nuevos movimientos deja Id vacio. ' +
           `Revisa las filas: ${unknownIds.join(', ')}`;
-        window.alert(msg);
+        toast.warning(msg);
         setImportError('Ids no permitidos en nuevas filas.');
         return;
       }
@@ -2848,7 +3204,7 @@ export function Transactions({
         const msg =
           'No se permite eliminar movimientos existentes. El Excel debe ' +
           `contener todas las filas actuales. Faltan ${missingExisting.length}.`;
-        window.alert(msg);
+        toast.warning(msg);
         setImportError('Faltan movimientos existentes.');
         return;
       }
@@ -2864,7 +3220,7 @@ export function Transactions({
         return;
       }
 
-      const ok = window.confirm(
+      const ok = await confirmDialog(
         `Se actualizaran ${toUpdate.length} movimientos y se agregaran ${toCreate.length} movimientos nuevos.`,
       );
       if (!ok) return;
@@ -2876,7 +3232,7 @@ export function Transactions({
           amount: Math.round(Number(rowData.amount || 0)),
           category: rowData.type === 'gasto' ? rowData.category : '',
           description: rowData.description,
-          date: rowData.date || new Date().toISOString().slice(0, 10),
+          date: rowData.date || todayKey(),
           ownerId: rowData.owner?.id ?? null,
           ownerName: rowData.owner?.name ?? null,
           ownerEmail: rowData.owner?.email ?? null,
@@ -2909,7 +3265,25 @@ export function Transactions({
           ]);
         }
 
-        if (isGasto && rowData.subcategoryId) {
+        if (isGasto && isDebt) {
+          const nextMeta = applyDebtMeta(
+            existingMeta,
+            rowData.debtSelection,
+            rowData.amount,
+          );
+          Object.keys(existingMeta).forEach((key) => {
+            if (!Object.is(existingMeta[key], nextMeta[key])) {
+              metaChanged = true;
+            }
+          });
+          Object.keys(nextMeta).forEach((key) => {
+            if (!Object.is(existingMeta[key], nextMeta[key])) {
+              metaChanged = true;
+            }
+          });
+          Object.keys(existingMeta).forEach((key) => delete existingMeta[key]);
+          Object.assign(existingMeta, nextMeta);
+        } else if (isGasto && rowData.subcategoryId) {
           const nextIds = [rowData.subcategoryId];
           const nextNames = rowData.subcategory;
           if (
@@ -2944,7 +3318,7 @@ export function Transactions({
           amount: Math.round(Number(row.amount || 0)),
           category: row.type === 'gasto' ? row.category : '',
           description: row.description,
-          date: row.date || new Date().toISOString().slice(0, 10),
+          date: row.date || todayKey(),
           ownerId: row.owner?.id || null,
           ownerName: row.owner?.name || null,
           ownerEmail: row.owner?.email || null,
@@ -2955,6 +3329,14 @@ export function Transactions({
             budgetSubcategoryIds: [row.subcategoryId],
             budgetSubcategoryNames: row.subcategory,
           };
+        }
+
+        if (row.type === 'gasto' && isDebtCategory(row.category)) {
+          base.meta = applyDebtMeta(
+            base.meta || {},
+            row.debtSelection,
+            row.amount,
+          );
         }
 
         await addTransaction({
@@ -3080,7 +3462,7 @@ export function Transactions({
         <Card>
           <div className="flex flex-col items-center">
             <div className="text-xs uppercase text-[color:var(--text-muted)] mb-1 text-center">
-              Balance
+              Balance a hoy
             </div>
             <div
               className={`w-full text-lg font-semibold ${
@@ -3135,9 +3517,15 @@ export function Transactions({
                 <Money n={saldoAnterior} />
               </div>
               <div className="flex items-center justify-between gap-2">
-                <span>Balance periodo</span>
-                <Money n={periodTotals.balance} />
+                <span>Balance periodo a hoy</span>
+                <Money n={balanceDisponible - saldoAnterior} />
               </div>
+              {balanceProyectado !== balanceDisponible && (
+                <div className="flex items-center justify-between gap-2">
+                  <span>Proyectado al cierre</span>
+                  <Money n={balanceProyectado} />
+                </div>
+              )}
             </div>
           </div>
         </Card>
@@ -4630,16 +5018,17 @@ export function Transactions({
 
                     <div className="flex flex-col gap-1">
                       <label className="text-xs text-[color:var(--text-muted)]">Monto</label>
-                      <div className="flex items-center gap-2">
-                        <span className="text-sm text-[color:var(--text-muted)]">$</span>
-                        <input
-                          type="text"
-                          className="border rounded-lg px-2 py-1 text-sm flex-1"
-                          value={amountFormatted}
-                          onChange={(e) => {
-                            setAmountEditedByUser(true);
-                            const raw = e.target.value;
-                            const digits = raw.replace(/\D/g, '');
+                    <div className="flex items-center gap-2">
+                      <span className="text-sm text-[color:var(--text-muted)]">$</span>
+                      <input
+                        type="text"
+                        className="border rounded-lg px-2 py-1 text-sm flex-1 disabled:bg-[color:var(--surface-2)] disabled:text-[color:var(--text-faint)] disabled:cursor-not-allowed"
+                        value={amountFormatted}
+                        disabled={shouldLockAmount || shouldLockDebtAmount}
+                        onChange={(e) => {
+                          setAmountEditedByUser(true);
+                          const raw = e.target.value;
+                          const digits = raw.replace(/\D/g, '');
                             if (!digits) {
                               setAmountFormatted('');
                               setAmount('');
@@ -4650,11 +5039,18 @@ export function Transactions({
                             );
                             setAmountFormatted(formatted);
                             setAmount(digits);
-                          }}
-                          placeholder="0"
-                        />
-                      </div>
+                        }}
+                        placeholder="0"
+                      />
                     </div>
+                    {(shouldLockAmount || shouldLockDebtAmount) && (
+                      <span className="text-[11px] text-[color:var(--text-muted)]">
+                        {shouldLockDebtAmount
+                          ? 'Monto bloqueado por multiples cuotas seleccionadas.'
+                          : 'Monto bloqueado por multiples subcategorias.'}
+                      </span>
+                    )}
+                  </div>
 
                     <div className="flex flex-col gap-1">
                       <label className="text-xs text-[color:var(--text-muted)]">Fecha</label>
@@ -4719,6 +5115,9 @@ export function Transactions({
                 <label className="text-xs text-[color:var(--text-muted)]">
                   Suma el efectivo actual
                 </label>
+                <div className="text-[11px] text-[color:var(--text-muted)]">
+                  Puedes sumar montos: 1000+2000+500
+                </div>
                 <div className="flex items-center gap-2">
                   <span className="text-sm text-[color:var(--text-muted)]">$</span>
                   <input
@@ -4726,11 +5125,27 @@ export function Transactions({
                     className="border rounded-lg px-2 py-1 text-sm flex-1"
                     value={cashFormatted}
                     onChange={(e) =>
-                      handleMoneyInput(e.target.value, {
+                      handleCalculatorInput(e.target.value, {
                         setFormatted: setCashFormatted,
                         setValue: setCashInput,
                       })
                     }
+                    onBlur={(e) =>
+                      commitCalculatorInput(e.target.value, {
+                        setFormatted: setCashFormatted,
+                        setValue: setCashInput,
+                      })
+                    }
+                    onKeyDown={(e) => {
+                      if (e.key === 'Enter') {
+                        e.preventDefault();
+                        commitCalculatorInput(e.currentTarget.value, {
+                          setFormatted: setCashFormatted,
+                          setValue: setCashInput,
+                        });
+                        e.currentTarget.blur();
+                      }
+                    }}
                     placeholder="0"
                   />
                 </div>
@@ -4740,6 +5155,9 @@ export function Transactions({
                 <label className="text-xs text-[color:var(--text-muted)]">
                   Suma el debito actual
                 </label>
+                <div className="text-[11px] text-[color:var(--text-muted)]">
+                  Puedes sumar montos: 1000+2000+500
+                </div>
                 <div className="flex items-center gap-2">
                   <span className="text-sm text-[color:var(--text-muted)]">$</span>
                   <input
@@ -4747,11 +5165,27 @@ export function Transactions({
                     className="border rounded-lg px-2 py-1 text-sm flex-1"
                     value={debitFormatted}
                     onChange={(e) =>
-                      handleMoneyInput(e.target.value, {
+                      handleCalculatorInput(e.target.value, {
                         setFormatted: setDebitFormatted,
                         setValue: setDebitInput,
                       })
                     }
+                    onBlur={(e) =>
+                      commitCalculatorInput(e.target.value, {
+                        setFormatted: setDebitFormatted,
+                        setValue: setDebitInput,
+                      })
+                    }
+                    onKeyDown={(e) => {
+                      if (e.key === 'Enter') {
+                        e.preventDefault();
+                        commitCalculatorInput(e.currentTarget.value, {
+                          setFormatted: setDebitFormatted,
+                          setValue: setDebitInput,
+                        });
+                        e.currentTarget.blur();
+                      }
+                    }}
                     placeholder="0"
                   />
                 </div>
@@ -4836,24 +5270,31 @@ export function Transactions({
                   </div>
                 </div>
 
-                {adjustType === 'gasto' && (
-                  <div className="flex flex-col gap-2">
-                    <label className="text-xs text-[color:var(--text-muted)]">
-                      Categoria del ajuste
+                <div className="flex flex-col gap-2">
+                  <div className="text-xs text-[color:var(--text-muted)]">Aplicar en</div>
+                  <div className="flex flex-col gap-1 text-sm">
+                    <label className="flex items-center gap-1">
+                      <input
+                        type="radio"
+                        name="adjust-period"
+                        value="previous"
+                        checked={adjustPeriod === 'previous'}
+                        onChange={(e) => setAdjustPeriod(e.target.value)}
+                      />
+                      Periodo anterior
                     </label>
-                    <select
-                      className="border rounded-lg px-2 py-1 text-sm"
-                      value={adjustCategory}
-                      onChange={(e) => setAdjustCategory(e.target.value)}
-                    >
-                      {categoryOptions.map((c) => (
-                        <option key={c} value={c}>
-                          {c}
-                        </option>
-                      ))}
-                    </select>
+                    <label className="flex items-center gap-1">
+                      <input
+                        type="radio"
+                        name="adjust-period"
+                        value="current"
+                        checked={adjustPeriod === 'current'}
+                        onChange={(e) => setAdjustPeriod(e.target.value)}
+                      />
+                      Periodo actual
+                    </label>
                   </div>
-                )}
+                </div>
 
                 <div className="flex flex-col gap-2">
                   <label className="text-xs text-[color:var(--text-muted)]">

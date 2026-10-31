@@ -21,10 +21,11 @@ export function Progress({
     if (v >= 100) color = 'bg-[color:var(--success)]';
     else color = 'bg-[color:var(--primary)]';
   } else {
-    // Riesgo: warning cerca del limite, rojo si se pasa.
-    if (v > 100) color = 'bg-[color:var(--danger)]';
+    // Semáforo: verde bajo 80 %, amarillo hasta 100 %, rojo si se pasa
+    // (o si `danger` lo indica, por ejemplo gasto sin presupuesto).
+    if (danger || v > 100) color = 'bg-[color:var(--danger)]';
     else if (v >= 80) color = 'bg-[color:var(--warning)]';
-    else color = 'bg-[color:var(--primary)]';
+    else color = 'bg-[color:var(--success)]';
   }
 
   return (

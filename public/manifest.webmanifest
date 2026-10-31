@@ -1,0 +1,21 @@
+{
+  "name": "Finanzas en Familia",
+  "short_name": "Finanzas",
+  "description": "Gastos, presupuesto, cuotas y ahorro del hogar en un solo lugar.",
+  "lang": "es-CL",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "orientation": "portrait",
+  "background_color": "#f2f5f9",
+  "theme_color": "#1e3a8a",
+  "icons": [
+    { "src": "/logo-finanzas-en-familia.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "any" },
+    { "src": "/icon-maskable.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "maskable" },
+    { "src": "/logo-finanzas-en-familia.png", "sizes": "1048x1080", "type": "image/png", "purpose": "any" }
+  ],
+  "shortcuts": [
+    { "name": "Registrar gasto", "short_name": "Gasto", "url": "/?accion=nuevo-gasto#movimientos" },
+    { "name": "Plan del mes", "short_name": "Plan", "url": "/#plan" }
+  ]
+}

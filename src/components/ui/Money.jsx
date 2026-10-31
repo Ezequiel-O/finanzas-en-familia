@@ -1,4 +1,4 @@
-// src/components/ui/money.jsx
+// src/components/ui/Money.jsx
 
 export function Money({ n }) {
   const sign = Number(n) < 0 ? '-' : '';

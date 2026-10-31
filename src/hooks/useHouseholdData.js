@@ -21,12 +21,19 @@ import {
   documentId,
 } from 'firebase/firestore';
 import { db } from '../firebase';
-import { DEBT_CATEGORY, CATEGORIES } from '../constants.js';
-import { monthKey, shiftMonth } from '../utils/budgetPeriod';
+import { DEBT_CATEGORY, CATEGORIES, SAVINGS_CATEGORY } from '../constants.js';
+import { budgetMonthKeyForDate, monthKey, shiftMonth } from '../utils/budgetPeriod';
+import { txDateKey } from '../domain/ledger.js';
 import { filterTransactionsByPeriodAndUser } from '../utils/transactions.js';
 import { getSubcategoryAllocationsForTransaction } from '../utils/subcategoryAllocations.js';
+import { toast } from '../components/feedback/feedback.js';
+import { validateCategoryChange } from '../domain/categories.js';
+import {
+  transactionPatchSchema,
+  transactionSchema,
+  validate,
+} from '../domain/schemas.js';
 
-const SAVINGS_CATEGORY = 'Ahorro';
 const DEFAULT_UNBUDGETED_LABEL = 'gasto no presupuestado';
 const DEFAULT_UNBUDGETED_KEY = DEFAULT_UNBUDGETED_LABEL.toLowerCase();
 const DEFAULT_USER_NAME = 'Usuario';
@@ -253,10 +260,16 @@ export default function useHouseholdData(householdId, authUser, options = {}) {
   const [savings, setSavings] = useState([]);
   const [trash, setTrash] = useState([]);
   const [fixedCategories, setFixedCategories] = useState({});
+  // Categorías prioritarias (comida, remedios...): el plan de pagos las reserva antes de pagar cuentas.
+  const [priorityCategories, setPriorityCategories] = useState({});
+  // Día del mes en que vence cada gasto fijo ({ Hogar: 5 }). Sin día, el plan pide definirlo.
+  const [fixedDueDays, setFixedDueDays] = useState({});
   const [householdUsers, setHouseholdUsers] = useState([]);
   const [memberInfo, setMemberInfo] = useState({});
   const [ownerUid, setOwnerUid] = useState(null);
   const [budgetCutDay, setBudgetCutDayState] = useState(1);
+  const [expectedIncome, setExpectedIncomeState] = useState(0);
+  const [closings, setClosings] = useState({});
   const budgetsRef = useRef({});
   const txStateRef = useRef({
     map: new Map(),
@@ -666,6 +679,8 @@ export default function useHouseholdData(householdId, authUser, options = {}) {
       setCategories(CATEGORIES);
       setBudgets(null);
       setFixedCategories({});
+      setPriorityCategories({});
+      setFixedDueDays({});
       setHouseholdUsers([]);
       setMemberInfo({});
       setOwnerUid(null);
@@ -988,6 +1003,9 @@ export default function useHouseholdData(householdId, authUser, options = {}) {
       const cats = normalizeCategoriesList(data.categories);
       setCategories(cats);
       setFixedCategories(data.fixedCategories || {});
+      setPriorityCategories(data.priorityCategories || {});
+      setFixedDueDays(data.fixedDueDays || {});
+      setExpectedIncomeState(Math.max(0, Number(data.expectedIncome || 0)));
     });
     return () => {
       unsub();
@@ -1111,6 +1129,26 @@ export default function useHouseholdData(householdId, authUser, options = {}) {
     };
   }, [householdId]);
 
+  // Cierres de periodo: { [periodKey]: { status, bankBalance, appBalance, difference, ... } }
+  useEffect(() => {
+    if (!householdId) {
+      setClosings({});
+      return undefined;
+    }
+    const unsub = onSnapshot(
+      collection(db, 'households', householdId, 'closings'),
+      (snap) => {
+        const next = {};
+        snap.forEach((d) => {
+          next[d.id] = { id: d.id, ...d.data() };
+        });
+        setClosings(next);
+      },
+      (err) => console.error('Error leyendo cierres', { code: err?.code }),
+    );
+    return () => unsub();
+  }, [householdId]);
+
   // Helpers internos para no repetir lógica
   function normalizeBudgetEntry(entry) {
     if (typeof entry === 'number') {
@@ -1147,7 +1185,11 @@ export default function useHouseholdData(householdId, authUser, options = {}) {
       deletedAt: Date.now(),
       ...(updatedBy ? { deletedBy: updatedBy } : {}),
     };
-    await addDoc(collection(db, 'households', householdId, 'trash'), payload);
+    const ref = await addDoc(
+      collection(db, 'households', householdId, 'trash'),
+      payload,
+    );
+    return ref.id;
   }
 
   async function addTrashItem(type, itemId, data) {
@@ -1334,24 +1376,78 @@ export default function useHouseholdData(householdId, authUser, options = {}) {
     }
   }
 
-  async function addTransaction(tx) {
+  function closedPeriodFor(dateKey) {
+    if (!dateKey) return null;
+    const pk = budgetMonthKeyForDate(dateKey, budgetCutDay || 1);
+    return closings[pk]?.status === 'closed' ? pk : null;
+  }
+
+  // Un periodo cerrado y conciliado no se puede modificar (se reabre explícitamente).
+  function blockIfClosed(...dateKeys) {
+    const pk = dateKeys.map(closedPeriodFor).find(Boolean);
+    if (!pk) return false;
+    toast.error(`El periodo ${pk} está cerrado y conciliado. Reábrelo en Plan del mes para hacer cambios.`);
+    return true;
+  }
+
+  // Historial de cambios de movimientos (solo se agrega, nunca se edita).
+  async function writeAudit(action, { txId, before = null, after = null }) {
+    if (!householdId) return;
     try {
-      await addDoc(
+      await addDoc(collection(db, 'households', householdId, 'auditLog'), {
+        action,
+        txId: txId || null,
+        before: before ? stripIdValue(before) : null,
+        after: after || null,
+        by: authUser?.uid || null,
+        byName: authUser?.displayName || authUser?.email || null,
+        at: serverTimestamp(),
+      });
+    } catch (err) {
+      // El historial no debe impedir la operación principal.
+      console.error('No se pudo registrar el historial', { code: err?.code });
+    }
+  }
+
+  // Devuelve el id del movimiento creado, o null si no se pudo guardar.
+  async function addTransaction(tx) {
+    if (blockIfClosed(txDateKey(tx))) return null;
+    const checked = validate(transactionSchema, tx);
+    if (!checked.ok) {
+      toast.error(`No se guardó el movimiento: ${checked.message}`);
+      return null;
+    }
+    try {
+      const ref = await addDoc(
         collection(db, 'households', householdId, 'transactions'),
-        { ...tx, ...buildUpdateMeta() },
+        { ...checked.data, ...buildUpdateMeta() },
       );
+      writeAudit('create', { txId: ref.id, after: checked.data });
+      return ref.id;
     } catch (e) {
-      console.error('Error al guardar transacción:', e);
-      alert('No se pudo guardar el movimiento. Revisa la consola.');
+      console.error('Error al guardar transacción', { code: e?.code });
+      toast.error('No se pudo guardar el movimiento. Revisa tu conexión e inténtalo de nuevo.');
+      return null;
     }
   }
 
   async function updateTransaction(id, patch) {
+    const checked = validate(transactionPatchSchema, patch);
+    if (!checked.ok) {
+      toast.error(`No se guardó el cambio: ${checked.message}`);
+      throw new Error(checked.message);
+    }
+    patch = checked.data;
+    const previous = txStateRef.current.map.get(id) || transactions.find((t) => t.id === id) || null;
+    if (blockIfClosed(txDateKey(previous || {}), patch.date ? txDateKey(patch) : '')) {
+      throw new Error('Periodo cerrado');
+    }
     const payload = { ...patch, ...buildUpdateMeta() };
     await updateDoc(
       doc(db, 'households', householdId, 'transactions', id),
       payload,
     );
+    writeAudit('update', { txId: id, before: previous, after: patch });
     const state = txStateRef.current;
     if (state.map.has(id)) {
       const current = state.map.get(id) || {};
@@ -1360,15 +1456,22 @@ export default function useHouseholdData(householdId, authUser, options = {}) {
     }
   }
 
+  // Devuelve { trashId, item } para poder ofrecer "Deshacer".
   async function removeTransaction(id) {
     const target = transactions.find((t) => t.id === id);
+    if (blockIfClosed(txDateKey(target || {}))) return null;
+    let trashId = null;
     if (target) {
-      await addToTrash('transaction', id, target);
+      trashId = await addToTrash('transaction', id, target);
     }
     await deleteDoc(doc(db, 'households', householdId, 'transactions', id));
+    writeAudit('delete', { txId: id, before: target });
     const state = txStateRef.current;
     state.map.delete(id);
     setTransactions(Array.from(state.map.values()));
+    return trashId
+      ? { trashId, item: { id: trashId, type: 'transaction', itemId: id, data: target } }
+      : null;
   }
 
   async function addDebt(d) {
@@ -1391,15 +1494,20 @@ export default function useHouseholdData(householdId, authUser, options = {}) {
     }
   }
 
+  // Devuelve { trashId, item } para poder ofrecer "Deshacer".
   async function removeDebt(id) {
     const target = debts.find((d) => d.id === id);
+    let trashId = null;
     if (target) {
-      await addToTrash('debt', id, target);
+      trashId = await addToTrash('debt', id, target);
     }
     await deleteDoc(doc(db, 'households', householdId, 'debts', id));
     const state = debtsStateRef.current;
     state.map.delete(id);
     setDebts(Array.from(state.map.values()));
+    return trashId
+      ? { trashId, item: { id: trashId, type: 'debt', itemId: id, data: target } }
+      : null;
   }
 
   async function addSaving(s) {
@@ -1422,15 +1530,20 @@ export default function useHouseholdData(householdId, authUser, options = {}) {
     }
   }
 
+  // Devuelve { trashId, item } para poder ofrecer "Deshacer".
   async function removeSaving(id) {
     const target = savings.find((s) => s.id === id);
+    let trashId = null;
     if (target) {
-      await addToTrash('saving', id, target);
+      trashId = await addToTrash('saving', id, target);
     }
     await deleteDoc(doc(db, 'households', householdId, 'savings', id));
     const state = savingsStateRef.current;
     state.map.delete(id);
     setSavings(Array.from(state.map.values()));
+    return trashId
+      ? { trashId, item: { id: trashId, type: 'saving', itemId: id, data: target } }
+      : null;
   }
 
   async function restoreTrashItem(item) {
@@ -1518,6 +1631,43 @@ export default function useHouseholdData(householdId, authUser, options = {}) {
     }
   }
 
+  // Colecciones que forman el historial financiero del hogar. No incluye el hogar,
+  // sus miembros, invitaciones ni la configuración (categorías y día de corte).
+  const FINANCE_COLLECTIONS = ['transactions', 'budgets', 'debts', 'savings', 'trash'];
+
+  // Lee TODO el historial directo de Firestore (el estado local está paginado).
+  async function exportFinances() {
+    if (!householdId) throw new Error('Sin hogar seleccionado');
+    const collections = {};
+    for (const col of FINANCE_COLLECTIONS) {
+      const snap = await getDocs(collection(db, 'households', householdId, col));
+      collections[col] = snap.docs.map((d) => ({ id: d.id, data: d.data() }));
+    }
+    return { householdId, exportedAt: new Date().toISOString(), collections };
+  }
+
+  // Borra el historial financiero completo. Devuelve cuántos documentos se borraron.
+  async function resetFinances() {
+    if (!householdId) throw new Error('Sin hogar seleccionado');
+    let deleted = 0;
+    for (const col of FINANCE_COLLECTIONS) {
+      const snap = await getDocs(collection(db, 'households', householdId, col));
+      for (let i = 0; i < snap.docs.length; i += 400) {
+        const batch = writeBatch(db);
+        snap.docs.slice(i, i + 400).forEach((d) => batch.delete(d.ref));
+        await batch.commit();
+      }
+      deleted += snap.size;
+    }
+    resetPagedState(txStateRef.current, setTransactions);
+    resetPagedState(debtsStateRef.current, setDebts);
+    resetPagedState(savingsStateRef.current, setSavings);
+    resetPagedState(trashStateRef.current, setTrash);
+    syncBudgetsState({});
+    writeAudit('reset-finances', { after: { deleted } });
+    return deleted;
+  }
+
   async function purgeTrashItem(id) {
     const safeId = String(id || '').trim();
     if (!householdId || !safeId) return;
@@ -1532,8 +1682,15 @@ export default function useHouseholdData(householdId, authUser, options = {}) {
     if (!trimmed) return;
     if (!householdId) return;
 
-    // "Deudas" es una categoria fija, no se agrega manualmente
-    if (trimmed === DEBT_CATEGORY) return;
+    const addError = validateCategoryChange({
+      action: 'add',
+      to: trimmed,
+      existing: categories || [],
+    });
+    if (addError) {
+      toast.warning(addError);
+      return;
+    }
 
     const configRef = doc(
       db,
@@ -1593,6 +1750,11 @@ export default function useHouseholdData(householdId, authUser, options = {}) {
     const trimmed = String(name || '').trim();
     if (!trimmed) return;
     if (!householdId) return;
+    const removeError = validateCategoryChange({ action: 'remove', from: trimmed });
+    if (removeError) {
+      toast.warning(removeError);
+      return;
+    }
 
     const configRef = doc(
       db,
@@ -1602,6 +1764,8 @@ export default function useHouseholdData(householdId, authUser, options = {}) {
       META_DOC_ID,
     );
     let nextFixed = null;
+    let nextPriority = null;
+    let nextDueDays = null;
     await runTransaction(db, async (tx) => {
       const snap = await tx.get(configRef);
       const data = snap.exists() ? snap.data() : {};
@@ -1614,13 +1778,29 @@ export default function useHouseholdData(householdId, authUser, options = {}) {
       const currentFixed = data.fixedCategories || {};
       nextFixed = { ...currentFixed };
       delete nextFixed[trimmed];
+      nextPriority = { ...(data.priorityCategories || {}) };
+      delete nextPriority[trimmed];
+      // Borra el día de la categoría y los de sus subcategorías ("Categoría::sub").
+      nextDueDays = Object.fromEntries(
+        Object.entries(data.fixedDueDays || {}).filter(
+          ([key]) => key !== trimmed && !key.startsWith(`${trimmed}::`),
+        ),
+      );
       tx.set(
         configRef,
-        { categories: newCats, fixedCategories: nextFixed, ...buildUpdateMeta() },
+        {
+          categories: newCats,
+          fixedCategories: nextFixed,
+          priorityCategories: nextPriority,
+          fixedDueDays: nextDueDays,
+          ...buildUpdateMeta(),
+        },
         { merge: true },
       );
     });
     if (nextFixed) setFixedCategories(nextFixed);
+    if (nextPriority) setPriorityCategories(nextPriority);
+    if (nextDueDays) setFixedDueDays(nextDueDays);
 
     const snap = await getDocs(
       collection(db, 'households', householdId, BUDGETS_COLLECTION),
@@ -1665,6 +1845,16 @@ export default function useHouseholdData(householdId, authUser, options = {}) {
     const to = String(newName || '').trim();
     if (!from || !to || from === to) return;
     if (!householdId) return;
+    const renameError = validateCategoryChange({
+      action: 'rename',
+      from,
+      to,
+      existing: categories || [],
+    });
+    if (renameError) {
+      toast.warning(renameError);
+      return;
+    }
 
     const configRef = doc(
       db,
@@ -1674,6 +1864,8 @@ export default function useHouseholdData(householdId, authUser, options = {}) {
       META_DOC_ID,
     );
     let nextFixed = null;
+    let nextPriority = null;
+    let nextDueDays = null;
     let renamed = false;
     await runTransaction(db, async (tx) => {
       const snap = await tx.get(configRef);
@@ -1691,15 +1883,36 @@ export default function useHouseholdData(householdId, authUser, options = {}) {
         nextFixed[to] = nextFixed[from];
         delete nextFixed[from];
       }
+      nextPriority = { ...(data.priorityCategories || {}) };
+      if (Object.prototype.hasOwnProperty.call(nextPriority, from)) {
+        nextPriority[to] = nextPriority[from];
+        delete nextPriority[from];
+      }
+      // Mueve el día de la categoría y los de sus subcategorías ("Categoría::sub").
+      nextDueDays = Object.fromEntries(
+        Object.entries(data.fixedDueDays || {}).map(([key, value]) => {
+          if (key === from) return [to, value];
+          if (key.startsWith(`${from}::`)) return [`${to}${key.slice(from.length)}`, value];
+          return [key, value];
+        }),
+      );
       tx.set(
         configRef,
-        { categories: newCats, fixedCategories: nextFixed, ...buildUpdateMeta() },
+        {
+          categories: newCats,
+          fixedCategories: nextFixed,
+          priorityCategories: nextPriority,
+          fixedDueDays: nextDueDays,
+          ...buildUpdateMeta(),
+        },
         { merge: true },
       );
       renamed = true;
     });
     if (!renamed) return;
     if (nextFixed) setFixedCategories(nextFixed);
+    if (nextPriority) setPriorityCategories(nextPriority);
+    if (nextDueDays) setFixedDueDays(nextDueDays);
 
     const mergeBudgetEntries = (preferred, fallback) => {
       const primary = normalizeBudgetEntry(preferred);
@@ -1859,6 +2072,42 @@ export default function useHouseholdData(householdId, authUser, options = {}) {
     });
   }
 
+  // Se guarda siempre la marca (true/false): un mapa con claves indica que el hogar ya eligió
+  // sus prioridades, y el plan deja de adivinarlas por el nombre.
+  async function setCategoryPriority(cat, isPriority) {
+    const name = String(cat || '').trim();
+    if (!name || !householdId) return;
+    const ref = doc(db, 'households', householdId, META_COLLECTION, META_DOC_ID);
+    let next = null;
+    await runTransaction(db, async (tx) => {
+      const snap = await tx.get(ref);
+      const data = snap.exists() ? snap.data() : {};
+      next = { ...(data.priorityCategories || {}), [name]: !!isPriority };
+      tx.set(ref, { priorityCategories: next, ...buildUpdateMeta() }, { merge: true });
+    });
+    if (next) setPriorityCategories(next);
+  }
+
+  // Día de vencimiento (1-31) de un gasto fijo. `cat` es la categoría o "Categoría::subId"
+  // para una subcategoría. Vacío o inválido lo borra.
+  async function setCategoryDueDay(cat, day) {
+    const name = String(cat || '').trim();
+    if (!name || !householdId) return;
+    const parsed = Number(day);
+    const valid = Number.isInteger(parsed) && parsed >= 1 && parsed <= 31;
+    const ref = doc(db, 'households', householdId, META_COLLECTION, META_DOC_ID);
+    let next = null;
+    await runTransaction(db, async (tx) => {
+      const snap = await tx.get(ref);
+      const data = snap.exists() ? snap.data() : {};
+      next = { ...(data.fixedDueDays || {}) };
+      if (valid) next[name] = parsed;
+      else delete next[name];
+      tx.set(ref, { fixedDueDays: next, ...buildUpdateMeta() }, { merge: true });
+    });
+    if (next) setFixedDueDays(next);
+  }
+
   async function setCategoryFixed(cat, isFixed) {
     const name = String(cat || '').trim();
     if (!name) return;
@@ -1918,8 +2167,6 @@ export default function useHouseholdData(householdId, authUser, options = {}) {
     let targetAuthUid = null;
     let nextName = null;
     let shouldSyncName = false;
-    const patchNameRaw =
-      patch?.name !== undefined ? String(patch.name || '').trim() : '';
     await runTransaction(db, async (tx) => {
       const snap = await tx.get(ref);
       const data = snap.exists() ? snap.data() : {};
@@ -2063,7 +2310,6 @@ export default function useHouseholdData(householdId, authUser, options = {}) {
       count += 1;
       if (count >= 450) {
         // Firestore batch limit is 500 ops; keep some slack.
-        // eslint-disable-next-line no-await-in-loop
         await commitBatch();
       }
     }
@@ -2089,6 +2335,65 @@ export default function useHouseholdData(householdId, authUser, options = {}) {
     }
   }
 
+  // Ingreso mensual esperado (para planificar antes de que llegue el sueldo).
+  async function setExpectedIncome(value) {
+    if (!householdId) return;
+    const n = Math.max(0, Math.round(Number(value) || 0));
+    await setDoc(
+      doc(db, 'households', householdId, META_COLLECTION, META_DOC_ID),
+      { expectedIncome: n, ...buildUpdateMeta() },
+      { merge: true },
+    );
+    setExpectedIncomeState(n);
+  }
+
+  // Cierra y concilia un periodo: guarda saldo según la app, saldo real y diferencia.
+  async function closePeriod({ periodKey, appBalance, bankBalance, note = '' }) {
+    if (!householdId || !periodKey) return;
+    const app = Math.round(Number(appBalance) || 0);
+    const bank = Math.round(Number(bankBalance) || 0);
+    await setDoc(doc(db, 'households', householdId, 'closings', periodKey), {
+      periodKey,
+      status: 'closed',
+      appBalance: app,
+      bankBalance: bank,
+      difference: bank - app,
+      note: String(note || '').slice(0, 300),
+      closedBy: authUser?.uid || null,
+      closedByName: authUser?.displayName || authUser?.email || null,
+      closedAt: serverTimestamp(),
+    });
+    writeAudit('close-period', { after: { periodKey, appBalance: app, bankBalance: bank } });
+  }
+
+  // Solo el dueño del hogar puede reabrir un periodo cerrado.
+  async function reopenPeriod(periodKey) {
+    if (!householdId || !periodKey) return;
+    if (!ownerUid || authUser?.uid !== ownerUid) {
+      toast.warning('Solo el dueño del hogar puede reabrir un periodo cerrado.');
+      return;
+    }
+    await updateDoc(doc(db, 'households', householdId, 'closings', periodKey), {
+      status: 'open',
+      reopenedBy: authUser?.uid || null,
+      reopenedAt: serverTimestamp(),
+    });
+    writeAudit('reopen-period', { after: { periodKey } });
+  }
+
+  // Últimos cambios registrados (para Ajustes).
+  async function fetchAuditLog(max = 50) {
+    if (!householdId) return [];
+    const snap = await getDocs(
+      query(
+        collection(db, 'households', householdId, 'auditLog'),
+        orderBy('at', 'desc'),
+        limit(Math.min(200, max)),
+      ),
+    );
+    return snap.docs.map((d) => ({ id: d.id, ...d.data() }));
+  }
+
   async function setBudgetCutDay(day) {
     const n = Math.max(1, Math.min(28, Number(day) || 1));
     const ref = doc(db, 'households', householdId);
@@ -2106,6 +2411,8 @@ export default function useHouseholdData(householdId, authUser, options = {}) {
     savings,
     trash,
     fixedCategories,
+    priorityCategories,
+    fixedDueDays,
     householdUsers,
     memberInfo,
     ownerUid,
@@ -2129,10 +2436,20 @@ export default function useHouseholdData(householdId, authUser, options = {}) {
     removeCategory,
     renameCategory,
     setCategoryFixed,
+    setCategoryPriority,
+    setCategoryDueDay,
     addHouseholdUser,
     updateHouseholdUser,
     removeHouseholdUser,
     setBudgetCutDay,
+    exportFinances,
+    resetFinances,
+    expectedIncome,
+    setExpectedIncome,
+    closings,
+    closePeriod,
+    reopenPeriod,
+    fetchAuditLog,
     moveCategoryInGroup,
   };
 }

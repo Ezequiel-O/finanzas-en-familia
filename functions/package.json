@@ -2,7 +2,7 @@
   "name": "finanzas-en-familia-functions",
   "private": true,
   "engines": {
-    "node": "18"
+    "node": "22"
   },
   "main": "index.js",
   "dependencies": {

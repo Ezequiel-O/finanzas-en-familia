@@ -1,9 +1,13 @@
 ﻿// src/modules/debts/Debts.jsx
-import React, { useState, useMemo } from 'react';
+import { txDateKey } from '../../domain/ledger.js';
+import { toast, confirmDialog } from '../../components/feedback/feedback.js';
+import { todayKey, toLocalDateKey } from '../../domain/dates.js';
+import React, { useEffect, useState, useMemo } from 'react';
 
-import { Card } from '../../components/ui/card.jsx';
+import { Card } from '../../components/ui/Card.jsx';
 import { SectionTitle } from '../../components/ui/SectionTitle.jsx';
-import { Money } from '../../components/ui/money.jsx';
+import { Money } from '../../components/ui/Money.jsx';
+import { CreditCard } from '../../components/ui/CreditCard.jsx';
 import { Progress } from '../../components/ui/Progress.jsx';
 import {
   monthKey,
@@ -13,6 +17,9 @@ import {
   budgetMonthKeyForDate,
 } from '../../utils/budgetPeriod.js';
 import { DEBT_CATEGORY } from '../../constants.js';
+
+// 30 años en cuotas mensuales; también mantiene el documento bajo el límite de Firestore.
+const MAX_INSTALLMENTS = 360;
 
 function toNumber(n) {
   const num = Number(n || 0);
@@ -114,9 +121,9 @@ function computeQuotaStatus(plannedAmount, paidAmount) {
 
 function addMonthsToDate(dateStr, months) {
   const d = new Date((dateStr || '').replace(/-/g, '/'));
-  if (Number.isNaN(d.getTime())) return new Date().toISOString().slice(0, 10);
+  if (Number.isNaN(d.getTime())) return todayKey();
   d.setMonth(d.getMonth() + months);
-  return d.toISOString().slice(0, 10);
+  return toLocalDateKey(d);
 }
 
 function monthIndexFromKey(key) {
@@ -167,7 +174,7 @@ function totalDebtPaidFromTransactions(transactions, periodKey, cutDay) {
   return (transactions || [])
     .filter((t) => t.category === DEBT_CATEGORY)
     .filter((t) => {
-      const d = (t.date || t.createdAt || '').slice(0, 10);
+      const d = txDateKey(t);
       return d >= start && d < end;
     })
     .reduce((s, t) => s + toNumber(t.amount), 0);
@@ -195,7 +202,8 @@ export function Debts({ data, actions, monthKeyStr }) {
     );
   }, [debts]);
 
-  const { addDebt, updateDebt, removeDebt } = actions || {};
+  const { addDebt, updateDebt, removeDebt, addTransaction } = actions || {};
+  const activeUser = data?.activeUser || null;
 
   const [form, setForm] = useState({
     name: '',
@@ -214,13 +222,22 @@ export function Debts({ data, actions, monthKeyStr }) {
   const [hidePaidDebts, setHidePaidDebts] = useState(true);
   const [showAddDebtModal, setShowAddDebtModal] = useState(false);
 
+  useEffect(() => {
+    if (!showAddDebtModal) return undefined;
+    const onKey = (e) => {
+      if (e.key === 'Escape') setShowAddDebtModal(false);
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [showAddDebtModal]);
+
   const currentPeriodKey = useMemo(
     () => monthKeyStr || monthKey(new Date()),
     [monthKeyStr],
   );
 
   const trueCurrentPeriod = useMemo(() => {
-    const todayStr = new Date().toISOString().slice(0, 10);
+    const todayStr = todayKey();
     return budgetMonthKeyForDate(todayStr, budgetCutDay);
   }, [budgetCutDay]);
 
@@ -240,11 +257,11 @@ export function Debts({ data, actions, monthKeyStr }) {
     return 'hidden xl:table-cell';
   };
 
-  function handleRemoveDebt(debt) {
+  async function handleRemoveDebt(debt) {
     if (!removeDebt || !debt?.id) return;
     const name = String(debt.name || '').trim();
     const label = name ? ` "${name}"` : '';
-    const ok = window.confirm(
+    const ok = await confirmDialog(
       `Eliminar deuda${label}? Se movera a la papelera para poder recuperarla.`,
     );
     if (!ok) return;
@@ -255,7 +272,7 @@ export function Debts({ data, actions, monthKeyStr }) {
     if (!updateDebt || !debt?.id) return;
     const name = String(debt.name || '').trim();
     const label = name ? ` "${name}"` : '';
-    const ok = window.confirm(
+    const ok = await confirmDialog(
       `Archivar deuda${label}? Se ocultara del listado principal.`,
     );
     if (!ok) return;
@@ -269,18 +286,28 @@ export function Debts({ data, actions, monthKeyStr }) {
     setForm((prev) => ({ ...prev, [field]: value }));
   }
 
-  function buildSubscriptionSchedule(monthlyAmount, startPeriodKey) {
+  // Con fecha de inicio el primer cobro es esa fecha y se repite mes a mes desde ahí
+  // (permite empezar el mes siguiente). Sin fecha, se mantiene el calendario por periodo.
+  function buildSubscriptionSchedule(monthlyAmount, startPeriodKey, firstDue = '') {
     const schedule = [];
     const start = startPeriodKey || monthKey();
-    for (let i = -1; i <= 18; i += 1) {
-      const pk = shiftMonth(start, i);
-      const { end } = getBudgetPeriod(pk, budgetCutDay);
-      const endDate = new Date(end + 'T00:00:00');
-      endDate.setDate(endDate.getDate() - 1);
+    for (let i = firstDue ? 0 : -1; i <= 18; i += 1) {
+      let pk;
+      let dueDate;
+      if (firstDue) {
+        dueDate = addMonthsToDate(firstDue, i);
+        pk = budgetMonthKeyForDate(dueDate, budgetCutDay);
+      } else {
+        pk = shiftMonth(start, i);
+        const { end } = getBudgetPeriod(pk, budgetCutDay);
+        const endDate = new Date(end + 'T00:00:00');
+        endDate.setDate(endDate.getDate() - 1);
+        dueDate = toLocalDateKey(endDate);
+      }
       schedule.push({
         id: `${Date.now()}-sub-${i}-${Math.random().toString(36).slice(2, 6)}`,
         periodKey: pk,
-        dueDate: endDate.toISOString().slice(0, 10),
+        dueDate,
         plannedAmount: monthlyAmount,
         paidAmount: 0,
         status: 'pending',
@@ -318,6 +345,51 @@ export function Debts({ data, actions, monthKeyStr }) {
     return schedule;
   }
 
+  // Primer vencimiento con monto (las cuotas en 0 de una suscripción pausada no cuentan).
+  function firstDueOf(debt) {
+    const dates = ensureScheduleArray(debt?.schedule)
+      .filter((q) => q.plannedAmount > 0 && q.dueDate)
+      .map((q) => q.dueDate)
+      .sort();
+    return dates[0] || '';
+  }
+
+  // Corre todas las cuotas para que la primera venza en `firstDue`. Conserva ids y montos,
+  // así los pagos ya vinculados siguen apuntando a su cuota.
+  function shiftScheduleFrom(schedule, firstDue) {
+    return [...schedule]
+      .sort((a, b) => String(a.dueDate).localeCompare(String(b.dueDate)))
+      .map((quota, i) => {
+        const dueDate = addMonthsToDate(firstDue, i);
+        return { ...quota, dueDate, periodKey: budgetMonthKeyForDate(dueDate, budgetCutDay) };
+      });
+  }
+
+  // Rehace el calendario de una suscripción desde `firstDue`. Reusa la cuota del mismo periodo
+  // (para no perder pagos) y solo conserva las de otros periodos si ya tienen pagos.
+  function restartSubscriptionFrom(debt, schedule, firstDue, monthlyAmount) {
+    const fresh = buildSubscriptionSchedule(monthlyAmount, '', firstDue);
+    const freshPeriods = new Set(fresh.map((q) => q.periodKey));
+    const byPeriod = new Map(schedule.map((q) => [resolveQuotaPeriodKey(q), q]));
+    const keptPaid = schedule.filter(
+      (q) => !freshPeriods.has(resolveQuotaPeriodKey(q)) && paidForQuota(q, debt.id) > 0,
+    );
+    return [
+      ...keptPaid,
+      ...fresh.map((q) => {
+        const prev = byPeriod.get(q.periodKey);
+        if (!prev) return q;
+        return {
+          ...prev,
+          periodKey: q.periodKey,
+          dueDate: q.dueDate,
+          plannedAmount: monthlyAmount,
+          status: computeQuotaStatus(monthlyAmount, prev.paidAmount),
+        };
+      }),
+    ];
+  }
+
   function handleSaveDebtMeta(e) {
     e.preventDefault();
     if (!debtEditModal || !updateDebt) return;
@@ -339,6 +411,22 @@ export function Debts({ data, actions, monthKeyStr }) {
       due: debtEditModal.due || '',
     };
 
+    const firstDue = String(debtEditModal.firstDue || '').trim();
+    if (firstDue && !/^\d{4}-\d{2}-\d{2}$/.test(firstDue)) {
+      toast.warning('La fecha del primer pago no es válida.');
+      return;
+    }
+    let baseSchedule = ensureScheduleArray(debt?.schedule || []);
+    if (debt && firstDue && firstDue !== debtEditModal.firstDueOriginal) {
+      if (debtEditModal.isSubscription) {
+        baseSchedule = restartSubscriptionFrom(debt, baseSchedule, firstDue, toNumber(debt.original));
+      } else {
+        baseSchedule = shiftScheduleFrom(baseSchedule, firstDue);
+        patch.due = baseSchedule[baseSchedule.length - 1]?.dueDate || patch.due;
+      }
+      patch.schedule = baseSchedule;
+    }
+
     if (debtEditModal.isSubscription) {
       const prevActive = debt?.subscriptionActive !== false;
       const subscriptionActive = debtEditModal.subscriptionActive !== false;
@@ -348,7 +436,7 @@ export function Debts({ data, actions, monthKeyStr }) {
       const monthlyAmount = toNumber(debt?.original);
 
       if (subscriptionActive && !prevActive && !resumeDate) {
-        window.alert(
+        toast.warning(
           'Selecciona la fecha desde la que quieres reactivar el cobro.',
         );
         return;
@@ -357,7 +445,7 @@ export function Debts({ data, actions, monthKeyStr }) {
       patch.subscriptionActive = subscriptionActive;
       patch.subscriptionResumeDate = subscriptionActive ? resumeDate || '' : '';
 
-      const schedule = ensureScheduleArray(debt?.schedule || []);
+      const schedule = baseSchedule;
       let updatedSchedule = schedule;
 
       if (!subscriptionActive) {
@@ -404,10 +492,17 @@ export function Debts({ data, actions, monthKeyStr }) {
     e.preventDefault();
 
     const original = toNumber(form.original);
-    if (!original || !addDebt) return;
+    if (!original || !addDebt) return false;
 
     const isSubscription = !!form.isSubscription;
-    const firstDue = form.firstDue || new Date().toISOString().slice(0, 10);
+    // Un plazo mayor a 30 años casi siempre es el monto de la cuota escrito en el campo equivocado.
+    if (!isSubscription && Number(form.installments || 1) > MAX_INSTALLMENTS) {
+      toast.warning(
+        `El número de cuotas no puede ser mayor a ${MAX_INSTALLMENTS}. ¿Escribiste el monto de la cuota en ese campo?`,
+      );
+      return false;
+    }
+    const firstDue = form.firstDue || todayKey();
     const startPeriod = budgetMonthKeyForDate(firstDue, budgetCutDay);
 
     let remaining = original;
@@ -418,7 +513,7 @@ export function Debts({ data, actions, monthKeyStr }) {
     if (isSubscription) {
       remaining = original;
       installments = 1;
-      schedule = buildSubscriptionSchedule(original, startPeriod);
+      schedule = buildSubscriptionSchedule(original, startPeriod, form.firstDue);
       lastQuota = schedule[schedule.length - 1];
     } else {
       remaining =
@@ -449,11 +544,19 @@ export function Debts({ data, actions, monthKeyStr }) {
       createdAt: Date.now(),
       schedule,
       isSubscription,
-      subscriptionActive: isSubscription ? true : undefined,
-      subscriptionResumeDate: isSubscription ? '' : undefined,
+      // Firestore rechaza campos `undefined`: solo las suscripciones llevan estos campos.
+      ...(isSubscription
+        ? { subscriptionActive: true, subscriptionResumeDate: '' }
+        : {}),
     };
 
-    await addDebt(d);
+    try {
+      await addDebt(d);
+    } catch (err) {
+      console.error('No se pudo agregar la deuda', { code: err?.code });
+      toast.error('No se pudo agregar la deuda. Revisa los datos e inténtalo de nuevo.');
+      return false;
+    }
 
     setForm({
       name: '',
@@ -466,14 +569,11 @@ export function Debts({ data, actions, monthKeyStr }) {
       installments: '',
       isSubscription: false,
     });
+    return true;
   }
 
   async function handleAddDebtFromModal(e) {
-    e.preventDefault();
-    const original = toNumber(form.original);
-    if (!original || !addDebt) return;
-    await handleAddDebt(e);
-    setShowAddDebtModal(false);
+    if (await handleAddDebt(e)) setShowAddDebtModal(false);
   }
 
   function renderDebtForm({ onSubmit, dateInputType, submitLabel }) {
@@ -527,25 +627,31 @@ export function Debts({ data, actions, monthKeyStr }) {
           />
         </div>
         <div className="grid grid-cols-2 gap-2">
-          <input
-            className="border rounded-lg p-3 text-sm"
-            type="number"
-            min={1}
-            step="1"
-            placeholder="Numero de cuotas"
-            value={form.installments}
-            onChange={(e) => handleFormChange('installments', e.target.value)}
-            disabled={form.isSubscription}
-          />
-          <input
-            className="border rounded-lg p-3 text-sm"
-            type={dateInputType}
-            placeholder={datePlaceholder}
-            value={form.firstDue}
-            onChange={(e) => handleFormChange('firstDue', e.target.value)}
-            disabled={form.isSubscription}
-            inputMode={dateInputType === 'text' ? 'text' : undefined}
-          />
+          <label className="grid gap-1 text-xs text-[color:var(--text-muted)]">
+            Número de cuotas
+            <input
+              className="border rounded-lg p-3 text-sm text-[color:var(--text)]"
+              type="number"
+              min={1}
+              max={MAX_INSTALLMENTS}
+              step="1"
+              placeholder="ej. 12"
+              value={form.installments}
+              onChange={(e) => handleFormChange('installments', e.target.value)}
+              disabled={form.isSubscription}
+            />
+          </label>
+          <label className="grid gap-1 text-xs text-[color:var(--text-muted)]">
+            {form.isSubscription ? 'Primer cobro' : 'Vencimiento 1ª cuota'}
+            <input
+              className="border rounded-lg p-3 text-sm text-[color:var(--text)]"
+              type={dateInputType}
+              placeholder={datePlaceholder}
+              value={form.firstDue}
+              onChange={(e) => handleFormChange('firstDue', e.target.value)}
+              inputMode={dateInputType === 'text' ? 'text' : undefined}
+            />
+          </label>
         </div>
         <input
           className="border rounded-lg p-3 text-sm"
@@ -600,6 +706,7 @@ export function Debts({ data, actions, monthKeyStr }) {
             ? String(fallbackQuota.plannedAmount)
             : '',
       dueDate: defaultDueDate,
+      paymentDate: todayStr,
     });
   }
 
@@ -819,7 +926,7 @@ export function Debts({ data, actions, monthKeyStr }) {
     return Math.abs(plannedTotal - summaryPlanned) < 0.5;
   };
 
-  const todayStr = new Date().toISOString().slice(0, 10);
+  const todayStr = todayKey();
 
   function resolveDueDate(quota, periodKey) {
     if (quota?.dueDate) return quota.dueDate;
@@ -827,7 +934,7 @@ export function Debts({ data, actions, monthKeyStr }) {
     const { end } = getBudgetPeriod(periodKey, budgetCutDay);
     const endDate = new Date(end + 'T00:00:00');
     endDate.setDate(endDate.getDate() - 1);
-    return endDate.toISOString().slice(0, 10);
+    return toLocalDateKey(endDate);
   }
 
   const paidInPeriodForModal =
@@ -855,56 +962,141 @@ export function Debts({ data, actions, monthKeyStr }) {
 
   const isModalQuotaPaid =
     plannedForModal > 0 && linkedPaidForModal >= plannedForModal;
+  const remainingForModal = Math.max(
+    0,
+    plannedForModal - linkedPaidForModal,
+  );
 
-  const visibleDebts = debtsActive.filter((d) => {
-    if (!hidePaidDebts) return true;
-    if (d.isSubscription) return true;
+  async function handleRegisterQuotaPayment() {
+    if (!quotaModal || !addTransaction) return;
+    const { debtId, quotaId, quotaIds, paymentDate } = quotaModal;
+    if (!debtId) return;
+
+    const debt = debts.find((d) => d.id === debtId);
+    const ids =
+      Array.isArray(quotaIds) && quotaIds.length
+        ? quotaIds
+        : quotaId
+          ? [quotaId]
+          : [];
+    if (!ids.length) return;
+
+    const amount = Math.round(remainingForModal);
+    if (!amount || amount <= 0) return;
+
+    const schedule = ensureScheduleArray(debt?.schedule || []);
+    const targetQuotas = schedule.filter((q) => ids.includes(q.id));
+    const weightedQuotas = targetQuotas.map((q) => ({
+      ...q,
+      plannedAmount: Math.max(
+        0,
+        toNumber(q.plannedAmount) - linkedPaidForQuota(q.id, debtId),
+      ),
+    }));
+    const allocationMap =
+      ids.length > 1
+        ? allocatePlannedAcrossQuotas(amount, weightedQuotas)
+        : { [ids[0]]: amount };
+
+    const debtIdMap = {};
+    ids.forEach((id) => {
+      debtIdMap[id] = debtId;
+    });
+
+    const description = debt?.name
+      ? `Pago deuda: ${debt.name}`
+      : 'Pago deuda';
+
+    try {
+      await addTransaction({
+        type: 'gasto',
+        category: DEBT_CATEGORY,
+        amount,
+        description,
+        date: paymentDate || todayStr,
+        createdAt: new Date().toISOString(),
+        ownerId: activeUser?.id || null,
+        ownerName: activeUser?.name || null,
+        ownerEmail: activeUser?.email || null,
+        meta: {
+          debtQuotaIds: ids,
+          debtQuotaId: ids.length === 1 ? ids[0] : undefined,
+          debtQuotaAmounts: allocationMap,
+          debtQuotaDebtIds: debtIdMap,
+          debtId,
+        },
+      });
+    } catch (err) {
+      console.error('Error registrando pago de deuda:', err);
+      toast.error('No se pudo registrar el pago.');
+    }
+  }
+
+  // Total de la deuda y lo pagado (abono inicial + cuotas pagadas en Movimientos).
+  function debtTotals(d) {
     const schedule = Array.isArray(d.schedule) ? d.schedule : [];
-    const totalOriginal = toNumber(d.original);
     const plannedTotal = schedule.reduce(
       (sum, q) => sum + toNumber(q.plannedAmount),
       0,
     );
-    const totalDebt = Math.max(totalOriginal, plannedTotal);
-    if (totalDebt <= 0) return true;
-    const basePaid = toNumber(d.alreadyPaid);
-    const paidFromSchedule = schedule.reduce(
-      (sum, q) => sum + paidForQuota(q, d.id),
-      0,
-    );
-    const totalPaid = basePaid + paidFromSchedule;
-    const isPaidOff = totalPaid >= totalDebt;
-    return !isPaidOff;
+    const total = Math.max(toNumber(d.original), plannedTotal + toNumber(d.alreadyPaid));
+    const paid =
+      toNumber(d.alreadyPaid) +
+      schedule.reduce((sum, q) => sum + paidForQuota(q, d.id), 0);
+    return { total, paid };
+  }
+
+  const visibleDebts = debtsActive.filter((d) => {
+    if (!hidePaidDebts) return true;
+    if (d.isSubscription) return true;
+    const { total, paid } = debtTotals(d);
+    if (total <= 0) return true;
+    return paid < total;
   });
 
   const cardSummary = useMemo(() => {
     const summary = new Map();
     debtsActive.forEach((debt) => {
       const cardName = String(debt.cardName || '').trim() || 'Sin tarjeta';
+      const entry = summary.get(cardName) || {
+        planned: 0,
+        paid: 0,
+        pending: 0,
+        balance: 0,
+        debtCount: 0,
+      };
+
+      if (!debt.isSubscription) {
+        const { total, paid } = debtTotals(debt);
+        const balance = Math.max(total - paid, 0);
+        entry.balance += balance;
+        if (balance > 0) entry.debtCount += 1;
+      } else if (debt.subscriptionActive !== false) {
+        entry.debtCount += 1;
+      }
+
+      let debtPending = 0;
       const schedule = Array.isArray(debt.schedule) ? debt.schedule : [];
-      const quotas = schedule.filter(
-        (q) => resolveQuotaPeriodKey(q) === currentPeriodKey,
-      );
-      if (!quotas.length) return;
-      quotas.forEach((quota) => {
-        const planned = toNumber(quota.plannedAmount);
-        if (planned <= 0) return;
-        const paid = paidForQuota(quota, debt.id);
-        const pending = Math.max(planned - paid, 0);
-        const entry = summary.get(cardName) || {
-          planned: 0,
-          paid: 0,
-          pending: 0,
-        };
-        entry.planned += planned;
-        entry.paid += paid;
-        entry.pending += pending;
-        summary.set(cardName, entry);
-      });
+      schedule
+        .filter((q) => resolveQuotaPeriodKey(q) === currentPeriodKey)
+        .forEach((quota) => {
+          const planned = toNumber(quota.plannedAmount);
+          if (planned <= 0) return;
+          const paid = paidForQuota(quota, debt.id);
+          entry.planned += planned;
+          entry.paid += paid;
+          debtPending += Math.max(planned - paid, 0);
+        });
+      entry.pending += debtPending;
+      // Las suscripciones no tienen saldo total (se repiten hasta eliminarlas):
+      // lo que se debe de ellas en la tarjeta es el cobro del periodo sin pagar.
+      if (debt.isSubscription) entry.balance += debtPending;
+
+      if (entry.debtCount > 0 || entry.planned > 0) summary.set(cardName, entry);
     });
     return Array.from(summary.entries())
       .map(([name, values]) => ({ name, ...values }))
-      .sort((a, b) => b.pending - a.pending);
+      .sort((a, b) => b.balance - a.balance || b.pending - a.pending);
   }, [debtsActive, currentPeriodKey]);
 
   return (
@@ -914,72 +1106,62 @@ export function Debts({ data, actions, monthKeyStr }) {
           <option key={name} value={name} />
         ))}
       </datalist>
-      <div className="md:hidden mb-4">
-        <button
-          type="button"
-          className="w-full px-4 py-3 rounded-xl border bg-[color:var(--primary)] text-[color:var(--primary-contrast)] text-sm font-semibold"
-          onClick={() => setShowAddDebtModal(true)}
-        >
-          Agregar Deuda
-        </button>
-      </div>
-      <div className="grid gap-6 w-full lg:grid-cols-[minmax(0,320px)_minmax(0,1fr)]">
-        {/* Formulario izquierda */}
-        <Card className="p-5 hidden md:block">
-          <SectionTitle>Nueva deuda</SectionTitle>
-          {renderDebtForm({
-            onSubmit: handleAddDebt,
-            dateInputType: 'date',
-            submitLabel: 'Agregar deuda',
-          })}
-        </Card>
-
-        {/* Calendario derecha */}
+      <div className="grid gap-6 w-full">
+        {/* Calendario */}
         <Card className="p-5 space-y-4">
-          <div className="flex items-center justify-between gap-3">
+          <div className="flex flex-wrap items-center justify-between gap-3">
             <SectionTitle>Calendario de deudas</SectionTitle>
-            <button
-              type="button"
-              className="text-xs font-semibold px-3 py-1.5 rounded-full border border-[color:var(--border)] text-[color:var(--text)] hover:bg-[color:var(--surface-2)]"
-              onClick={() => setHidePaidDebts((prev) => !prev)}
-            >
-              <span className="inline-flex items-center gap-2">
-                {hidePaidDebts ? (
-                  <svg
-                    className="h-4 w-4"
-                    viewBox="0 0 24 24"
-                    fill="none"
-                    stroke="currentColor"
-                    strokeWidth="2"
-                    strokeLinecap="round"
-                    strokeLinejoin="round"
-                    aria-hidden="true"
-                  >
-                    <path d="M3 3l18 18" />
-                    <path d="M9.88 9.88A3 3 0 0 0 12 15a3 3 0 0 0 2.12-.88" />
-                    <path d="M5.88 5.88C4.1 7.24 2.75 9.2 2.036 11.678a1 1 0 0 0 0 .644C3.423 16.49 7.36 19.5 12 19.5c1.68 0 3.29-.41 4.72-1.14" />
-                    <path d="M10.73 5.08A10.95 10.95 0 0 1 12 4.5c4.639 0 8.576 3.01 9.964 7.178a1 1 0 0 1 0 .644 11.1 11.1 0 0 1-1.67 3.03" />
-                  </svg>
-                ) : (
-                  <svg
-                    className="h-4 w-4"
-                    viewBox="0 0 24 24"
-                    fill="none"
-                    stroke="currentColor"
-                    strokeWidth="2"
-                    strokeLinecap="round"
-                    strokeLinejoin="round"
-                    aria-hidden="true"
-                  >
-                    <path d="M2.036 12.322a1 1 0 0 1 0-.644C3.423 7.51 7.36 4.5 12 4.5c4.638 0 8.576 3.01 9.964 7.178a1 1 0 0 1 0 .644C20.576 16.49 16.639 19.5 12 19.5c-4.638 0-8.576-3.01-9.964-7.178Z" />
-                    <path d="M15 12a3 3 0 1 1-6 0 3 3 0 0 1 6 0Z" />
-                  </svg>
-                )}
-                <span>
-                  {hidePaidDebts ? 'Mostrar pagados' : 'Ocultar pagados'}
+            <div className="flex flex-wrap items-center gap-2">
+              <button
+                type="button"
+                className="inline-flex min-h-[40px] items-center gap-1 rounded-xl bg-[color:var(--primary)] px-4 text-sm font-semibold text-[color:var(--primary-contrast)] shadow-sm active:scale-[0.98]"
+                onClick={() => setShowAddDebtModal(true)}
+              >
+                + Agregar deuda
+              </button>
+              <button
+                type="button"
+                className="text-xs font-semibold px-3 py-1.5 rounded-full border border-[color:var(--border)] text-[color:var(--text)] hover:bg-[color:var(--surface-2)]"
+                onClick={() => setHidePaidDebts((prev) => !prev)}
+              >
+                <span className="inline-flex items-center gap-2">
+                  {hidePaidDebts ? (
+                    <svg
+                      className="h-4 w-4"
+                      viewBox="0 0 24 24"
+                      fill="none"
+                      stroke="currentColor"
+                      strokeWidth="2"
+                      strokeLinecap="round"
+                      strokeLinejoin="round"
+                      aria-hidden="true"
+                    >
+                      <path d="M3 3l18 18" />
+                      <path d="M9.88 9.88A3 3 0 0 0 12 15a3 3 0 0 0 2.12-.88" />
+                      <path d="M5.88 5.88C4.1 7.24 2.75 9.2 2.036 11.678a1 1 0 0 0 0 .644C3.423 16.49 7.36 19.5 12 19.5c1.68 0 3.29-.41 4.72-1.14" />
+                      <path d="M10.73 5.08A10.95 10.95 0 0 1 12 4.5c4.639 0 8.576 3.01 9.964 7.178a1 1 0 0 1 0 .644 11.1 11.1 0 0 1-1.67 3.03" />
+                    </svg>
+                  ) : (
+                    <svg
+                      className="h-4 w-4"
+                      viewBox="0 0 24 24"
+                      fill="none"
+                      stroke="currentColor"
+                      strokeWidth="2"
+                      strokeLinecap="round"
+                      strokeLinejoin="round"
+                      aria-hidden="true"
+                    >
+                      <path d="M2.036 12.322a1 1 0 0 1 0-.644C3.423 7.51 7.36 4.5 12 4.5c4.638 0 8.576 3.01 9.964 7.178a1 1 0 0 1 0 .644C20.576 16.49 16.639 19.5 12 19.5c-4.638 0-8.576-3.01-9.964-7.178Z" />
+                      <path d="M15 12a3 3 0 1 1-6 0 3 3 0 0 1 6 0Z" />
+                    </svg>
+                  )}
+                  <span>
+                    {hidePaidDebts ? 'Mostrar pagados' : 'Ocultar pagados'}
+                  </span>
                 </span>
-              </span>
-            </button>
+              </button>
+            </div>
           </div>
 
           {/* Chips estado */}
@@ -1010,51 +1192,6 @@ export function Debts({ data, actions, monthKeyStr }) {
             </div>
           </div>
 
-          {cardSummary.length > 0 && (
-            <div className="grid gap-2">
-              <div className="text-xs font-semibold text-[color:var(--text-muted)]">
-                Resumen por tarjeta (
-                {formatBudgetPeriodLabel(currentPeriodKey, budgetCutDay)})
-              </div>
-              <div className="grid gap-2 sm:grid-cols-2 lg:grid-cols-3">
-                {cardSummary.map((card) => (
-                  <div
-                    key={card.name}
-                    className="rounded-xl border border-[color:var(--border)] bg-[color:var(--surface-2)] p-3"
-                  >
-                    <div className="text-sm font-semibold">{card.name}</div>
-                    <div className="mt-2 grid grid-cols-3 gap-2 text-xs">
-                      <div>
-                        <div className="text-[color:var(--text-muted)]">
-                          Planificado
-                        </div>
-                        <div className="font-semibold">
-                          <Money n={card.planned} />
-                        </div>
-                      </div>
-                      <div>
-                        <div className="text-[color:var(--text-muted)]">
-                          Pagado
-                        </div>
-                        <div className="font-semibold">
-                          <Money n={card.paid} />
-                        </div>
-                      </div>
-                      <div>
-                        <div className="text-[color:var(--text-muted)]">
-                          Pendiente
-                        </div>
-                        <div className="font-semibold text-[color:var(--danger)]">
-                          <Money n={card.pending} />
-                        </div>
-                      </div>
-                    </div>
-                  </div>
-                ))}
-              </div>
-            </div>
-          )}
-
           {/* Deudas */}
           {debtsActive.length === 0 ? (
             <div className="text-[color:var(--text-muted)]">
@@ -1073,7 +1210,7 @@ export function Debts({ data, actions, monthKeyStr }) {
                   );
                   const totalDebt = isSubscription
                     ? totalOriginal
-                    : Math.max(totalOriginal, plannedTotal);
+                    : Math.max(totalOriginal, plannedTotal + toNumber(d.alreadyPaid));
                   const basePaid = toNumber(d.alreadyPaid);
                   const paidFromSchedule = schedule.reduce(
                     (sum, q) => sum + paidForQuota(q, d.id),
@@ -1115,6 +1252,45 @@ export function Debts({ data, actions, monthKeyStr }) {
                       )}
                       <div className="mt-2">
                         <Progress value={progress} mode="good" />
+                      </div>
+                      <div className="mt-3 flex flex-wrap gap-2">
+                        <button
+                          type="button"
+                          className="px-3 py-1.5 text-xs rounded-lg border text-[color:var(--text-muted)] hover:bg-[color:var(--surface-2)]"
+                          onClick={() =>
+                            setDebtEditModal({
+                              id: d.id,
+                              name: d.name || '',
+                              original: d.original != null ? String(d.original) : '',
+                              alreadyPaid:
+                                d.alreadyPaid != null ? String(d.alreadyPaid) : '',
+                              due: d.due || '',
+                              firstDue: firstDueOf(d),
+                              firstDueOriginal: firstDueOf(d),
+                              rateAPR: d.rateAPR != null ? String(d.rateAPR) : '',
+                              cardName: d.cardName || '',
+                              chargeDay:
+                                d.chargeDay != null ? String(d.chargeDay) : '',
+                              isSubscription: !!d.isSubscription,
+                            })
+                          }
+                        >
+                          Editar
+                        </button>
+                        <button
+                          type="button"
+                          className="px-3 py-1.5 text-xs rounded-lg border border-[color:var(--danger)]/40 text-[color:var(--danger)] hover:bg-[color:var(--danger)]/10"
+                          onClick={() => handleRemoveDebt(d)}
+                        >
+                          Eliminar
+                        </button>
+                        <button
+                          type="button"
+                          className="px-3 py-1.5 text-xs rounded-lg border text-[color:var(--primary)] border-[color:var(--primary)]/40 bg-[color:var(--primary)]/10 hover:bg-[color:var(--primary)]/20"
+                          onClick={() => openQuotaModal(d, null, currentPeriodKey)}
+                        >
+                          Cuotas
+                        </button>
                       </div>
                     </div>
                   );
@@ -1192,7 +1368,7 @@ export function Debts({ data, actions, monthKeyStr }) {
                           );
                           const totalDebt = isSubscription
                             ? totalOriginal
-                            : Math.max(totalOriginal, plannedTotal);
+                            : Math.max(totalOriginal, plannedTotal + toNumber(d.alreadyPaid));
                           const basePaid = toNumber(d.alreadyPaid);
                           const paidFromSchedule = schedule.reduce(
                             (sum, q) => sum + paidForQuota(q, d.id),
@@ -1371,6 +1547,8 @@ export function Debts({ data, actions, monthKeyStr }) {
                                             ? String(d.rateAPR)
                                             : '',
                                         due: d.due || '',
+                                        firstDue: firstDueOf(d),
+                                        firstDueOriginal: firstDueOf(d),
                                         isSubscription: !!d.isSubscription,
                                         subscriptionActive:
                                           d.subscriptionActive !== false,
@@ -1457,15 +1635,51 @@ export function Debts({ data, actions, monthKeyStr }) {
             </>
           )}
         </Card>
+
+        {cardSummary.length > 0 && (
+          <section className="grid gap-3" aria-labelledby="card-summary-title">
+            <h2 id="card-summary-title" className="text-lg font-semibold">
+              Resumen por tarjeta{' '}
+              <span className="text-sm font-normal text-[color:var(--text-muted)]">
+                ({formatBudgetPeriodLabel(currentPeriodKey, budgetCutDay)})
+              </span>
+            </h2>
+            <div className="grid gap-3 grid-cols-[repeat(auto-fill,minmax(16rem,20rem))]">
+              {cardSummary.map((card) => (
+                <CreditCard
+                  key={card.name}
+                  name={card.name}
+                  balance={card.balance}
+                  debtCount={card.debtCount}
+                  planned={card.planned}
+                  paid={card.paid}
+                  pending={card.pending}
+                  isPlaceholder={card.name === 'Sin tarjeta'}
+                />
+              ))}
+            </div>
+          </section>
+        )}
       </div>
       {showAddDebtModal && (
-        <div className="fixed inset-0 z-40 flex items-start justify-center bg-black/40 backdrop-blur-sm pt-16 px-4">
-          <div className="bg-[color:var(--surface-1)] rounded-2xl shadow-[var(--shadow)] p-5 w-full max-w-md">
+        <div
+          className="fixed inset-0 z-[60] flex items-end sm:items-start justify-center bg-black/40 backdrop-blur-sm sm:pt-16 sm:px-4"
+          onClick={() => setShowAddDebtModal(false)}
+        >
+          <div
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="add-debt-title"
+            className="sheet-enter bg-[color:var(--surface-1)] rounded-t-3xl sm:rounded-2xl shadow-xl p-5 pb-[calc(1.25rem+env(safe-area-inset-bottom))] w-full sm:max-w-md max-h-[92vh] overflow-y-auto"
+            onClick={(e) => e.stopPropagation()}
+          >
             <div className="flex items-center justify-between mb-4">
-              <h3 className="text-lg font-semibold">Agregar deuda</h3>
+              <h3 id="add-debt-title" className="text-lg font-semibold">
+                Nueva deuda
+              </h3>
               <button
                 type="button"
-                className="text-sm text-[color:var(--text-muted)] hover:text-[color:var(--text)]"
+                className="min-h-[40px] px-2 text-sm text-[color:var(--text-muted)] hover:text-[color:var(--text)]"
                 onClick={() => setShowAddDebtModal(false)}
               >
                 Cerrar
@@ -1473,7 +1687,7 @@ export function Debts({ data, actions, monthKeyStr }) {
             </div>
             {renderDebtForm({
               onSubmit: handleAddDebtFromModal,
-              dateInputType: 'text',
+              dateInputType: 'date',
               submitLabel: 'Agregar deuda',
             })}
           </div>
@@ -1564,8 +1778,55 @@ export function Debts({ data, actions, monthKeyStr }) {
                 </div>
               )}
 
+              {(quotaModal.quotaId ||
+                (Array.isArray(quotaModal.quotaIds) &&
+                  quotaModal.quotaIds.length > 0)) && (
+                <div className="grid gap-2 rounded-lg border border-[color:var(--border)]/70 bg-[color:var(--surface-2)]/60 p-3">
+                  <div className="text-xs font-semibold uppercase text-[color:var(--text-muted)]">
+                    Registrar pago
+                  </div>
+                  <div className="grid gap-1">
+                    <label className="text-xs text-[color:var(--text-muted)]">
+                      Monto a registrar
+                    </label>
+                    <div className="border rounded-lg p-2 bg-[color:var(--surface-1)] text-right">
+                      <Money n={remainingForModal} />
+                    </div>
+                  </div>
+                  <div className="grid gap-1">
+                    <label className="text-xs text-[color:var(--text-muted)]">
+                      Fecha del pago
+                    </label>
+                    <input
+                      type="date"
+                      className="border rounded-lg p-2"
+                      value={quotaModal.paymentDate || ''}
+                      onChange={(e) =>
+                        setQuotaModal((prev) => ({
+                          ...prev,
+                          paymentDate: e.target.value,
+                        }))
+                      }
+                    />
+                  </div>
+                  <button
+                    type="button"
+                    className="px-3 py-2 text-sm rounded-lg border bg-[color:var(--primary)] text-[color:var(--primary-contrast)] disabled:opacity-60"
+                    onClick={handleRegisterQuotaPayment}
+                    disabled={!addTransaction || remainingForModal <= 0}
+                  >
+                    Marcar como pagada
+                  </button>
+                  {remainingForModal <= 0 && (
+                    <div className="text-xs text-[color:var(--text-muted)]">
+                      Esta cuota ya no tiene saldo pendiente.
+                    </div>
+                  )}
+                </div>
+              )}
+
               <div className="grid gap-1">
-                <label>Fecha de pago (o vencimiento)</label>
+                <label>Fecha de vencimiento</label>
                 <input
                   type="date"
                   className="border rounded-lg p-2"
@@ -1705,19 +1966,46 @@ export function Debts({ data, actions, monthKeyStr }) {
               )}
 
               <div className="grid gap-1">
-                <label>Fecha último vencimiento</label>
+                <label>
+                  {debtEditModal.isSubscription ? 'Primer cobro' : 'Vencimiento 1ª cuota'}
+                </label>
                 <input
                   type="date"
                   className="border rounded-lg p-2"
-                  value={debtEditModal.due || ''}
+                  value={debtEditModal.firstDue || ''}
                   onChange={(e) =>
                     setDebtEditModal((prev) => ({
                       ...prev,
-                      due: e.target.value,
+                      firstDue: e.target.value,
                     }))
                   }
                 />
+                {debtEditModal.firstDue &&
+                  debtEditModal.firstDue !== debtEditModal.firstDueOriginal && (
+                    <div className="text-xs text-[color:var(--text-muted)]">
+                      {debtEditModal.isSubscription
+                        ? 'El cobro mensual empezará en esta fecha. Los pagos ya registrados se conservan.'
+                        : 'Todas las cuotas se correrán para que la primera venza en esta fecha. Los pagos ya registrados se conservan.'}
+                    </div>
+                  )}
               </div>
+
+              {!debtEditModal.isSubscription && (
+                <div className="grid gap-1">
+                  <label>Fecha último vencimiento</label>
+                  <input
+                    type="date"
+                    className="border rounded-lg p-2"
+                    value={debtEditModal.due || ''}
+                    onChange={(e) =>
+                      setDebtEditModal((prev) => ({
+                        ...prev,
+                        due: e.target.value,
+                      }))
+                    }
+                  />
+                </div>
+              )}
 
               <div className="grid gap-1">
                 <label>Tasa anual % (opcional)</label>

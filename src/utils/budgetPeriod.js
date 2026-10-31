@@ -1,4 +1,5 @@
 // src/utils/budgetPeriod.js
+import { toLocalDateKey } from '../domain/dates.js';
 
 // Clave de mes: "YYYY-MM"
 export function monthKey(date = new Date()) {
@@ -23,8 +24,8 @@ export function getBudgetPeriod(monthKeyStr, cutDay = 1) {
   const start = new Date(y, m - 1, day);
   const end = new Date(y, m, day); // siguiente mes mismo día (exclusivo)
 
-  const startStr = start.toISOString().slice(0, 10);
-  const endStr = end.toISOString().slice(0, 10);
+  const startStr = toLocalDateKey(start);
+  const endStr = toLocalDateKey(end);
 
   return { start: startStr, end: endStr };
 }
@@ -68,23 +69,23 @@ export function dateKeyFromValue(value) {
   if (!value) return '';
   if (value instanceof Date) {
     if (Number.isNaN(value.getTime())) return '';
-    return value.toISOString().slice(0, 10);
+    return toLocalDateKey(value);
   }
   if (typeof value === 'number') {
     const d = new Date(value);
     if (Number.isNaN(d.getTime())) return '';
-    return d.toISOString().slice(0, 10);
+    return toLocalDateKey(d);
   }
   if (typeof value === 'object') {
     if (typeof value.toDate === 'function') {
       const d = value.toDate();
       if (!d || Number.isNaN(d.getTime())) return '';
-      return d.toISOString().slice(0, 10);
+      return toLocalDateKey(d);
     }
     if (typeof value.seconds === 'number') {
       const d = new Date(value.seconds * 1000);
       if (Number.isNaN(d.getTime())) return '';
-      return d.toISOString().slice(0, 10);
+      return toLocalDateKey(d);
     }
   }
   const raw = String(value || '').trim();
@@ -93,5 +94,5 @@ export function dateKeyFromValue(value) {
   if (match) return match[0];
   const d = new Date(raw);
   if (Number.isNaN(d.getTime())) return '';
-  return d.toISOString().slice(0, 10);
+  return toLocalDateKey(d);
 }

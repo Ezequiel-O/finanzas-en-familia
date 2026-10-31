@@ -174,7 +174,7 @@ service cloud.firestore {
         request.resource.data.tokenHash == resource.data.tokenHash &&
         request.resource.data.createdByUid == resource.data.createdByUid) ||
         inviteAcceptedBySelf(hid, inviteId);
-      allow delete: if isOwner(hid) || selfDeleteJoinRequest(uid);
+      allow delete: if isOwner(hid);
     }
 
     match /households/{hid}/joinRequests/{uid} {
@@ -198,9 +198,45 @@ service cloud.firestore {
       allow delete: if isOwner(hid) || selfDeleteJoinRequest(uid);
     }
 
+    // Forma mínima de un movimiento. Los ingresos pueden ir sin categoría.
+    function validTransaction(d) {
+      return d.type in ['gasto', 'ingreso'] &&
+        (d.amount is int || d.amount is float) &&
+        d.amount >= 0 && d.amount <= 1000000000000 &&
+        d.date is string && d.date.matches('^[0-9]{4}-[0-9]{2}-[0-9]{2}.*') &&
+        (!('category' in d) || (d.category is string && d.category.size() <= 60)) &&
+        (!('description' in d) || (d.description is string && d.description.size() <= 500)) &&
+        (!('meta' in d) || d.meta is map);
+    }
+
+    match /households/{hid}/transactions/{txId} {
+      allow read, delete: if isMember(hid);
+      allow create: if isMember(hid) && validTransaction(request.resource.data);
+      // Un movimiento válido debe seguir siéndolo; los antiguos con otro formato
+      // (por ejemplo sin `date`) se pueden seguir editando para corregirlos.
+      allow update: if isMember(hid) &&
+        (validTransaction(request.resource.data) || !validTransaction(resource.data));
+    }
+
+    // Historial de cambios: cualquier miembro agrega a su nombre; nadie lo edita ni lo borra.
+    match /households/{hid}/auditLog/{entryId} {
+      allow read: if isMember(hid);
+      allow create: if isMember(hid) && request.resource.data.by == request.auth.uid;
+      allow update, delete: if false;
+    }
+
+    // Cierres de periodo: los miembros cierran; solo el dueño reabre; no se borran.
+    match /households/{hid}/closings/{periodKey} {
+      allow read: if isMember(hid);
+      allow create: if isMember(hid) && request.resource.data.status == 'closed';
+      allow update: if isMember(hid) &&
+        (request.resource.data.status == 'closed' || isOwner(hid));
+      allow delete: if false;
+    }
+
     match /households/{hid}/{col}/{doc} {
       allow read, write: if isMember(hid) &&
-        !(col in ['invites', 'joinRequests']);
+        !(col in ['invites', 'joinRequests', 'transactions', 'auditLog', 'closings']);
     }
   }
 }

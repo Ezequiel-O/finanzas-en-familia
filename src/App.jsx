@@ -4,25 +4,53 @@
 // - Datos en Firestore con sincronización en tiempo real
 // - Validación de login con tooltip en caso de credenciales vacías o inválidas
 
-import React, { useCallback, useEffect, useRef, useState } from 'react';
+import React, {
+  Suspense,
+  lazy,
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+} from 'react';
+import { createPortal } from 'react-dom';
 import { onAuthStateChanged, signOut } from 'firebase/auth';
 import { doc, setDoc, serverTimestamp } from 'firebase/firestore';
 
 // Firebase
 import { auth, db } from './firebase';
 
-// Layout
-import { Header } from './components/layout/header.jsx';
-import { Money } from './components/ui/money.jsx';
+// Layout y avisos
+import { Header } from './components/layout/Header.jsx';
+import { BottomNav } from './components/layout/BottomNav.jsx';
+import { Money } from './components/ui/Money.jsx';
+import { ErrorBoundary } from './components/feedback/ErrorBoundary.jsx';
+import { FeedbackHost } from './components/feedback/FeedbackHost.jsx';
+import { confirmDialog } from './components/feedback/feedback.js';
+import { parseIntent } from './ai/intentParser.js';
 
-// Módulos principales
-import { Dashboard } from './modules/dashboard/Dashboard.jsx';
-import { Transactions } from './modules/transactions/Transactions.jsx';
-import { Budgets } from './modules/budgets/Budgets.jsx';
-import { Debts } from './modules/debts/Debts.jsx';
-import { Savings } from './modules/savings/Savings.jsx';
+// Dominio y navegación
+import { buildDebtPaidIndex, debtProgress } from './domain/commitments.js';
+import { todayKey } from './domain/dates.js';
+import { useHashTab } from './navigation/tabs.js';
+
+// Siempre visibles al entrar
 import { AuthGate } from './modules/auth/AuthGate.jsx';
-import { Settings } from './modules/settings/Settings.jsx';
+import { QuickAddSheet } from './features/quick-add/QuickAddSheet.jsx';
+import { CommitmentsPanel } from './features/plan/CommitmentsPanel.jsx';
+import { UpcomingCard } from './features/plan/UpcomingCard.jsx';
+import { ExpectedIncomeCard } from './features/plan/ExpectedIncomeCard.jsx';
+import { PaymentPlanCard } from './features/plan/PaymentPlanCard.jsx';
+import { PeriodClosingCard } from './features/plan/PeriodClosingCard.jsx';
+import { FinancialHealthCard } from './features/plan/FinancialHealthCard.jsx';
+
+// Pestañas: se cargan al abrirlas para achicar la descarga inicial
+const named = (loader, name) => lazy(() => loader().then((m) => ({ default: m[name] })));
+const Dashboard = named(() => import('./modules/dashboard/Dashboard.jsx'), 'Dashboard');
+const Transactions = named(() => import('./modules/transactions/Transactions.jsx'), 'Transactions');
+const Budgets = named(() => import('./modules/budgets/Budgets.jsx'), 'Budgets');
+const CommitmentsPage = named(() => import('./features/commitments/CommitmentsPage.jsx'), 'CommitmentsPage');
+const Settings = named(() => import('./modules/settings/Settings.jsx'), 'Settings');
 
 // Hooks y utils
 import useHouseholdData from './hooks/useHouseholdData.js';
@@ -39,8 +67,18 @@ import './App.css';
 const INACTIVITY_TIMEOUT_MS = 20 * 60 * 1000;
 const ACTIVITY_SYNC_INTERVAL_MS = 6 * 60 * 60 * 1000;
 
+function TabFallback() {
+  return (
+    <div className="py-10 text-center text-sm text-[color:var(--text-muted)]" role="status">
+      Cargando…
+    </div>
+  );
+}
+
 export default function App() {
-  const [tab, setTab] = useState('dashboard');
+  const [tab, setTab, tabSection] = useHashTab('dashboard');
+  const [commitmentsSection, setCommitmentsSection] = useState('debts');
+  const [quickAddOpen, setQuickAddOpen] = useState(false);
   const [ctx, setCtx] = useState(null);
 
   const [selectedMonth, setSelectedMonth] = useState(monthKey());
@@ -49,6 +87,16 @@ export default function App() {
   const [showTrashModal, setShowTrashModal] = useState(false);
   const [showArchiveModal, setShowArchiveModal] = useState(false);
   const [mobileMenuOpen, setMobileMenuOpen] = useState(false);
+  const [aiOpen, setAiOpen] = useState(false);
+  const [aiText, setAiText] = useState('');
+  const [aiListening, setAiListening] = useState(false);
+  const [aiStatus, setAiStatus] = useState('');
+  const [aiInterim, setAiInterim] = useState('');
+  const [aiError, setAiError] = useState('');
+  const [aiPlan, setAiPlan] = useState(null);
+  const aiRecognitionRef = useRef(null);
+  const aiManualStopRef = useRef(false);
+  const aiListenTimerRef = useRef(null);
 
   const [authedUser, setAuthedUser] = useState(null);
   const lastActivityRef = useRef(Date.now());
@@ -59,12 +107,16 @@ export default function App() {
     useHouseholdData(ctx?.householdId, ctx?.user, {
       selectedMonthKey: selectedMonth,
     }) || {};
-  const todayStr = new Date().toISOString().slice(0, 10);
+  const todayStr = todayKey();
   const selectedHid = ctx?.householdId || null;
   const trashItems = Array.isArray(h.trash) ? h.trash : [];
   const archivedDebts = Array.isArray(h.debts)
     ? h.debts.filter((d) => d && d.archived)
     : [];
+  const debtPaidIndex = useMemo(
+    () => buildDebtPaidIndex(h.transactions || []),
+    [h.transactions],
+  );
 
   const budgetsForSelectedMonth = (h.budgets && h.budgets[selectedMonth]) || {};
   const householdUsers = h.householdUsers || [];
@@ -188,6 +240,106 @@ export default function App() {
     };
   }, [ctx?.householdId, ctx?.user?.uid, handleLogout, syncActivity]);
 
+  const stopAiDictation = useCallback(() => {
+    aiManualStopRef.current = true;
+    if (aiListenTimerRef.current) {
+      clearTimeout(aiListenTimerRef.current);
+      aiListenTimerRef.current = null;
+    }
+    const recognition = aiRecognitionRef.current;
+    if (recognition) {
+      recognition.stop();
+    }
+    setAiListening(false);
+    setAiInterim('');
+  }, []);
+
+  const startAiDictation = useCallback(() => {
+    if (aiListening) return;
+    setAiError('');
+    setAiStatus('');
+    setAiInterim('');
+    aiManualStopRef.current = false;
+    const SpeechRecognition =
+      window.SpeechRecognition || window.webkitSpeechRecognition;
+    if (!SpeechRecognition) {
+      setAiError('Transcripción no disponible en este navegador.');
+      return;
+    }
+    const recognition = new SpeechRecognition();
+    aiRecognitionRef.current = recognition;
+    recognition.lang = navigator.language || 'es-CL';
+    recognition.interimResults = true;
+    recognition.continuous = true;
+
+    recognition.onresult = (event) => {
+      let interimText = '';
+      let finalText = '';
+      for (let i = event.resultIndex; i < event.results.length; i += 1) {
+        const result = event.results[i];
+        const transcript = result[0]?.transcript || '';
+        if (result.isFinal) {
+          finalText += transcript;
+        } else {
+          interimText += transcript;
+        }
+      }
+      if (interimText) setAiInterim(interimText.trim());
+      if (finalText.trim()) {
+        setAiText((prev) =>
+          prev ? `${prev} ${finalText.trim()}` : finalText.trim(),
+        );
+        setAiInterim('');
+        setAiStatus('Transcripción lista (pendiente de IA).');
+      }
+    };
+
+    recognition.onerror = (event) => {
+      if (!aiManualStopRef.current && event?.error === 'no-speech') {
+        return;
+      }
+      setAiError('No se pudo transcribir el audio.');
+      aiManualStopRef.current = true;
+      setAiListening(false);
+      setAiInterim('');
+    };
+
+    recognition.onend = () => {
+      if (aiManualStopRef.current) {
+        setAiListening(false);
+        setAiInterim('');
+        return;
+      }
+      try {
+        recognition.start();
+      } catch {
+        setAiError('No se pudo reanudar el dictado.');
+        setAiListening(false);
+      }
+    };
+
+    recognition.start();
+    setAiListening(true);
+    setAiStatus('Escuchando...');
+    if (aiListenTimerRef.current) {
+      clearTimeout(aiListenTimerRef.current);
+    }
+    aiListenTimerRef.current = setTimeout(() => {
+      aiManualStopRef.current = true;
+      setAiStatus('Dictado finalizado (límite 2 min).');
+      const rec = aiRecognitionRef.current;
+      if (rec) rec.stop();
+      setAiListening(false);
+      setAiInterim('');
+      aiListenTimerRef.current = null;
+    }, 120000);
+  }, [aiListening]);
+
+  const handleAiToggle = useCallback(() => {
+    if (aiListening) stopAiDictation();
+    setAiOpen((prev) => !prev);
+  }, [aiListening, stopAiDictation]);
+
   // Preferencias de usuario de la casa
   const userPrefs = activeHouseholdUser?.preferences || {};
   const theme = userPrefs.ui?.theme || 'light';
@@ -202,6 +354,37 @@ export default function App() {
     }
   }, [theme]);
 
+  // Sección de Compromisos pedida por enlace antiguo (#deudas / #ahorro).
+  useEffect(() => {
+    if (tabSection) setCommitmentsSection(tabSection);
+  }, [tabSection]);
+
+  // Pestaña inicial según preferencias, solo si la URL no trae una.
+  const appliedDefaultTabRef = useRef(false);
+  const preferredTab = userPrefs.defaultTab;
+  useEffect(() => {
+    if (appliedDefaultTabRef.current || !activeHouseholdUser) return;
+    appliedDefaultTabRef.current = true;
+    if (!window.location.hash && preferredTab && preferredTab !== 'dashboard') {
+      setTab(preferredTab);
+    }
+  }, [activeHouseholdUser, preferredTab, setTab]);
+
+  // Atajo del ícono instalado: "Registrar gasto" abre el formulario rápido.
+  useEffect(() => {
+    if (!ctx) return;
+    const params = new URLSearchParams(window.location.search);
+    if (params.get('accion') !== 'nuevo-gasto') return;
+    setQuickAddOpen(true);
+    params.delete('accion');
+    const query = params.toString();
+    window.history.replaceState(
+      null,
+      '',
+      `${window.location.pathname}${query ? `?${query}` : ''}${window.location.hash}`,
+    );
+  }, [ctx]);
+
   // Datos compartidos a los módulos
   const data = {
     categories: h.categories,
@@ -211,11 +394,16 @@ export default function App() {
     debts: h.debts,
     savings: h.savings,
     fixedCategories: h.fixedCategories,
+    priorityCategories: h.priorityCategories,
+    fixedDueDays: h.fixedDueDays,
     householdUsers: h.householdUsers,
     memberInfo: h.memberInfo,
     ownerUid: h.ownerUid,
     budgetCutDay: h.budgetCutDay,
+    expectedIncome: h.expectedIncome,
+    closings: h.closings,
     trash: h.trash,
+    activeUser,
   };
 
   const actions = {
@@ -239,21 +427,110 @@ export default function App() {
     removeCategory: h.removeCategory,
     renameCategory: h.renameCategory,
     setCategoryFixed: h.setCategoryFixed,
+    setCategoryPriority: h.setCategoryPriority,
+    setCategoryDueDay: h.setCategoryDueDay,
     moveCategoryInGroup: h.moveCategoryInGroup,
     addHouseholdUser: h.addHouseholdUser,
     updateHouseholdUser: h.updateHouseholdUser,
     removeHouseholdUser: h.removeHouseholdUser,
     setBudgetCutDay: h.setBudgetCutDay,
+    exportFinances: h.exportFinances,
+    resetFinances: h.resetFinances,
+    setExpectedIncome: h.setExpectedIncome,
+    closePeriod: h.closePeriod,
+    reopenPeriod: h.reopenPeriod,
+    fetchAuditLog: h.fetchAuditLog,
   };
+
+  const handleAiSendText = useCallback(() => {
+    const input = aiText.trim();
+    if (!input) return;
+    try {
+      const result = parseIntent(input, {
+        categories: data.categories,
+        transactions: data.transactions,
+      });
+      if (result.type === 'clarify') {
+        setAiPlan(null);
+        setAiStatus(result.message);
+        return;
+      }
+      if (result.type === 'plan') {
+        setAiPlan(result.plan);
+        setAiStatus('Revisa y confirma la acción.');
+        return;
+      }
+      setAiStatus('No pude interpretar la instrucción.');
+    } catch (err) {
+      console.error('AI parse error:', err);
+      setAiError('No se pudo interpretar la instrucción.');
+    }
+  }, [aiText, data.categories, data.transactions]);
+
+  const handleAiConfirm = useCallback(async () => {
+    if (!aiPlan) return;
+    setAiError('');
+    try {
+      if (aiPlan.kind === 'create_transaction') {
+        if (!actions?.addTransaction) {
+          setAiError('Acción no disponible.');
+          return;
+        }
+        const payload = {
+          type: aiPlan.payload.type,
+          amount: Math.round(Number(aiPlan.payload.amount || 0)),
+          category: aiPlan.payload.category || 'Ingresos',
+          description: aiPlan.payload.description || '',
+          date: aiPlan.payload.date,
+          ownerId: activeUser?.id || null,
+          ownerName: activeUser?.name || null,
+          ownerEmail: activeUser?.email || null,
+          createdAt: new Date().toISOString(),
+        };
+        const createdId = await actions.addTransaction(payload);
+        if (!createdId) {
+          setAiError('No se pudo guardar el movimiento.');
+          return;
+        }
+      } else if (aiPlan.kind === 'update_transaction') {
+        if (!actions?.updateTransaction) {
+          setAiError('Acción no disponible.');
+          return;
+        }
+        await actions.updateTransaction(aiPlan.payload.id, aiPlan.payload.patch);
+      } else if (aiPlan.kind === 'delete_transaction') {
+        if (!actions?.removeTransaction) {
+          setAiError('Acción no disponible.');
+          return;
+        }
+        await actions.removeTransaction(aiPlan.payload.id);
+      } else if (aiPlan.kind === 'set_budget') {
+        if (!actions?.setBudget) {
+          setAiError('Acción no disponible.');
+          return;
+        }
+        await actions.setBudget(aiPlan.payload.category, aiPlan.payload.amount);
+      }
+      setAiStatus('Acción ejecutada.');
+      setAiPlan(null);
+      setAiText('');
+    } catch (err) {
+      console.error('AI action error:', err);
+      setAiError('No se pudo ejecutar la acción.');
+    }
+  }, [aiPlan, actions, activeUser]);
+
+  const handleAiCancelPlan = useCallback(() => {
+    setAiPlan(null);
+    setAiStatus('Acción cancelada.');
+  }, []);
 
   const hasCtx = !!ctx;
   const showTrashButton =
     hasCtx &&
-    (tab === 'transactions' ||
-      tab === 'budgets' ||
-      tab === 'debts' ||
-      tab === 'savings');
-  const showArchiveButton = hasCtx && tab === 'debts';
+    (tab === 'transactions' || tab === 'plan' || tab === 'commitments');
+  const showArchiveButton =
+    hasCtx && tab === 'commitments' && commitmentsSection === 'debts';
   const headerUser = hasCtx ? ctx.user : authedUser;
   const headerHouseholdId = hasCtx ? selectedHid : null;
   const sortedTrashItems = [...trashItems].sort(
@@ -309,10 +586,10 @@ export default function App() {
   };
 
   const archivedDebtTitle = (debt) => debt?.name || 'Deuda sin nombre';
+  // Saldo real desde los pagos registrados (el campo `remaining` guardado puede estar desactualizado).
   const archivedDebtAmount = (debt) => {
-    const remaining = Number(debt?.remaining || 0);
-    if (remaining > 0) return remaining;
-    return Number(debt?.original || 0);
+    const progress = debtProgress(debt, debtPaidIndex);
+    return progress.remaining > 0 ? progress.remaining : progress.total;
   };
   const archivedDebtMeta = (debt) => {
     const parts = [];
@@ -332,7 +609,7 @@ export default function App() {
     if (!h.removeDebt || !debt?.id) return;
     const name = String(debt?.name || '').trim();
     const label = name ? ` "${name}"` : '';
-    const ok = window.confirm(
+    const ok = await confirmDialog(
       `Eliminar deuda archivada${label}? Se movera a la papelera.`,
     );
     if (!ok) return;
@@ -381,7 +658,7 @@ export default function App() {
 
   const handlePurgeTrash = async (item) => {
     if (!actions.purgeTrashItem) return;
-    const ok = window.confirm(
+    const ok = await confirmDialog(
       'Eliminar definitivamente este elemento? Esta accion no se puede deshacer.',
     );
     if (!ok) return;
@@ -392,12 +669,126 @@ export default function App() {
     return (
       <div className="min-h-screen bg-[color:var(--bg)] text-[color:var(--text)]">
         <AuthGate onReady={(c) => setCtx(c)} />
+        <FeedbackHost />
       </div>
     );
   }
 
+  const aiFloating = (
+    <div className="fixed bottom-[calc(5.5rem+env(safe-area-inset-bottom))] md:bottom-4 right-4 left-auto z-[9999]">
+      {!aiOpen ? (
+        <button
+          type="button"
+          className="ai-fab h-12 w-12 md:h-16 md:w-16 rounded-full shadow-lg hover:brightness-105 active:scale-95 transition text-sm md:text-base font-semibold tracking-wide"
+          onClick={handleAiToggle}
+          aria-label="Abrir asistente"
+        >
+          IA
+        </button>
+      ) : (
+        <div className="ai-panel w-[min(90vw,360px)] rounded-2xl border border-[color:var(--border)] bg-[color:var(--surface-1)] shadow-[var(--shadow)] p-4 space-y-3">
+          <div className="flex items-center justify-between">
+            <div className="text-sm font-semibold">Asistente</div>
+            <button
+              type="button"
+              className="text-xs text-[color:var(--text-muted)] hover:text-[color:var(--text)]"
+              onClick={handleAiToggle}
+            >
+              Cerrar
+            </button>
+          </div>
+          <textarea
+            className="w-full rounded-lg border border-[color:var(--border)] bg-transparent px-3 py-2 text-sm"
+            rows={3}
+            placeholder="Escribe tu solicitud (o pega la transcripción aquí)"
+            value={aiText}
+            onChange={(e) => {
+              setAiText(e.target.value);
+              setAiStatus('');
+              setAiPlan(null);
+            }}
+          />
+          <div className="flex flex-wrap items-center gap-2">
+            {aiListening ? (
+              <button
+                type="button"
+                className="px-3 py-1.5 text-xs rounded-lg border border-[color:var(--danger)]/40 text-[color:var(--danger)] hover:bg-[color:var(--danger)]/10"
+                onClick={stopAiDictation}
+              >
+                Detener dictado
+              </button>
+            ) : (
+              <button
+                type="button"
+                className="px-3 py-1.5 text-xs rounded-lg border text-[color:var(--text-muted)] hover:bg-[color:var(--surface-2)]"
+                onClick={startAiDictation}
+              >
+                Dictar
+              </button>
+            )}
+          </div>
+          {aiListening && (
+            <div className="flex items-center gap-2 text-xs text-[color:var(--text-muted)]">
+              <span className="ai-listening-dot" />
+              Escuchando...
+            </div>
+          )}
+          {aiInterim && (
+            <div className="text-xs text-[color:var(--text-muted)]">
+              {aiInterim}
+            </div>
+          )}
+          {aiError && (
+            <div className="text-xs text-[color:var(--danger)]">{aiError}</div>
+          )}
+          {aiStatus && (
+            <div className="text-xs text-[color:var(--text-muted)]">
+              {aiStatus}
+            </div>
+          )}
+          {aiPlan && (
+            <div className="rounded-lg border border-[color:var(--border)] bg-[color:var(--surface-2)]/60 p-3 text-xs space-y-2">
+              <div className="font-semibold text-[color:var(--text)]">
+                Confirmar acción
+              </div>
+              <div className="text-[color:var(--text-muted)]">
+                {aiPlan.summary}
+              </div>
+              <div className="flex gap-2">
+                <button
+                  type="button"
+                  className="flex-1 px-3 py-2 text-xs rounded-lg border bg-[color:var(--primary)] text-[color:var(--primary-contrast)] disabled:opacity-60"
+                  onClick={handleAiConfirm}
+                >
+                  Confirmar
+                </button>
+                <button
+                  type="button"
+                  className="flex-1 px-3 py-2 text-xs rounded-lg border text-[color:var(--text-muted)] hover:bg-[color:var(--surface-2)]"
+                  onClick={handleAiCancelPlan}
+                >
+                  Cancelar
+                </button>
+              </div>
+            </div>
+          )}
+          <div className="flex gap-2">
+            <button
+              type="button"
+              className="flex-1 px-3 py-2 text-xs rounded-lg border text-[color:var(--text-muted)] hover:bg-[color:var(--surface-2)] disabled:opacity-60"
+              onClick={handleAiSendText}
+              disabled={!aiText.trim()}
+            >
+              Enviar texto
+            </button>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+
   return (
-    <div className="min-h-screen bg-[color:var(--bg)] text-[color:var(--text)]">
+    <div className="min-h-screen bg-[color:var(--bg)] text-[color:var(--text)] overflow-x-clip">
       <div>
         <div className="flex min-h-screen flex-col md:flex-row">
           <Header
@@ -416,7 +807,7 @@ export default function App() {
             }`}
           >
             {tab !== 'settings' && (() => {
-              const today = new Date().toISOString().slice(0, 10);
+              const today = todayKey();
               const currentBudgetKey = budgetMonthKeyForDate(
                 today,
                 data.budgetCutDay || 1,
@@ -443,12 +834,20 @@ export default function App() {
                       </button>
                     )}
                     <div className="flex flex-wrap items-center justify-end gap-2">
+                      <button
+                        type="button"
+                        onClick={() => setQuickAddOpen(true)}
+                        className="hidden md:inline-flex h-9 items-center gap-1 rounded-lg bg-[color:var(--primary)] px-3 text-sm font-semibold text-[color:var(--primary-contrast)] shadow-sm active:scale-[0.98]"
+                      >
+                        + Registrar gasto
+                      </button>
                       <div className="grid min-w-0 grid-cols-[minmax(2rem,auto)_auto_minmax(2rem,auto)] items-center gap-2">
                         <button
                           className="period-nav-button w-full h-8 min-h-[32px] inline-flex items-center justify-center rounded-md border border-[color:var(--border)] bg-[color:var(--surface-2)] text-[color:var(--text)] shadow-sm transition-colors duration-150 hover:bg-[color:var(--surface-1)] active:bg-[color:var(--surface-2)] active:shadow-inner disabled:cursor-not-allowed disabled:opacity-50"
                           onClick={() =>
                             setSelectedMonth((prev) => shiftMonth(prev, -1))
                           }
+                          aria-label="Periodo anterior"
                         >
                           <svg
                             className="h-4 w-4"
@@ -474,6 +873,7 @@ export default function App() {
                           onClick={() =>
                             setSelectedMonth((prev) => shiftMonth(prev, 1))
                           }
+                          aria-label="Periodo siguiente"
                         >
                           <svg
                             className="h-4 w-4"
@@ -699,110 +1099,158 @@ export default function App() {
         )}
 
         <main
-          className={`${tab === 'debts' || tab === 'savings' ? 'w-full max-w-none' : 'max-w-6xl mx-auto'} px-4 py-4 grid gap-4 ${
+          className={`${tab === 'commitments' ? 'w-full max-w-none' : 'max-w-6xl mx-auto'} px-4 pt-4 pb-28 md:pb-6 grid gap-4 ${
             density === 'compact' ? 'text-xs' : 'text-sm'
           }`}
         >
-          {!hasCtx && <AuthGate onReady={(c) => setCtx(c)} />}
+          <ErrorBoundary resetKey={tab}>
+            <Suspense fallback={<TabFallback />}>
+              {tab === 'dashboard' && (
+                <>
+                  <UpcomingCard
+                    data={data}
+                    actions={actions}
+                    activeUser={activeUser}
+                    onOpenPlan={() => setTab('plan')}
+                  />
+                  <FinancialHealthCard data={data} periodKey={selectedMonth} />
+                  <Dashboard
+                    data={{
+                      categories: data.categories,
+                      budgets: data.budgets,
+                      budgetsAll: data.budgetsAll,
+                      transactions: data.transactions,
+                      debts: data.debts,
+                      savings: data.savings,
+                      fixedCategories: data.fixedCategories,
+                      budgetCutDay: data.budgetCutDay,
+                      activeUserPreferences: userPrefs,
+                    }}
+                    monthKeyStr={selectedMonth}
+                  />
+                </>
+              )}
 
-          {tab === 'dashboard' && (
-            <Dashboard
-              data={{
-                categories: data.categories,
-                budgets: data.budgets,
-                budgetsAll: data.budgetsAll,
-                transactions: data.transactions,
-                debts: data.debts,
-                savings: data.savings,
-                fixedCategories: data.fixedCategories,
-                budgetCutDay: data.budgetCutDay,
-                activeUserPreferences: userPrefs,
-              }}
-              monthKeyStr={selectedMonth}
-            />
-          )}
+              {tab === 'transactions' && (
+                <Transactions
+                  data={{
+                    transactions: data.transactions,
+                    categories: data.categories,
+                    debts: data.debts,
+                    savings: data.savings,
+                    budgets: data.budgets,
+                    budgetsAll: data.budgetsAll,
+                    fixedCategories: data.fixedCategories,
+                    householdUsers: data.householdUsers,
+                  }}
+                  actions={actions}
+                  activeUser={activeUser}
+                  monthKeyStr={selectedMonth}
+                  budgetCutDay={data.budgetCutDay}
+                />
+              )}
 
-          {tab === 'transactions' && (
-            <Transactions
-              data={{
-                transactions: data.transactions,
-                categories: data.categories,
-                debts: data.debts,
-                savings: data.savings,
-                budgets: data.budgets,
-                budgetsAll: data.budgetsAll,
-                fixedCategories: data.fixedCategories,
-                householdUsers: data.householdUsers,
-              }}
-              actions={actions}
-              activeUser={activeUser}
-              monthKeyStr={selectedMonth}
-              budgetCutDay={data.budgetCutDay}
-            />
-          )}
+              {tab === 'plan' && (
+                <>
+                  <Budgets
+                    data={{
+                      budgets: data.budgets,
+                      budgetsAll: data.budgetsAll,
+                      transactions: data.transactions,
+                      categories: data.categories,
+                      fixedCategories: data.fixedCategories,
+                      budgetCutDay: data.budgetCutDay,
+                      debts: data.debts,
+                      savings: data.savings,
+                      expectedIncome: data.expectedIncome,
+                    }}
+                    actions={actions}
+                    activeUser={activeUser}
+                    monthKeyStr={selectedMonth}
+                    topSlot={<PaymentPlanCard data={data} actions={actions} activeUser={activeUser} />}
+                    beforeCategories={
+                      <>
+                        <ExpectedIncomeCard data={data} actions={actions} periodKey={selectedMonth} />
+                        <CommitmentsPanel
+                          data={data}
+                          actions={actions}
+                          activeUser={activeUser}
+                          periodKey={selectedMonth}
+                          onOpenCommitments={() => setTab('commitments')}
+                        />
+                      </>
+                    }
+                  />
+                  <PeriodClosingCard
+                    data={data}
+                    actions={actions}
+                    activeUser={activeUser}
+                    periodKey={selectedMonth}
+                    isOwner={!!data.ownerUid && data.ownerUid === ctx.user?.uid}
+                  />
+                </>
+              )}
 
-          {tab === 'budgets' && (
-            <Budgets
-              data={{
-                budgets: data.budgets,
-                budgetsAll: data.budgetsAll,
-                transactions: data.transactions,
-                categories: data.categories,
-                fixedCategories: data.fixedCategories,
-                budgetCutDay: data.budgetCutDay,
-                debts: data.debts,
-                savings: data.savings,
-              }}
-              actions={actions}
-              monthKeyStr={selectedMonth}
-            />
-          )}
+              {tab === 'commitments' && (
+                <CommitmentsPage
+                  section={commitmentsSection}
+                  onSectionChange={setCommitmentsSection}
+                  data={data}
+                  actions={actions}
+                  monthKeyStr={selectedMonth}
+                />
+              )}
 
-          {tab === 'debts' && (
-            <Debts
-              data={{
-                debts: data.debts,
-                transactions: data.transactions,
-                budgetCutDay: data.budgetCutDay,
-              }}
-              actions={actions}
-              monthKeyStr={selectedMonth}
-            />
-          )}
-
-          {tab === 'savings' && (
-            <Savings
-              data={{
-                savings: data.savings,
-                transactions: data.transactions,
-                budgetCutDay: data.budgetCutDay,
-              }}
-              actions={actions}
-              monthKeyStr={selectedMonth}
-            />
-          )}
-
-          {tab === 'settings' && (
-            <Settings
-              data={{
-                budgets: data.budgets,
-                transactions: data.transactions,
-                debts: data.debts,
-                savings: data.savings,
-                householdUsers: data.householdUsers,
-                memberInfo: data.memberInfo,
-                ownerUid: data.ownerUid,
-                budgetCutDay: data.budgetCutDay,
-                fixedCategories: data.fixedCategories,
-              }}
-              householdId={selectedHid}
-              user={ctx.user}
-              categories={data.categories}
-              actions={actions}
-              activeHouseholdUser={activeHouseholdUser}
-            />
-          )}
+              {tab === 'settings' && (
+                <Settings
+                  data={{
+                    budgets: data.budgets,
+                    transactions: data.transactions,
+                    debts: data.debts,
+                    savings: data.savings,
+                    householdUsers: data.householdUsers,
+                    memberInfo: data.memberInfo,
+                    ownerUid: data.ownerUid,
+                    budgetCutDay: data.budgetCutDay,
+                    fixedCategories: data.fixedCategories,
+                    priorityCategories: data.priorityCategories,
+                    fixedDueDays: data.fixedDueDays,
+                  }}
+                  householdId={selectedHid}
+                  user={ctx.user}
+                  categories={data.categories}
+                  actions={actions}
+                  activeHouseholdUser={activeHouseholdUser}
+                />
+              )}
+            </Suspense>
+          </ErrorBoundary>
         </main>
+
+        <BottomNav
+          currentTab={tab}
+          setTab={setTab}
+          onQuickAdd={() => setQuickAddOpen(true)}
+        />
+
+        <QuickAddSheet
+          open={quickAddOpen}
+          onClose={() => setQuickAddOpen(false)}
+          categories={data.categories || []}
+          budgetsAll={data.budgetsAll || {}}
+          transactions={data.transactions || []}
+          budgetCutDay={data.budgetCutDay || 1}
+          fixedCategories={data.fixedCategories || {}}
+          householdUsers={data.householdUsers || []}
+          activeUser={activeUser}
+          actions={actions}
+        />
+
+        <FeedbackHost />
+
+        {typeof document !== 'undefined'
+          ? createPortal(aiFloating, document.body)
+          : aiFloating}
 
       </div>
     </div>

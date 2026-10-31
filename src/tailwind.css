@@ -1,0 +1,18 @@
+/* Tailwind compilado en el build (antes se cargaba desde cdn.tailwindcss.com).
+   Se importa después de index.css y App.css para mantener el mismo orden de
+   cascada que tenía el CDN, que inyectaba sus estilos al final del <head>. */
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* iOS amplía la pantalla al enfocar un campo con letra menor a 16px (text-sm = 14px)
+   y no vuelve al tamaño original. Con 16px en pantallas táctiles no hace zoom, sin
+   bloquear el zoom con los dedos (maximum-scale=1 rompe la accesibilidad).
+   !important porque las utilidades text-xs/text-sm de cada campo tienen más prioridad. */
+@media (hover: none) and (pointer: coarse) {
+  input:not([type='checkbox']):not([type='radio']),
+  select,
+  textarea {
+    font-size: 16px !important;
+  }
+}

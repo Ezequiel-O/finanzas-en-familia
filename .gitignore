@@ -37,3 +37,10 @@ dist-ssr
 dist/
 
 .notas
+
+# Temporales
+tmp_*
+*.bak
+
+# Respaldos de Firestore (datos financieros)
+backups/

@@ -1,9 +1,14 @@
 // src/modules/savings/Savings.jsx
-import React, { useMemo, useState } from 'react';
+import { txDateKey } from '../../domain/ledger.js';
+import { plannedForSavingPeriod } from '../../domain/commitments.js';
+import { SAVINGS_CATEGORY } from '../../constants.js';
+import { toast, confirmDialog } from '../../components/feedback/feedback.js';
+import { todayKey, toLocalDateKey } from '../../domain/dates.js';
+import React, { useEffect, useMemo, useState } from 'react';
 
-import { Card } from '../../components/ui/card.jsx';
+import { Card } from '../../components/ui/Card.jsx';
 import { SectionTitle } from '../../components/ui/SectionTitle.jsx';
-import { Money } from '../../components/ui/money.jsx';
+import { Money } from '../../components/ui/Money.jsx';
 import { Progress } from '../../components/ui/Progress.jsx';
 import {
   monthKey,
@@ -14,7 +19,6 @@ import {
   dateKeyFromValue,
 } from '../../utils/budgetPeriod.js';
 
-const SAVINGS_CATEGORY = 'Ahorro';
 const DEFAULT_PLAN_PERIODS = 3;
 
 function toNumber(n) {
@@ -58,49 +62,6 @@ function periodsBetween(startPk, endPk) {
   return count;
 }
 
-function savingStartPeriodKey(s, cutDay) {
-  const dateKey = dateKeyFromValue(s?.createdAt);
-  return dateKey ? budgetMonthKeyForDate(dateKey, cutDay) : '';
-}
-
-function planForSavingLegacy(s, periodKey, cutDay) {
-  if (!periodKey) return { plan: 0, targetPk: '' };
-  const rawStartPk = savingStartPeriodKey(s, cutDay);
-  const startPk = rawStartPk || periodKey || monthKey(new Date());
-  const periods = Math.max(1, Number(DEFAULT_PLAN_PERIODS) || 1);
-  const targetPk = s?.targetDate
-    ? budgetMonthKeyForDate(s.targetDate, cutDay)
-    : shiftMonth(startPk, periods - 1);
-
-  const normalizedTarget =
-    targetPk && rawStartPk && rawStartPk > targetPk ? rawStartPk : targetPk;
-
-  if (rawStartPk && periodKey < rawStartPk) {
-    return { plan: 0, targetPk: normalizedTarget };
-  }
-
-  const remaining = Math.max(toNumber(s.goal) - toNumber(s.saved), 0);
-  if (remaining <= 0 || (normalizedTarget && periodKey > normalizedTarget)) {
-    return { plan: 0, targetPk: normalizedTarget };
-  }
-
-  const scheduleStartPk = rawStartPk || periodKey;
-  if (periodKey < scheduleStartPk) {
-    return { plan: 0, targetPk: normalizedTarget };
-  }
-
-  const totalPeriods = periodsBetween(
-    scheduleStartPk,
-    normalizedTarget || scheduleStartPk,
-  );
-  const basePlan =
-    totalPeriods > 0 ? Math.floor(remaining / totalPeriods) : remaining;
-  const delta = remaining - basePlan * totalPeriods;
-  const plan = periodKey === normalizedTarget ? basePlan + delta : basePlan;
-
-  return { plan, targetPk: normalizedTarget };
-}
-
 function resolveSchedulePeriodKey(entry, cutDay) {
   if (entry?.periodKey) return entry.periodKey;
   if (entry?.dueDate) {
@@ -109,18 +70,6 @@ function resolveSchedulePeriodKey(entry, cutDay) {
   return '';
 }
 
-function plannedForSavingPeriod(saving, periodKey, cutDay) {
-  if (!periodKey) return 0;
-  const schedule = ensureScheduleArray(saving?.schedule);
-  if (schedule.length) {
-    return schedule
-      .filter((q) => resolveSchedulePeriodKey(q, cutDay) === periodKey)
-      .reduce((sum, q) => sum + toNumber(q.plannedAmount), 0);
-  }
-  const { plan, targetPk } = planForSavingLegacy(saving, periodKey, cutDay);
-  if (!targetPk || periodKey > targetPk) return 0;
-  return plan;
-}
 function buildSavingSchedule({
   goal,
   saved,
@@ -133,7 +82,7 @@ function buildSavingSchedule({
   if (remaining <= 0) return [];
 
   const createdKey =
-    dateKeyFromValue(createdAt) || new Date().toISOString().slice(0, 10);
+    dateKeyFromValue(createdAt) || todayKey();
   const startPk = budgetMonthKeyForDate(createdKey, budgetCutDay);
   const periods = Math.max(1, Number(defaultPeriods) || DEFAULT_PLAN_PERIODS);
 
@@ -158,7 +107,7 @@ function buildSavingSchedule({
     schedule.push({
       id: `${Date.now()}-${i}-${Math.random().toString(36).slice(2, 6)}`,
       periodKey: pk,
-      dueDate: endDate.toISOString().slice(0, 10),
+      dueDate: toLocalDateKey(endDate),
       plannedAmount: planned,
       paidAmount: 0,
       status: computePlanStatus(planned, 0),
@@ -173,7 +122,7 @@ function totalSavingsPaidFromTransactions(transactions, periodKey, cutDay) {
   return (transactions || [])
     .filter((t) => t.category === SAVINGS_CATEGORY)
     .filter((t) => {
-      const d = (t.date || t.createdAt || '').slice(0, 10);
+      const d = txDateKey(t);
       return d >= start && d < end;
     })
     .reduce((sum, t) => sum + toNumber(t.amount), 0);
@@ -212,13 +161,22 @@ export function Savings({ data, actions, monthKeyStr }) {
   const [hideCompletedSavings, setHideCompletedSavings] = useState(true);
   const [showAddSavingModal, setShowAddSavingModal] = useState(false);
 
+  useEffect(() => {
+    if (!showAddSavingModal) return undefined;
+    const onKey = (e) => {
+      if (e.key === 'Escape') setShowAddSavingModal(false);
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [showAddSavingModal]);
+
   const currentPeriodKey = useMemo(
     () => monthKeyStr || monthKey(new Date()),
     [monthKeyStr],
   );
 
   const trueCurrentPeriod = useMemo(() => {
-    const todayStr = new Date().toISOString().slice(0, 10);
+    const todayStr = todayKey();
     return budgetMonthKeyForDate(todayStr, budgetCutDay);
   }, [budgetCutDay]);
 
@@ -253,7 +211,7 @@ export function Savings({ data, actions, monthKeyStr }) {
       if (t?.category !== SAVINGS_CATEGORY) return;
       const amt = toNumber(t.amount);
       if (!amt) return;
-      const dateStr = (t.date || t.createdAt || '').slice(0, 10);
+      const dateStr = txDateKey(t);
       const periodKey = dateStr
         ? budgetMonthKeyForDate(dateStr, budgetCutDay)
         : '';
@@ -263,6 +221,11 @@ export function Savings({ data, actions, monthKeyStr }) {
         savingId = nameKey ? savingNameLookup[nameKey] : '';
       }
       if (!savingId) return;
+      // Retiro (ingreso) descuenta del total; lo aportado en el periodo cuenta solo aportes.
+      if (t.type === 'ingreso') {
+        bySavingId[savingId] = (bySavingId[savingId] || 0) - amt;
+        return;
+      }
       bySavingId[savingId] = (bySavingId[savingId] || 0) + amt;
       if (periodKey) {
         const key = `${savingId}::${periodKey}`;
@@ -287,7 +250,7 @@ export function Savings({ data, actions, monthKeyStr }) {
     if (!removeSaving || !saving?.id) return;
     const name = String(saving.name || '').trim();
     const label = name ? ` "${name}"` : '';
-    const ok = window.confirm(
+    const ok = await confirmDialog(
       `Eliminar meta${label}? Se movera a la papelera para poder recuperarla.`,
     );
     if (!ok) return;
@@ -312,7 +275,7 @@ export function Savings({ data, actions, monthKeyStr }) {
         : [];
 
     if (relatedTx.length && updateTransaction) {
-      const wantsMigration = window.confirm(
+      const wantsMigration = await confirmDialog(
         `La meta${label} tiene ${relatedTx.length} movimiento${
           relatedTx.length === 1 ? '' : 's'
         } asociado${
@@ -323,7 +286,7 @@ export function Savings({ data, actions, monthKeyStr }) {
       if (wantsMigration) {
         const options = savings.filter((s) => s.id !== saving.id);
         if (options.length === 0) {
-          const keepUnassigned = window.confirm(
+          const keepUnassigned = await confirmDialog(
             'No hay otras metas para migrar. Los movimientos quedaran sin asignar. ¿Continuar?',
           );
           if (!keepUnassigned) return;
@@ -346,7 +309,7 @@ export function Savings({ data, actions, monthKeyStr }) {
           if (trimmed) {
             const index = Number(trimmed) - 1;
             if (!Number.isInteger(index) || index < 0 || index >= options.length) {
-              alert('Opcion no valida.');
+              toast.warning('Opción no válida.');
               return;
             }
             targetSaving = options[index];
@@ -391,7 +354,7 @@ export function Savings({ data, actions, monthKeyStr }) {
     const { end } = getBudgetPeriod(periodKey, budgetCutDay);
     const endDate = new Date(end + 'T00:00:00');
     endDate.setDate(endDate.getDate() - 1);
-    return endDate.toISOString().slice(0, 10);
+    return toLocalDateKey(endDate);
   }
 
   function planTooltip(saving, planEntry, periodKey) {
@@ -408,7 +371,7 @@ export function Savings({ data, actions, monthKeyStr }) {
     const endDate = new Date(end + 'T00:00:00');
     endDate.setDate(endDate.getDate() - 1);
     const defaultDueDate =
-      planEntry?.dueDate || endDate.toISOString().slice(0, 10);
+      planEntry?.dueDate || toLocalDateKey(endDate);
     const plannedValue =
       planEntry && planEntry.plannedAmount != null
         ? String(planEntry.plannedAmount)
@@ -644,7 +607,7 @@ export function Savings({ data, actions, monthKeyStr }) {
     return Math.abs(plannedTotal - summaryPlanned) < 0.5;
   };
 
-  const todayStr = new Date().toISOString().slice(0, 10);
+  const todayStr = todayKey();
 
   const paidInPeriodForModal =
     planModal && planModal.periodKey
@@ -674,70 +637,61 @@ export function Savings({ data, actions, monthKeyStr }) {
 
   return (
     <>
-      <div className="md:hidden mb-4">
-        <button
-          type="button"
-          className="w-full px-4 py-3 rounded-xl border bg-[color:var(--primary)] text-[color:var(--primary-contrast)] text-sm font-semibold"
-          onClick={() => setShowAddSavingModal(true)}
-        >
-          Agregar Meta
-        </button>
-      </div>
-      <div className="grid gap-6 w-full lg:grid-cols-[minmax(0,320px)_minmax(0,1fr)]">
-        <Card className="p-5 hidden md:block">
-          <SectionTitle>Nueva meta de ahorro</SectionTitle>
-          {renderSavingForm({
-            onSubmit: handleAddSaving,
-            dateInputType: 'date',
-            submitLabel: 'Agregar meta',
-          })}
-        </Card>
-
+      <div className="grid gap-6 w-full">
       <Card className="p-5 space-y-4">
-        <div className="flex items-center justify-between gap-3">
+        <div className="flex flex-wrap items-center justify-between gap-3">
           <SectionTitle>Calendario de ahorro</SectionTitle>
-          <button
-            type="button"
-            className="text-xs font-semibold px-3 py-1.5 rounded-full border border-[color:var(--border)] text-[color:var(--text)] hover:bg-[color:var(--surface-2)]"
-            onClick={() => setHideCompletedSavings((prev) => !prev)}
-          >
-            <span className="inline-flex items-center gap-2">
-              {hideCompletedSavings ? (
-                <svg
-                  className="h-4 w-4"
-                  viewBox="0 0 24 24"
-                  fill="none"
-                  stroke="currentColor"
-                  strokeWidth="2"
-                  strokeLinecap="round"
-                  strokeLinejoin="round"
-                  aria-hidden="true"
-                >
-                  <path d="M3 3l18 18" />
-                  <path d="M9.88 9.88A3 3 0 0 0 12 15a3 3 0 0 0 2.12-.88" />
-                  <path d="M5.88 5.88C4.1 7.24 2.75 9.2 2.036 11.678a1 1 0 0 0 0 .644C3.423 16.49 7.36 19.5 12 19.5c1.68 0 3.29-.41 4.72-1.14" />
-                  <path d="M10.73 5.08A10.95 10.95 0 0 1 12 4.5c4.639 0 8.576 3.01 9.964 7.178a1 1 0 0 1 0 .644 11.1 11.1 0 0 1-1.67 3.03" />
-                </svg>
-              ) : (
-                <svg
-                  className="h-4 w-4"
-                  viewBox="0 0 24 24"
-                  fill="none"
-                  stroke="currentColor"
-                  strokeWidth="2"
-                  strokeLinecap="round"
-                  strokeLinejoin="round"
-                  aria-hidden="true"
-                >
-                  <path d="M2.036 12.322a1 1 0 0 1 0-.644C3.423 7.51 7.36 4.5 12 4.5c4.638 0 8.576 3.01 9.964 7.178a1 1 0 0 1 0 .644C20.576 16.49 16.639 19.5 12 19.5c-4.638 0-8.576-3.01-9.964-7.178Z" />
-                  <path d="M15 12a3 3 0 1 1-6 0 3 3 0 0 1 6 0Z" />
-                </svg>
-              )}
-              <span>
-                {hideCompletedSavings ? 'Mostrar completados' : 'Ocultar completados'}
+          <div className="flex flex-wrap items-center gap-2">
+            <button
+              type="button"
+              className="inline-flex min-h-[40px] items-center gap-1 rounded-xl bg-[color:var(--primary)] px-4 text-sm font-semibold text-[color:var(--primary-contrast)] shadow-sm active:scale-[0.98]"
+              onClick={() => setShowAddSavingModal(true)}
+            >
+              + Agregar meta
+            </button>
+            <button
+              type="button"
+              className="text-xs font-semibold px-3 py-1.5 rounded-full border border-[color:var(--border)] text-[color:var(--text)] hover:bg-[color:var(--surface-2)]"
+              onClick={() => setHideCompletedSavings((prev) => !prev)}
+            >
+              <span className="inline-flex items-center gap-2">
+                {hideCompletedSavings ? (
+                  <svg
+                    className="h-4 w-4"
+                    viewBox="0 0 24 24"
+                    fill="none"
+                    stroke="currentColor"
+                    strokeWidth="2"
+                    strokeLinecap="round"
+                    strokeLinejoin="round"
+                    aria-hidden="true"
+                  >
+                    <path d="M3 3l18 18" />
+                    <path d="M9.88 9.88A3 3 0 0 0 12 15a3 3 0 0 0 2.12-.88" />
+                    <path d="M5.88 5.88C4.1 7.24 2.75 9.2 2.036 11.678a1 1 0 0 0 0 .644C3.423 16.49 7.36 19.5 12 19.5c1.68 0 3.29-.41 4.72-1.14" />
+                    <path d="M10.73 5.08A10.95 10.95 0 0 1 12 4.5c4.639 0 8.576 3.01 9.964 7.178a1 1 0 0 1 0 .644 11.1 11.1 0 0 1-1.67 3.03" />
+                  </svg>
+                ) : (
+                  <svg
+                    className="h-4 w-4"
+                    viewBox="0 0 24 24"
+                    fill="none"
+                    stroke="currentColor"
+                    strokeWidth="2"
+                    strokeLinecap="round"
+                    strokeLinejoin="round"
+                    aria-hidden="true"
+                  >
+                    <path d="M2.036 12.322a1 1 0 0 1 0-.644C3.423 7.51 7.36 4.5 12 4.5c4.638 0 8.576 3.01 9.964 7.178a1 1 0 0 1 0 .644C20.576 16.49 16.639 19.5 12 19.5c-4.638 0-8.576-3.01-9.964-7.178Z" />
+                    <path d="M15 12a3 3 0 1 1-6 0 3 3 0 0 1 6 0Z" />
+                  </svg>
+                )}
+                <span>
+                  {hideCompletedSavings ? 'Mostrar completados' : 'Ocultar completados'}
+                </span>
               </span>
-            </span>
-          </button>
+            </button>
+          </div>
         </div>
 
         <div className="grid grid-cols-3 gap-3">
@@ -771,6 +725,11 @@ export function Savings({ data, actions, monthKeyStr }) {
                 const saved = totalSavedForSaving(s);
                 const progress =
                   goal > 0 ? (Math.min(saved, goal) / goal) * 100 : 0;
+                const plannedForCurrent = plannedForSavingPeriod(
+                  s,
+                  currentPeriodKey,
+                  budgetCutDay,
+                );
                 return (
                   <div
                     key={s.id || s.name + s.goal}
@@ -786,6 +745,43 @@ export function Savings({ data, actions, monthKeyStr }) {
                     </div>
                     <div className="mt-2">
                       <Progress value={progress} mode="good" />
+                    </div>
+                    <div className="mt-3 flex flex-wrap gap-2">
+                      <button
+                        type="button"
+                        className="px-3 py-1.5 text-xs rounded-lg border text-[color:var(--text-muted)] hover:bg-[color:var(--surface-2)]"
+                        onClick={() =>
+                          setSavingEditModal({
+                            id: s.id,
+                            name: s.name || '',
+                            goal: s.goal != null ? String(s.goal) : '',
+                            targetDate: s.targetDate || '',
+                          })
+                        }
+                      >
+                        Editar
+                      </button>
+                      <button
+                        type="button"
+                        className="px-3 py-1.5 text-xs rounded-lg border border-[color:var(--danger)]/40 text-[color:var(--danger)] hover:bg-[color:var(--danger)]/10"
+                        onClick={() => handleRemoveSaving(s)}
+                      >
+                        Eliminar
+                      </button>
+                      <button
+                        type="button"
+                        className="px-3 py-1.5 text-xs rounded-lg border text-[color:var(--primary)] border-[color:var(--primary)]/40 bg-[color:var(--primary)]/10 hover:bg-[color:var(--primary)]/20"
+                        onClick={() =>
+                          openPlanModal(
+                            s,
+                            null,
+                            currentPeriodKey,
+                            plannedForCurrent,
+                          )
+                        }
+                      >
+                        Aportes
+                      </button>
                     </div>
                   </div>
                 );
@@ -1028,13 +1024,24 @@ export function Savings({ data, actions, monthKeyStr }) {
       </Card>
       </div>
       {showAddSavingModal && (
-        <div className="fixed inset-0 z-40 flex items-start justify-center bg-black/40 backdrop-blur-sm pt-16 px-4">
-          <div className="bg-[color:var(--surface-1)] rounded-2xl shadow-[var(--shadow)] p-5 w-full max-w-md">
+        <div
+          className="fixed inset-0 z-[60] flex items-end sm:items-start justify-center bg-black/40 backdrop-blur-sm sm:pt-16 sm:px-4"
+          onClick={() => setShowAddSavingModal(false)}
+        >
+          <div
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="add-saving-title"
+            className="sheet-enter bg-[color:var(--surface-1)] rounded-t-3xl sm:rounded-2xl shadow-xl p-5 pb-[calc(1.25rem+env(safe-area-inset-bottom))] w-full sm:max-w-md max-h-[92vh] overflow-y-auto"
+            onClick={(e) => e.stopPropagation()}
+          >
             <div className="flex items-center justify-between mb-4">
-              <h3 className="text-lg font-semibold">Agregar meta</h3>
+              <h3 id="add-saving-title" className="text-lg font-semibold">
+                Nueva meta de ahorro
+              </h3>
               <button
                 type="button"
-                className="text-sm text-[color:var(--text-muted)] hover:text-[color:var(--text)]"
+                className="min-h-[40px] px-2 text-sm text-[color:var(--text-muted)] hover:text-[color:var(--text)]"
                 onClick={() => setShowAddSavingModal(false)}
               >
                 Cerrar
@@ -1042,7 +1049,7 @@ export function Savings({ data, actions, monthKeyStr }) {
             </div>
             {renderSavingForm({
               onSubmit: handleAddSavingFromModal,
-              dateInputType: 'text',
+              dateInputType: 'date',
               submitLabel: 'Agregar meta',
             })}
           </div>

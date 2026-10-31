@@ -1,4 +1,4 @@
-// src/components/layout/header.jsx
+// src/components/layout/Header.jsx
 import React, { useEffect, useRef, useState } from 'react';
 
 function AppLogo({ className }) {
@@ -15,7 +15,7 @@ function AppLogo({ className }) {
 
 const ICON_STROKE = 1.5;
 
-function DashboardIcon({ className }) {
+export function DashboardIcon({ className }) {
   return (
     <svg
       className={className}
@@ -35,7 +35,7 @@ function DashboardIcon({ className }) {
   );
 }
 
-function MovementsIcon({ className }) {
+export function MovementsIcon({ className }) {
   return (
     <svg
       className={className}
@@ -55,7 +55,7 @@ function MovementsIcon({ className }) {
   );
 }
 
-function BudgetsIcon({ className }) {
+export function BudgetsIcon({ className }) {
   return (
     <svg
       className={className}
@@ -75,7 +75,7 @@ function BudgetsIcon({ className }) {
   );
 }
 
-function DebtsIcon({ className }) {
+export function DebtsIcon({ className }) {
   return (
     <svg
       className={className}
@@ -94,7 +94,7 @@ function DebtsIcon({ className }) {
   );
 }
 
-function SavingsIcon({ className }) {
+export function SavingsIcon({ className }) {
   return (
     <svg
       className={className}
@@ -114,7 +114,7 @@ function SavingsIcon({ className }) {
   );
 }
 
-function SettingsIcon({ className }) {
+export function SettingsIcon({ className }) {
   return (
     <svg
       className={className}
@@ -155,12 +155,12 @@ function LogoutIcon({ className }) {
   );
 }
 
+// Compromisos agrupa Deudas y Ahorro; Plan del mes reemplaza a Presupuestos.
 const NAV_ITEMS = [
-  { id: 'dashboard', label: 'Resumen', icon: DashboardIcon },
+  { id: 'dashboard', label: 'Inicio', icon: DashboardIcon },
   { id: 'transactions', label: 'Movimientos', icon: MovementsIcon },
-  { id: 'budgets', label: 'Presupuestos', icon: BudgetsIcon },
-  { id: 'debts', label: 'Deudas', icon: DebtsIcon },
-  { id: 'savings', label: 'Ahorro', icon: SavingsIcon },
+  { id: 'plan', label: 'Plan del mes', icon: BudgetsIcon },
+  { id: 'commitments', label: 'Compromisos', icon: DebtsIcon },
   { id: 'settings', label: 'Ajustes', icon: SettingsIcon },
 ];
 
@@ -331,7 +331,7 @@ export function Header({
       {showNav && (
         <aside
           ref={navRef}
-          className={`hidden md:flex md:flex-col md:shrink-0 md:border-r md:border-blue-800 md:bg-blue-900/95 md:text-blue-100 md:backdrop-blur md:sticky md:top-0 md:h-screen md:transition-all md:duration-300 md:ease-out ${
+          className={`hidden md:flex md:flex-col md:shrink-0 md:border-r md:border-blue-800 md:bg-blue-900/95 md:text-blue-100 md:backdrop-blur md:sticky md:top-0 md:h-screen md:self-start md:overflow-y-auto md:transition-all md:duration-300 md:ease-out ${
             isCollapsed ? 'md:w-16' : 'md:w-64'
           }`}
         >

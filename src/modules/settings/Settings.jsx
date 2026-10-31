@@ -1,4 +1,8 @@
 // src/modules/settings/Settings.jsx
+import { DangerZone } from '../../features/settings/DangerZone.jsx';
+import { AuditLogPanel } from '../../features/settings/AuditLogPanel.jsx';
+import { toast, confirmDialog } from '../../components/feedback/feedback.js';
+import { toLocalDateKey } from '../../domain/dates.js';
 import React, { useState, useEffect } from 'react';
 import {
   addDoc,
@@ -22,9 +26,10 @@ import {
   signOut,
 } from 'firebase/auth';
 
-import { Card } from '../../components/ui/card.jsx';
+import { Card } from '../../components/ui/Card.jsx';
 import { SectionTitle } from '../../components/ui/SectionTitle.jsx';
-import { CATEGORIES, DEBT_CATEGORY } from '../../constants.js';
+import { CATEGORIES, DEBT_CATEGORY, SAVINGS_CATEGORY } from '../../constants.js';
+import { dueDayKey, isPriorityCategory } from '../../domain/paymentPlan.js';
 import { auth, db, secondaryAuth, secondaryDb } from '../../firebase';
 import {
   buildInviteLink,
@@ -32,7 +37,6 @@ import {
   hashInviteToken,
 } from '../../lib/invites.js';
 
-const SAVINGS_CATEGORY = 'Ahorro';
 const INVITE_TTL_MINUTES = 10;
 const INVITE_TTL_MS = INVITE_TTL_MINUTES * 60 * 1000;
 const LAST_INVITE_LINK_KEY = 'fef:lastInviteLink';
@@ -40,6 +44,29 @@ const LAST_ACCESS_MESSAGE_KEY = 'fef:lastAccessMessage';
 const TEMP_LOGIN_PREFIX = 'usuario';
 const TEMP_LOGIN_DOMAIN = 'finanzasenfamilia.com';
 const TEMP_PASSWORD_LENGTH = 10;
+
+// Día del mes (1-31) en que vence un gasto fijo; se guarda al salir del campo.
+function DueDayInput({ value, label, placeholder = '—', onSave }) {
+  return (
+    <input
+      key={String(value || '')}
+      type="number"
+      inputMode="numeric"
+      min={1}
+      max={31}
+      step={1}
+      defaultValue={value || ''}
+      placeholder={placeholder}
+      aria-label={label}
+      className="w-14 rounded border px-1 py-0.5 text-xs"
+      onBlur={(e) => {
+        const next = e.target.value.trim();
+        if (next === String(value || '')) return;
+        onSave(next);
+      }}
+    />
+  );
+}
 
 export function Settings({
   data,
@@ -81,6 +108,8 @@ export function Settings({
       ? data.memberInfo
       : {};
   const fixedCategories = data.fixedCategories || {};
+  const priorityCategories = data.priorityCategories || {};
+  const fixedDueDays = data.fixedDueDays || {};
   const editableCats = cats.filter(
     (c) => c !== SAVINGS_CATEGORY && c !== DEBT_CATEGORY,
   );
@@ -194,7 +223,7 @@ export function Settings({
         invitedBy: params.get('by') || '',
         url: url.toString(),
       };
-    } catch (err) {
+    } catch {
       return null;
     }
   }
@@ -269,7 +298,7 @@ export function Settings({
 
   function formatDate(ms) {
     if (!ms) return '';
-    return new Date(ms).toISOString().slice(0, 10);
+    return toLocalDateKey(new Date(ms));
   }
 
   function matchLabel(value) {
@@ -704,7 +733,7 @@ export function Settings({
 
   async function handleRevokeInvite(invite) {
     if (!invite?.id || !householdId) return;
-    const ok = window.confirm('Cancelar esta invitacion?');
+    const ok = await confirmDialog('Cancelar esta invitacion?');
     if (!ok) return;
     setInviteActionId(invite.id);
     setInvitesError('');
@@ -823,7 +852,7 @@ export function Settings({
 
   async function handleApproveJoinRequest(request) {
     if (!request?.uid || !householdId) return;
-    const ok = window.confirm(
+    const ok = await confirmDialog(
       `Aprobar ingreso de "${request.displayName || request.email || 'usuario'}"?`,
     );
     if (!ok) return;
@@ -919,7 +948,7 @@ export function Settings({
 
   async function handleRejectJoinRequest(request) {
     if (!request?.uid || !householdId) return;
-    const ok = window.confirm('Rechazar esta solicitud?');
+    const ok = await confirmDialog('Rechazar esta solicitud?');
     if (!ok) return;
     setJoinActionUid(request.uid);
     setJoinRequestsError('');
@@ -952,10 +981,10 @@ export function Settings({
     if (!user?.uid || !householdId) return;
     if (!target?.authUid || target.authUid !== user.uid) return;
     if (ownerUid && user.uid === ownerUid) {
-      alert('El superadministrador no puede darse de baja.');
+      toast.warning('El superadministrador no puede darse de baja.');
       return;
     }
-    const ok = window.confirm(
+    const ok = await confirmDialog(
       'Vas a darte de baja del presupuesto. Perderas acceso. Continuar?',
     );
     if (!ok) return;
@@ -998,7 +1027,7 @@ export function Settings({
       await signOut(auth);
     } catch (err) {
       console.error('Error dando de baja:', err);
-      alert('No se pudo dar de baja. Intenta mas tarde.');
+      toast.error('No se pudo dar de baja. Intenta mas tarde.');
     }
   }
 
@@ -1064,8 +1093,8 @@ export function Settings({
     if (!value) return;
     try {
       await navigator.clipboard.writeText(value);
-      alert('Texto copiado.');
-    } catch (err) {
+      toast.success('Texto copiado.');
+    } catch {
       window.prompt('Copia este texto:', value);
     }
   }
@@ -1164,7 +1193,7 @@ export function Settings({
     await actions.updateHouseholdUser(activeHouseholdUser.id, {
       preferences: prefs,
     });
-    alert('Preferencias guardadas.');
+    toast.success('Preferencias guardadas.');
   }
 
   function renderCategoryRow(cat, list) {
@@ -1172,12 +1201,25 @@ export function Settings({
     const canMoveUp = index > 0;
     const canMoveDown = index >= 0 && index < list.length - 1;
     const isFixed = !!fixedCategories[cat];
+    const isPriority = isPriorityCategory(cat, priorityCategories);
+    // Subcategorías del presupuesto del mes visible: cada una puede vencer otro día.
+    const subcategories = isFixed
+      ? (Array.isArray(data.budgets?.[cat]?.breakdown) ? data.budgets[cat].breakdown : [])
+          .map((item, idx) => ({
+            id: String(item.id || item.name || `${cat}-${idx}`),
+            name: String(item.name || '').trim(),
+          }))
+          .filter((item) => item.name)
+      : [];
     return (
-      <li key={cat} className="flex items-center justify-between gap-2">
+      <li
+        key={cat}
+        className="flex flex-col gap-2 sm:flex-row sm:flex-wrap sm:items-center sm:justify-between border rounded-lg px-3 py-2"
+      >
         <div className="flex items-center gap-2 min-w-0 flex-1">
           <span className="whitespace-normal break-words">{cat}</span>
         </div>
-        <div className="flex flex-col gap-1 sm:flex-row sm:items-center">
+        <div className="flex flex-wrap gap-2 sm:items-center">
           <label className="inline-flex items-center gap-1 text-[11px] text-[color:var(--text-muted)]">
             <input
               type="checkbox"
@@ -1188,6 +1230,32 @@ export function Settings({
             />
             Gasto fijo
           </label>
+          {isFixed && (
+            <label className="inline-flex items-center gap-1 text-[11px] text-[color:var(--text-muted)]">
+              {subcategories.length ? 'Vence el día (por defecto)' : 'Vence el día'}
+              <DueDayInput
+                value={fixedDueDays[cat]}
+                label={`Día de vencimiento de ${cat}`}
+                onSave={(day) => actions?.setCategoryDueDay?.(cat, day)}
+              />
+            </label>
+          )}
+          {/* Un gasto fijo se paga una vez en su fecha: la prioridad (reserva diaria) es solo para los variables. */}
+          {!isFixed && (
+            <label
+              className="inline-flex items-center gap-1 text-[11px] text-[color:var(--text-muted)]"
+              data-tooltip="Se reserva por día hasta el próximo ingreso, antes de pagar cuentas"
+            >
+              <input
+                type="checkbox"
+                checked={isPriority}
+                onChange={(e) =>
+                  actions?.setCategoryPriority?.(cat, e.target.checked)
+                }
+              />
+              Prioridad
+            </label>
+          )}
           <div className="flex items-center gap-1">
             <button
               type="button"
@@ -1233,7 +1301,7 @@ export function Settings({
                 ? txList.filter((tx) => tx?.category === cat)
                 : [];
               if (affected.length && actions?.updateTransaction) {
-                const wantsMigration = window.confirm(
+                const wantsMigration = await confirmDialog(
                   `La categoria "${cat}" tiene ${affected.length} movimiento${
                     affected.length === 1 ? '' : 's'
                   } asociado${
@@ -1249,7 +1317,7 @@ export function Settings({
                   if (input === null) return;
                   const target = String(input || '').trim();
                   if (!target || !options.includes(target)) {
-                    alert('Categoria destino no valida.');
+                    toast.warning('Categoría destino no válida.');
                     return;
                   }
                   await Promise.all(
@@ -1270,7 +1338,7 @@ export function Settings({
                 }
               }
 
-              const ok = window.confirm(
+              const ok = await confirmDialog(
                 `Eliminar la categoria "${cat}"? Los presupuestos de esa categoria se perderan.`,
               );
               if (!ok) return;
@@ -1280,6 +1348,24 @@ export function Settings({
             Eliminar
           </button>
         </div>
+        {subcategories.length > 0 && (
+          <ul className="w-full grid gap-1 sm:grid-cols-2 border-t border-[color:var(--divider)] pt-2">
+            {subcategories.map((sub) => (
+              <li key={sub.id} className="flex items-center justify-between gap-2 text-[11px] text-[color:var(--text-muted)]">
+                <span className="truncate">{sub.name}</span>
+                <label className="inline-flex items-center gap-1">
+                  Vence el día
+                  <DueDayInput
+                    value={fixedDueDays[dueDayKey(cat, sub.id)]}
+                    placeholder={fixedDueDays[cat] ? String(fixedDueDays[cat]) : '—'}
+                    label={`Día de vencimiento de ${cat} · ${sub.name}`}
+                    onSave={(day) => actions?.setCategoryDueDay?.(dueDayKey(cat, sub.id), day)}
+                  />
+                </label>
+              </li>
+            ))}
+          </ul>
+        )}
       </li>
     );
   }
@@ -1333,10 +1419,10 @@ export function Settings({
                   return (
                     <li
                       key={u.id}
-                      className="flex items-center justify-between border rounded-lg px-3 py-2"
+                      className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between border rounded-lg px-3 py-2"
                     >
-                      <div>
-                        <div className="font-medium">
+                      <div className="min-w-0">
+                        <div className="font-medium break-all">
                           {getUserEmail(u) || displayName(u)}{' '}
                           {isCurrent && (
                             <span className="text-xs text-[color:var(--text-muted)]">
@@ -1354,7 +1440,7 @@ export function Settings({
                         </div>
                       </div>
                       {(canEdit || canRemove || canLeave) && (
-                        <div className="flex gap-2">
+                        <div className="flex flex-wrap gap-2">
                           {canEdit && (
                             <button
                               type="button"
@@ -1378,7 +1464,7 @@ export function Settings({
                               type="button"
                               className="text-xs text-[color:var(--danger)]"
                               onClick={async () => {
-                                const ok = window.confirm(
+                                const ok = await confirmDialog(
                                   `Eliminar al usuario "${displayName(u)}"?`,
                                 );
                                 if (!ok) return;
@@ -1528,6 +1614,13 @@ export function Settings({
                     >
                       Copiar enlace
                     </button>
+                    <button
+                      type="button"
+                      className="mt-2 ml-3 text-xs text-[color:var(--primary)]"
+                      onClick={openInviteInspector}
+                    >
+                      Revisar enlace
+                    </button>
                   </div>
                 )}
               </div>
@@ -1612,7 +1705,7 @@ export function Settings({
                 const formData = new FormData(e.currentTarget);
                 const day = formData.get('cut-day') || data.budgetCutDay || 1;
                 await actions.setBudgetCutDay(day);
-                alert('Día de corte actualizado.');
+                toast.success('Día de corte actualizado.');
               }}
             >
               {!isOwner && (
@@ -1758,7 +1851,9 @@ export function Settings({
 
           <p className="text-xs text-[color:var(--text-muted)] mt-1">
             Marca las categorias fijas para que acumulen pendientes entre
-            periodos.
+            periodos (con su día de vencimiento), y las de prioridad (comida,
+            remedios) para que el plan las reserve por día hasta el próximo
+            ingreso.
           </p>
 
           <form
@@ -2091,6 +2186,14 @@ export function Settings({
           </div>
         </div>
       )}
+
+      <AuditLogPanel onFetch={actions?.fetchAuditLog} />
+
+      <DangerZone
+        isOwner={isOwner}
+        onExport={actions?.exportFinances}
+        onReset={actions?.resetFinances}
+      />
     </>
   );
 }
