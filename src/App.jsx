@@ -39,8 +39,7 @@ import { AuthGate } from './modules/auth/AuthGate.jsx';
 import { QuickAddSheet } from './features/quick-add/QuickAddSheet.jsx';
 import { CommitmentsPanel } from './features/plan/CommitmentsPanel.jsx';
 import { UpcomingCard } from './features/plan/UpcomingCard.jsx';
-import { ExpectedIncomeCard } from './features/plan/ExpectedIncomeCard.jsx';
-import { PaymentPlanCard } from './features/plan/PaymentPlanCard.jsx';
+import { PlanScreen } from './features/plan/PlanCards.jsx';
 import { PeriodClosingCard } from './features/plan/PeriodClosingCard.jsx';
 import { FinancialHealthCard } from './features/plan/FinancialHealthCard.jsx';
 
@@ -1151,45 +1150,45 @@ export default function App() {
               )}
 
               {tab === 'plan' && (
-                <>
-                  <Budgets
-                    data={{
-                      budgets: data.budgets,
-                      budgetsAll: data.budgetsAll,
-                      transactions: data.transactions,
-                      categories: data.categories,
-                      fixedCategories: data.fixedCategories,
-                      fixedDueDays: data.fixedDueDays,
-                      budgetCutDay: data.budgetCutDay,
-                      debts: data.debts,
-                      savings: data.savings,
-                      expectedIncome: data.expectedIncome,
-                    }}
-                    actions={actions}
-                    activeUser={activeUser}
-                    monthKeyStr={selectedMonth}
-                    topSlot={<PaymentPlanCard data={data} actions={actions} activeUser={activeUser} />}
-                    beforeCategories={
-                      <>
-                        <ExpectedIncomeCard data={data} actions={actions} periodKey={selectedMonth} />
-                        <CommitmentsPanel
-                          data={data}
-                          actions={actions}
-                          activeUser={activeUser}
-                          periodKey={selectedMonth}
-                          onOpenCommitments={() => setTab('commitments')}
-                        />
-                      </>
-                    }
-                  />
-                  <PeriodClosingCard
-                    data={data}
-                    actions={actions}
-                    activeUser={activeUser}
-                    periodKey={selectedMonth}
-                    isOwner={!!data.ownerUid && data.ownerUid === ctx.user?.uid}
-                  />
-                </>
+                <PlanScreen
+                  data={data}
+                  budgetsTable={
+                    <Budgets
+                      data={{
+                        budgets: data.budgets,
+                        budgetsAll: data.budgetsAll,
+                        transactions: data.transactions,
+                        categories: data.categories,
+                        fixedCategories: data.fixedCategories,
+                        fixedDueDays: data.fixedDueDays,
+                        budgetCutDay: data.budgetCutDay,
+                        debts: data.debts,
+                        savings: data.savings,
+                      }}
+                      actions={actions}
+                      activeUser={activeUser}
+                      monthKeyStr={selectedMonth}
+                    />
+                  }
+                  commitments={
+                    <CommitmentsPanel
+                      data={data}
+                      actions={actions}
+                      activeUser={activeUser}
+                      periodKey={selectedMonth}
+                      onOpenCommitments={() => setTab('commitments')}
+                    />
+                  }
+                  closing={
+                    <PeriodClosingCard
+                      data={data}
+                      actions={actions}
+                      activeUser={activeUser}
+                      periodKey={selectedMonth}
+                      isOwner={!!data.ownerUid && data.ownerUid === ctx.user?.uid}
+                    />
+                  }
+                />
               )}
 
               {tab === 'commitments' && (

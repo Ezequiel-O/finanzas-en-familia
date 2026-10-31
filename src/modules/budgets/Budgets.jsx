@@ -1,6 +1,5 @@
 import { plannedForSavingPeriod } from '../../domain/commitments.js';
-import { categorySpent, isAdjustment, periodLedger, txDateKey } from '../../domain/ledger.js';
-import { LedgerBreakdown } from '../../features/plan/LedgerBreakdown.jsx';
+import { categorySpent, isAdjustment, txDateKey } from '../../domain/ledger.js';
 import { PeriodOutlook } from '../../features/plan/PeriodOutlook.jsx';
 import { DueDayInput } from '../../components/ui/DueDayInput.jsx';
 import { dueDayKey } from '../../domain/paymentPlan.js';
@@ -298,7 +297,7 @@ function buildSpentBreakdownFromPeriod({
   return { breakdown: nextBreakdown, total };
 }
 
-export function Budgets({ data, actions, activeUser = null, monthKeyStr, topSlot = null, beforeCategories = null }) {
+export function Budgets({ data, actions, activeUser = null, monthKeyStr, beforeCategories = null }) {
   const {
     budgets = {},
     budgetsAll = {},
@@ -309,7 +308,6 @@ export function Budgets({ data, actions, activeUser = null, monthKeyStr, topSlot
     budgetCutDay = 1,
     debts = [],
     savings = [],
-    expectedIncome = 0,
   } = data || {};
 
   const baseCats = categories && categories.length ? categories : CATEGORIES;
@@ -466,12 +464,6 @@ export function Budgets({ data, actions, activeUser = null, monthKeyStr, topSlot
   const [editBreakdownByCat, setEditBreakdownByCat] = useState({});
   const [budgetInfo, setBudgetInfo] = useState(null);
   const [breakdownModal, setBreakdownModal] = useState(null);
-  const [summaryOpen, setSummaryOpen] = useState({
-    available: false,
-    budget: false,
-    vs: false,
-    real: false,
-  });
   const breakdownSpent = useMemo(() => {
     const acc = {};
     for (const t of monthTx) {
@@ -740,22 +732,6 @@ export function Budgets({ data, actions, activeUser = null, monthKeyStr, topSlot
     savingsUnassignedForPeriod,
   ]);
 
-  // --- SALDO DEL PERIODO (libro único, base caja) ---
-  // saldo final = saldo anterior + ingresos + reembolsos + retiros de ahorro
-  //               − consumo − cuotas − aportes ± ajustes. Traspasos no cuentan.
-  const ledger = useMemo(
-    () => periodLedger({ transactions, periodKey: mk, cutDay, debts: debtsArray }),
-    [transactions, mk, cutDay, debtsArray],
-  );
-  const ingresosPeriodo = ledger.income;
-  const ingresoEsperado = Number(expectedIncome || 0);
-  // Para planificar se usa el ingreso esperado mientras no haya llegado todo.
-  const ingresoBase = Math.max(ingresoEsperado, ingresosPeriodo);
-  // Salidas reales: consumo + suscripciones + cuotas + aportes, menos reembolsos.
-  const gastosPeriodo = ledger.outflows - ledger.refunds;
-
-  const disponibleInicial = ledger.opening + ingresoBase;
-  const disponible = ledger.closing;
 
   // --- FILAS POR CATEGORIA ---
   const rows = cats.map((c) => {
@@ -871,7 +847,9 @@ export function Budgets({ data, actions, activeUser = null, monthKeyStr, topSlot
     })),
   );
 
-  const totalFunded = rows.reduce((a, r) => a + r.funded, 0);
+  const spendFunded = rows
+    .filter((r) => r.c !== DEBT_CATEGORY && r.c !== SAVINGS_CATEGORY)
+    .reduce((a, r) => a + Number(r.funded || 0), 0);
 
   // Categorías sin presupuesto este periodo que sí lo tenían en el anterior (sin subcategorías;
   // las que tienen subcategorías ya se copian solas en el efecto de arriba).
@@ -896,64 +874,10 @@ export function Budgets({ data, actions, activeUser = null, monthKeyStr, topSlot
     toast.success(`Presupuesto copiado en ${copyableFromPrevious.length} categorías. Ajusta lo que cambió.`);
   }
 
-  const restanteSinAsignar = disponibleInicial + ledger.savingWithdrawals - totalFunded;
-  const disponibleMenosGastado = disponible;
-  const presupuestoMenosGastado = totalFunded - gastosPeriodo;
 
   const defaultUnbudgetedKey = DEFAULT_UNBUDGETED_LABEL.toLowerCase();
-  const overspentSubcategoryList = (() => {
-    const seen = new Set();
-    const items = [];
-    rows.forEach((r) => {
-      const breakdown = Array.isArray(r.breakdown) ? r.breakdown : [];
-      const unassignedSpent = Number(unassignedSpentByCategory[r.c] || 0);
-      let mergedUnassigned = false;
-      breakdown.forEach((item, idx) => {
-        const spentKey = item.id || item.name || `${r.c}-${idx}`;
-        const carryKey = item.id || item.name || `${r.c}-${idx}`;
-        let spent = Number(breakdownSpent[spentKey] || 0);
-        const baseAmount = Number(item.amount || 0);
-        const carryover = r.isFixedCategory
-          ? fixedCarryoverMap.get(`${r.c}::${carryKey}`) || 0
-          : 0;
-        const planned = baseAmount + carryover;
-        const name = item.name || 'Sin nombre';
-        if (
-          unassignedSpent > 0 &&
-          String(name).trim().toLowerCase() === defaultUnbudgetedKey
-        ) {
-          spent += unassignedSpent;
-          mergedUnassigned = true;
-        }
-        if (spent <= planned || spent <= 0) return;
-        const key = `${r.c}::${name}`;
-        if (seen.has(key)) return;
-        seen.add(key);
-        items.push({ cat: r.c, name });
-      });
-      if (unassignedSpent > 0 && !mergedUnassigned) {
-        const name = DEFAULT_UNBUDGETED_LABEL;
-        const key = `${r.c}::${name}`;
-        if (!seen.has(key)) {
-          seen.add(key);
-          items.push({ cat: r.c, name });
-        }
-      }
-    });
-    return items;
-  })();
 
-  const overspentCategoryList = (() => {
-    const set = new Set();
-    rows.forEach((r) => {
-      if (r.spent > r.funded && r.spent > 0) set.add(r.c);
-    });
-    overspentSubcategoryList.forEach((item) => set.add(item.cat));
-    return Array.from(set);
-  })();
 
-  const hasOverspendAlert =
-    overspentCategoryList.length > 0 || overspentSubcategoryList.length > 0;
 
   const subcategoryIndex = useMemo(() => {
     const byCategory = new Map();
@@ -1407,162 +1331,16 @@ export function Budgets({ data, actions, activeUser = null, monthKeyStr, topSlot
   return (
     <>
       <div className="grid gap-4">
-      {topSlot}
-      {/* RESUMEN DEL PERIODO CON ROLLOVER: plegado para que lo primero sea qué hacer hoy */}
-      <Card className="bg-transparent border-transparent shadow-none">
-        <details open={totalFunded <= 0}>
-        <summary className="cursor-pointer list-none">
-          <SectionTitle>Números del presupuesto</SectionTitle>
-          <div className="text-sm text-[color:var(--text-muted)]">
-            {totalFunded > 0 ? (
-              <>
-                Te quedan <strong className="text-[color:var(--text)]"><Money n={presupuestoMenosGastado} /></strong> de{' '}
-                <Money n={totalFunded} /> presupuestados ·{' '}
-              </>
-            ) : null}
-            <span className="font-semibold text-[color:var(--primary)] dark:text-blue-300">Ver detalle</span>
-          </div>
-        </summary>
-        <div className="text-xs text-[color:var(--text-muted)] mt-3 mb-3">
-          Día de corte del mes: {budgetCutDay}
-        </div>
-        {/* Sin cashAvailable: el límite diario según la plata de hoy lo da "Qué hacer hoy". */}
+      {/* Sin presupuesto en el periodo: ofrece copiar el del periodo anterior. */}
+      {spendFunded <= 0 && (
         <PeriodOutlook
           rows={rows}
           periodKey={mk}
           cutDay={cutDay}
-          income={ingresoBase}
-          incomeIsExpected={ingresoEsperado > ingresosPeriodo}
           copyableCount={copyableFromPrevious.length}
           onCopyPrevious={handleCopyPreviousBudget}
         />
-        <div className="mt-3 grid gap-5 sm:grid-cols-2 xl:grid-cols-4">
-          <div className="rounded-2xl border border-[color:var(--primary)]/35 bg-[color:var(--primary)]/20 px-5 py-4 shadow-[var(--shadow)]/80 ring-1 ring-[color:var(--primary)]/15 backdrop-blur-md">
-            <div className="flex items-center justify-between gap-2">
-              <span className="text-xs uppercase text-[color:var(--text-muted)]">
-                Disponible
-              </span>
-              <button
-                type="button"
-                className="h-6 w-6 rounded-md border border-[color:var(--border)] text-[color:var(--text-muted)] transition hover:bg-[color:var(--surface-2)]"
-                onClick={() =>
-                  setSummaryOpen((prev) => ({
-                    ...prev,
-                    available: !prev.available,
-                  }))
-                }
-                aria-expanded={summaryOpen.available}
-                aria-label="Mostrar detalle de Disponible"
-              >
-                <span
-                  className={`inline-block transition-transform ${
-                    summaryOpen.available ? 'rotate-90' : ''
-                  }`}
-                >
-                  &gt;
-                </span>
-              </button>
-            </div>
-            <div className="mt-1 text-lg font-semibold">
-              <Money n={disponible} />
-            </div>
-            <div className="text-[10px] text-[color:var(--text-faint)]">
-              Saldo actual del hogar (incluye lo que sobró antes)
-            </div>
-            {summaryOpen.available && (
-              <div className="mt-2">
-                <LedgerBreakdown ledger={ledger} expectedIncome={ingresoEsperado} />
-              </div>
-            )}
-          </div>
-
-          <div className="rounded-2xl border border-[color:var(--primary)]/35 bg-[color:var(--primary)]/20 px-5 py-4 shadow-[var(--shadow)]/80 ring-1 ring-[color:var(--primary)]/15 backdrop-blur-md">
-            <span className="text-xs uppercase text-[color:var(--text-muted)]">
-              Presupuesto
-            </span>
-            <div className="mt-1 text-lg font-semibold">
-              <Money n={totalFunded} />
-            </div>
-          </div>
-
-          <div className="rounded-2xl border border-[color:var(--primary)]/35 bg-[color:var(--primary)]/20 px-5 py-4 shadow-[var(--shadow)]/80 ring-1 ring-[color:var(--primary)]/15 backdrop-blur-md">
-            <span className="text-xs uppercase text-[color:var(--text-muted)]">
-              Sin asignar
-            </span>
-            <div className="text-[10px] text-[color:var(--text-faint)]">
-              Saldo anterior + ingreso {ingresoEsperado > ingresosPeriodo ? 'esperado' : 'recibido'} − presupuesto
-            </div>
-            <div
-              className={`mt-1 text-lg font-semibold ${
-                restanteSinAsignar < 0
-                  ? 'text-[color:var(--danger)]'
-                  : ''
-              }`}
-            >
-              <Money n={restanteSinAsignar} />
-            </div>
-          </div>
-
-          <div className="rounded-2xl border border-[color:var(--primary)]/35 bg-[color:var(--primary)]/20 px-5 py-4 shadow-[var(--shadow)]/80 ring-1 ring-[color:var(--primary)]/15 backdrop-blur-md">
-            <span className="text-xs uppercase text-[color:var(--text-muted)]">
-              Gastos del periodo
-            </span>
-            <div className="mt-2 space-y-1 text-xs text-[color:var(--text-muted)]">
-              <div className="flex justify-between gap-2">
-                <span>Gastado hasta ahora:</span>
-                <strong className="text-[color:var(--text)]">
-                  <Money n={gastosPeriodo} />
-                </strong>
-              </div>
-              <div className="flex justify-between gap-2">
-                <span>Disponible actual:</span>
-                <strong
-                  className={
-                    disponibleMenosGastado < 0
-                      ? 'text-[color:var(--danger)]'
-                      : 'text-[color:var(--text)]'
-                  }
-                >
-                  <Money n={disponibleMenosGastado} />
-                </strong>
-              </div>
-              <div className="flex justify-between gap-2">
-                <span>Presupuesto - Gastado:</span>
-                <strong
-                  className={
-                    presupuestoMenosGastado < 0
-                      ? 'text-[color:var(--danger)]'
-                      : 'text-[color:var(--text)]'
-                  }
-                >
-                  <Money n={presupuestoMenosGastado} />
-                </strong>
-              </div>
-            </div>
-          </div>
-        </div>
-
-        {hasOverspendAlert && (
-          <div className="mt-4 rounded-lg border border-[color:var(--warning)]/30 bg-[color:var(--warning)]/15 px-3 py-2 text-xs text-[color:var(--warning)] space-y-1">
-            <div className="flex items-center gap-2">
-              <span className="inline-flex h-4 w-4 items-center justify-center rounded-full bg-[color:var(--warning)] text-[10px] font-bold text-[color:var(--warning)]">
-                !
-              </span>
-              <span className="font-semibold">
-                Alerta: algunos gastos superan el presupuesto:
-              </span>
-            </div>
-            <div className="text-[11px] text-[color:var(--warning)]">
-              {overspentCategoryList
-                .slice(0, 6)
-                .map((c) => `- ${c}`)
-                .join(' ')}
-              {overspentCategoryList.length > 6 ? ' - ...' : ''}
-            </div>
-          </div>
-        )}
-        </details>
-      </Card>
+      )}
 
       {beforeCategories}
 

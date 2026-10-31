@@ -6,6 +6,7 @@ import { Budgets } from '../../modules/budgets/Budgets.jsx';
 import { Dashboard } from '../../modules/dashboard/Dashboard.jsx';
 import { Transactions } from '../../modules/transactions/Transactions.jsx';
 import { CommitmentsPage } from '../commitments/CommitmentsPage.jsx';
+import { PlanScreen } from '../plan/PlanCards.jsx';
 
 afterEach(cleanup);
 
@@ -79,7 +80,7 @@ describe('pestañas', () => {
         beforeCategories={<div>compromisos-aqui</div>}
       />,
     );
-    expect(screen.getByText('Números del presupuesto')).toBeTruthy();
+    expect(screen.getByText('Presupuestos por categoria')).toBeTruthy();
     expect(screen.getByText('compromisos-aqui')).toBeTruthy();
   });
 
@@ -108,6 +109,20 @@ describe('pestañas', () => {
     expect(setCategoryDueDay).toHaveBeenCalledWith('Hogar', '5');
     // Un gasto variable no pide fecha.
     expect(screen.queryByLabelText('Día de vencimiento de Alimentación')).toBeNull();
+  });
+
+  it('Plan: tres tarjetas y el detalle plegado', () => {
+    render(
+      <PlanScreen
+        data={{ budgets, budgetsAll: { [pk]: budgets }, transactions, categories, budgetCutDay: 1, debts, savings }}
+        budgetsTable={<div>tabla-aqui</div>}
+      />,
+    );
+    expect(screen.getByText(/¿Puedo gastar esto\?/)).toBeTruthy();
+    expect(screen.getByText('Qué pagar y cuándo')).toBeTruthy();
+    expect(screen.getByText('Fin de mes')).toBeTruthy();
+    expect(screen.getByText('Ver detalle').closest('details').open).toBe(false);
+    expect(screen.getByText('Detalle de tramos')).toBeTruthy();
   });
 
   it('Compromisos: deudas y ahorro', () => {

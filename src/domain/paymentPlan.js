@@ -64,8 +64,10 @@ export function isPriorityCategory(category, priorityCategories = {}) {
 export const isFoodCategory = (category) => FOOD_PATTERN.test(String(category || ''));
 
 // Qué pasa si un gasto fijo se atrasa, según lo que es (se mira la subcategoría y la categoría).
+export const SERVICE_CUT_REASON = 'Si se atrasa, pueden cortar el servicio';
+
 const FIXED_REASONS = [
-  [/luz|agua|\bgas\b|electric|internet|tel[eé]fono|celular|cable|servicio/i, 'Si se atrasa, pueden cortar el servicio'],
+  [/luz|agua|\bgas\b|electric|internet|tel[eé]fono|celular|cable|servicio/i, SERVICE_CUT_REASON],
   [/arriendo|alquiler|dividendo|hipotec|gastos? comunes|hogar|vivienda/i, 'Atrasarse genera multa o intereses'],
   [/colegio|jard[ií]n|educa|universidad|matr[ií]cula/i, 'Puede cobrar multa o interés por atraso'],
   [/seguro|isapre|fonasa|plan de salud/i, 'Si no se paga, se puede perder la cobertura'],
@@ -165,6 +167,7 @@ function fixedBills({ budgetsAll, transactions, cutDay, periodKey, fixedCategori
           kind: 'fixed',
           category,
           subId,
+          subName,
           name: subName ? `${category} · ${subName}` : category,
           detail: 'Gasto fijo',
           reason: fixedReason(category, subName),
