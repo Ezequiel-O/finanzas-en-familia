@@ -29,7 +29,7 @@ import {
 import { Card } from '../../components/ui/Card.jsx';
 import { SectionTitle } from '../../components/ui/SectionTitle.jsx';
 import { CATEGORIES, DEBT_CATEGORY, SAVINGS_CATEGORY } from '../../constants.js';
-import { dueDayKey, isPriorityCategory } from '../../domain/paymentPlan.js';
+import { isPriorityCategory } from '../../domain/paymentPlan.js';
 import { auth, db, secondaryAuth, secondaryDb } from '../../firebase';
 import {
   buildInviteLink,
@@ -44,29 +44,6 @@ const LAST_ACCESS_MESSAGE_KEY = 'fef:lastAccessMessage';
 const TEMP_LOGIN_PREFIX = 'usuario';
 const TEMP_LOGIN_DOMAIN = 'finanzasenfamilia.com';
 const TEMP_PASSWORD_LENGTH = 10;
-
-// Día del mes (1-31) en que vence un gasto fijo; se guarda al salir del campo.
-function DueDayInput({ value, label, placeholder = '—', onSave }) {
-  return (
-    <input
-      key={String(value || '')}
-      type="number"
-      inputMode="numeric"
-      min={1}
-      max={31}
-      step={1}
-      defaultValue={value || ''}
-      placeholder={placeholder}
-      aria-label={label}
-      className="w-14 rounded border px-1 py-0.5 text-xs"
-      onBlur={(e) => {
-        const next = e.target.value.trim();
-        if (next === String(value || '')) return;
-        onSave(next);
-      }}
-    />
-  );
-}
 
 export function Settings({
   data,
@@ -109,7 +86,6 @@ export function Settings({
       : {};
   const fixedCategories = data.fixedCategories || {};
   const priorityCategories = data.priorityCategories || {};
-  const fixedDueDays = data.fixedDueDays || {};
   const editableCats = cats.filter(
     (c) => c !== SAVINGS_CATEGORY && c !== DEBT_CATEGORY,
   );
@@ -1202,19 +1178,10 @@ export function Settings({
     const canMoveDown = index >= 0 && index < list.length - 1;
     const isFixed = !!fixedCategories[cat];
     const isPriority = isPriorityCategory(cat, priorityCategories);
-    // Subcategorías del presupuesto del mes visible: cada una puede vencer otro día.
-    const subcategories = isFixed
-      ? (Array.isArray(data.budgets?.[cat]?.breakdown) ? data.budgets[cat].breakdown : [])
-          .map((item, idx) => ({
-            id: String(item.id || item.name || `${cat}-${idx}`),
-            name: String(item.name || '').trim(),
-          }))
-          .filter((item) => item.name)
-      : [];
     return (
       <li
         key={cat}
-        className="flex flex-col gap-2 sm:flex-row sm:flex-wrap sm:items-center sm:justify-between border rounded-lg px-3 py-2"
+        className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between border rounded-lg px-3 py-2"
       >
         <div className="flex items-center gap-2 min-w-0 flex-1">
           <span className="whitespace-normal break-words">{cat}</span>
@@ -1230,16 +1197,6 @@ export function Settings({
             />
             Gasto fijo
           </label>
-          {isFixed && (
-            <label className="inline-flex items-center gap-1 text-[11px] text-[color:var(--text-muted)]">
-              {subcategories.length ? 'Vence el día (por defecto)' : 'Vence el día'}
-              <DueDayInput
-                value={fixedDueDays[cat]}
-                label={`Día de vencimiento de ${cat}`}
-                onSave={(day) => actions?.setCategoryDueDay?.(cat, day)}
-              />
-            </label>
-          )}
           {/* Un gasto fijo se paga una vez en su fecha: la prioridad (reserva diaria) es solo para los variables. */}
           {!isFixed && (
             <label
@@ -1348,24 +1305,6 @@ export function Settings({
             Eliminar
           </button>
         </div>
-        {subcategories.length > 0 && (
-          <ul className="w-full grid gap-1 sm:grid-cols-2 border-t border-[color:var(--divider)] pt-2">
-            {subcategories.map((sub) => (
-              <li key={sub.id} className="flex items-center justify-between gap-2 text-[11px] text-[color:var(--text-muted)]">
-                <span className="truncate">{sub.name}</span>
-                <label className="inline-flex items-center gap-1">
-                  Vence el día
-                  <DueDayInput
-                    value={fixedDueDays[dueDayKey(cat, sub.id)]}
-                    placeholder={fixedDueDays[cat] ? String(fixedDueDays[cat]) : '—'}
-                    label={`Día de vencimiento de ${cat} · ${sub.name}`}
-                    onSave={(day) => actions?.setCategoryDueDay?.(dueDayKey(cat, sub.id), day)}
-                  />
-                </label>
-              </li>
-            ))}
-          </ul>
-        )}
       </li>
     );
   }
@@ -1851,9 +1790,9 @@ export function Settings({
 
           <p className="text-xs text-[color:var(--text-muted)] mt-1">
             Marca las categorias fijas para que acumulen pendientes entre
-            periodos (con su día de vencimiento), y las de prioridad (comida,
-            remedios) para que el plan las reserve por día hasta el próximo
-            ingreso.
+            periodos (su fecha de vencimiento se define en Plan, en cada
+            subgasto), y marca como prioridad los gastos variables que el plan
+            debe reservar por día hasta el próximo ingreso (comida, remedios).
           </p>
 
           <form

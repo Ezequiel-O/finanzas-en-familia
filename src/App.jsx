@@ -1159,6 +1159,7 @@ export default function App() {
                       transactions: data.transactions,
                       categories: data.categories,
                       fixedCategories: data.fixedCategories,
+                      fixedDueDays: data.fixedDueDays,
                       budgetCutDay: data.budgetCutDay,
                       debts: data.debts,
                       savings: data.savings,
@@ -1214,7 +1215,6 @@ export default function App() {
                     budgetCutDay: data.budgetCutDay,
                     fixedCategories: data.fixedCategories,
                     priorityCategories: data.priorityCategories,
-                    fixedDueDays: data.fixedDueDays,
                   }}
                   householdId={selectedHid}
                   user={ctx.user}

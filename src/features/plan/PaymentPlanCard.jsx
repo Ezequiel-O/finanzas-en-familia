@@ -141,7 +141,7 @@ export function PaymentPlanCard({ data, actions, activeUser }) {
 
       {plan.missingDueDates.length > 0 && (
         <div className="mt-3 rounded-xl border border-[color:var(--warning)]/40 bg-[color:var(--warning)]/10 px-3 py-2 text-sm">
-          Define la fecha de pago de {listNames(plan.missingDueDates)} en Ajustes &gt; Categorías. Mientras tanto se cuenta
+          Define la fecha de pago de {listNames(plan.missingDueDates)} más abajo, en Presupuestos por categoría (campo «Vence el día» de cada gasto fijo). Mientras tanto se cuenta
           {plan.missingDueDates.length === 1 ? '' : 'n'} como si venciera{plan.missingDueDates.length === 1 ? '' : 'n'} antes del{' '}
           {incomeDay}.
         </div>
@@ -290,7 +290,7 @@ export function PaymentPlanCard({ data, actions, activeUser }) {
           </p>
           <p>
             Los gastos fijos se pagan una vez en su fecha. Solo las categorías prioritarias que no son fijas se reservan por día.
-            Ambas cosas se configuran en Ajustes &gt; Categorías.
+            La fecha de cada gasto fijo se define aquí en Plan; las prioridades, en Ajustes &gt; Categorías.
           </p>
         </div>
       </details>

@@ -83,6 +83,33 @@ describe('pestañas', () => {
     expect(screen.getByText('compromisos-aqui')).toBeTruthy();
   });
 
+  it('Plan: el gasto fijo pide su fecha de vencimiento y la guarda', () => {
+    const setCategoryDueDay = vi.fn();
+    render(
+      <Budgets
+        data={{
+          budgets: { Hogar: 500000 },
+          budgetsAll: { [pk]: { Hogar: 500000 } },
+          transactions,
+          categories,
+          fixedCategories: { Hogar: true },
+          fixedDueDays: {},
+          budgetCutDay: 1,
+          debts,
+          savings,
+        }}
+        actions={{ ...actions, setCategoryDueDay }}
+        monthKeyStr={pk}
+      />,
+    );
+    const input = screen.getByLabelText('Día de vencimiento de Hogar');
+    fireEvent.change(input, { target: { value: '5' } });
+    fireEvent.blur(input);
+    expect(setCategoryDueDay).toHaveBeenCalledWith('Hogar', '5');
+    // Un gasto variable no pide fecha.
+    expect(screen.queryByLabelText('Día de vencimiento de Alimentación')).toBeNull();
+  });
+
   it('Compromisos: deudas y ahorro', () => {
     const onSectionChange = vi.fn();
     const { rerender } = render(

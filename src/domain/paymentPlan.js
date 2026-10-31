@@ -3,7 +3,7 @@
 // sin quedarse sin comida en los días intermedios.
 //
 // - Gastos FIJOS (arriendo, luz, ofrenda): lo pendiente es UN pago con fecha de vencimiento
-//   (día definido en Ajustes > Categorías). Nunca se reparte por día. Si la categoría tiene
+//   (día definido en Plan, en cada subgasto fijo). Nunca se reparte por día. Si la categoría tiene
 //   subcategorías (Luz, Agua, Internet), cada una es un pago con su propia fecha.
 // - Categorías PRIORITARIAS no fijas (comida, transporte): se reserva por día
 //   disponible ÷ días que quedan del periodo (incluido hoy), solo si queda disponible.

@@ -2,6 +2,8 @@ import { plannedForSavingPeriod } from '../../domain/commitments.js';
 import { categorySpent, isAdjustment, periodLedger, txDateKey } from '../../domain/ledger.js';
 import { LedgerBreakdown } from '../../features/plan/LedgerBreakdown.jsx';
 import { PeriodOutlook } from '../../features/plan/PeriodOutlook.jsx';
+import { DueDayInput } from '../../components/ui/DueDayInput.jsx';
+import { dueDayKey } from '../../domain/paymentPlan.js';
 import { toast, confirmDialog } from '../../components/feedback/feedback.js';
 import { todayKey } from '../../domain/dates.js';
 import { formatCLP } from '../../domain/money.js';
@@ -301,6 +303,7 @@ export function Budgets({ data, actions, activeUser = null, monthKeyStr, topSlot
     budgets = {},
     budgetsAll = {},
     fixedCategories = {},
+    fixedDueDays = {},
     transactions = [],
     categories = [],
     budgetCutDay = 1,
@@ -1824,6 +1827,14 @@ export function Budgets({ data, actions, activeUser = null, monthKeyStr, topSlot
                               Pendiente: <Money n={carryover} />
                             </span>
                           )}
+                          {/* Cada subgasto fijo vence en su día: el plan ordena qué pagar primero. */}
+                          {r.isFixedCategory && isEditableRow && (
+                            <DueDayInput
+                              value={fixedDueDays[dueDayKey(r.c, item.id)] || fixedDueDays[r.c]}
+                              label={`Día de vencimiento de ${r.c} · ${item.name}`}
+                              onSave={(day) => actions?.setCategoryDueDay?.(dueDayKey(r.c, item.id), day)}
+                            />
+                          )}
                         </div>
                         {r.isFixedCategory &&
                           renderFixedPayControl(r.c, item, effectivePlanned, spent)}
@@ -2093,6 +2104,16 @@ export function Budgets({ data, actions, activeUser = null, monthKeyStr, topSlot
                               >
                                 {r.c}
                               </div>
+                              {r.isFixedCategory &&
+                                !isDebtRow &&
+                                !isSavingsRow &&
+                                !(Array.isArray(r.breakdown) && r.breakdown.length) && (
+                                  <DueDayInput
+                                    value={fixedDueDays[r.c]}
+                                    label={`Día de vencimiento de ${r.c}`}
+                                    onSave={(day) => actions?.setCategoryDueDay?.(r.c, day)}
+                                  />
+                                )}
                               {r.c === DEBT_CATEGORY && (
                                 <div className="text-[11px] text-[color:var(--text-muted)]">
                                   Desde Modulo Deudas
