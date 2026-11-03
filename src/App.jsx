@@ -753,8 +753,8 @@ export default function App() {
           </p>
           {!appCheckConfigured && (
             <p className="rounded-lg bg-[color:var(--warning)]/15 px-2 py-1.5 text-[11px] text-[color:var(--warning)]">
-              Para habilitar Gemini, configura App Check y
-              VITE_FIREBASE_APP_CHECK_SITE_KEY.
+              Para habilitar Gemini, configura App Check con reCAPTCHA
+              Enterprise y VITE_FIREBASE_APP_CHECK_SITE_KEY.
             </p>
           )}
           {aiMessages.length > 0 && (

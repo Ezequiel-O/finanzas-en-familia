@@ -315,8 +315,8 @@ export function GmailImportModal({
         )}
         {!appCheckConfigured && (
           <p className="mb-3 rounded-lg border border-[color:var(--warning)]/30 bg-[color:var(--warning)]/15 px-3 py-2 text-sm text-[color:var(--warning)]">
-            Registra la app web en Firebase App Check y configura su clave
-            reCAPTCHA v3 para habilitar Gemini.
+            Registra la app web en Firebase App Check con reCAPTCHA Enterprise
+            y configura su clave de sitio para habilitar Gemini.
           </p>
         )}
         <button
