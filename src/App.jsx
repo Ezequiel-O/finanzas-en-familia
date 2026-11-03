@@ -18,7 +18,7 @@ import { onAuthStateChanged, signOut } from 'firebase/auth';
 import { doc, setDoc, serverTimestamp } from 'firebase/firestore';
 
 // Firebase
-import { auth, db } from './firebase';
+import { appCheckConfigured, auth, db } from './firebase';
 
 // Layout y avisos
 import { Header } from './components/layout/Header.jsx';
@@ -28,6 +28,7 @@ import { ErrorBoundary } from './components/feedback/ErrorBoundary.jsx';
 import { FeedbackHost } from './components/feedback/FeedbackHost.jsx';
 import { confirmDialog } from './components/feedback/feedback.js';
 import { parseIntent } from './ai/intentParser.js';
+import { askFinancialAssistant } from './ai/financialAssistant.js';
 
 // Dominio y navegación
 import { buildDebtPaidIndex, debtProgress } from './domain/commitments.js';
@@ -93,6 +94,8 @@ export default function App() {
   const [aiInterim, setAiInterim] = useState('');
   const [aiError, setAiError] = useState('');
   const [aiPlan, setAiPlan] = useState(null);
+  const [aiMessages, setAiMessages] = useState([]);
+  const [aiSending, setAiSending] = useState(false);
   const aiRecognitionRef = useRef(null);
   const aiManualStopRef = useRef(false);
   const aiListenTimerRef = useRef(null);
@@ -441,30 +444,65 @@ export default function App() {
     fetchAuditLog: h.fetchAuditLog,
   };
 
-  const handleAiSendText = useCallback(() => {
+  const handleAiSendText = useCallback(async () => {
     const input = aiText.trim();
-    if (!input) return;
+    if (!input || aiSending) return;
+    const userMessage = { role: 'user', text: input };
+    const nextMessages = [...aiMessages, userMessage];
+    setAiMessages(nextMessages);
+    setAiText('');
+    setAiError('');
     try {
       const result = parseIntent(input, {
         categories: data.categories,
         transactions: data.transactions,
       });
-      if (result.type === 'clarify') {
-        setAiPlan(null);
-        setAiStatus(result.message);
-        return;
-      }
       if (result.type === 'plan') {
         setAiPlan(result.plan);
-        setAiStatus('Revisa y confirma la acción.');
+        setAiMessages([
+          ...nextMessages,
+          {
+            role: 'model',
+            text: `Preparé una acción para revisar: ${result.plan.summary}`,
+          },
+        ]);
+        setAiStatus('Revisa y confirma la acción antes de ejecutarla.');
         return;
       }
-      setAiStatus('No pude interpretar la instrucción.');
+      setAiSending(true);
+      setAiStatus('Consultando al asistente…');
+      const answer = await askFinancialAssistant({
+        question: input,
+        history: aiMessages,
+        periodKey: selectedMonth,
+        transactions: data.transactions,
+        budgetsAll: data.budgetsAll,
+        categories: data.categories,
+        debts: data.debts,
+        budgetCutDay: data.budgetCutDay,
+      });
+      setAiMessages([...nextMessages, { role: 'model', text: answer }]);
+      setAiStatus('');
     } catch (err) {
-      console.error('AI parse error:', err);
-      setAiError('No se pudo interpretar la instrucción.');
+      console.error('AI assistant error:', { code: err?.code });
+      setAiError(
+        err?.message ||
+          'No se pudo consultar Gemini. Revisa App Check y vuelve a intentar.',
+      );
+    } finally {
+      setAiSending(false);
     }
-  }, [aiText, data.categories, data.transactions]);
+  }, [
+    aiText,
+    aiSending,
+    aiMessages,
+    data.categories,
+    data.transactions,
+    data.budgetsAll,
+    data.debts,
+    data.budgetCutDay,
+    selectedMonth,
+  ]);
 
   const handleAiConfirm = useCallback(async () => {
     if (!aiPlan) return;
@@ -510,6 +548,10 @@ export default function App() {
         }
         await actions.setBudget(aiPlan.payload.category, aiPlan.payload.amount);
       }
+      setAiMessages((current) => [
+        ...current,
+        { role: 'model', text: 'Listo, la acción fue ejecutada.' },
+      ]);
       setAiStatus('Acción ejecutada.');
       setAiPlan(null);
       setAiText('');
@@ -521,6 +563,10 @@ export default function App() {
 
   const handleAiCancelPlan = useCallback(() => {
     setAiPlan(null);
+    setAiMessages((current) => [
+      ...current,
+      { role: 'model', text: 'Acción cancelada; no se hicieron cambios.' },
+    ]);
     setAiStatus('Acción cancelada.');
   }, []);
 
@@ -678,16 +724,21 @@ export default function App() {
       {!aiOpen ? (
         <button
           type="button"
-          className="ai-fab h-12 w-12 md:h-16 md:w-16 rounded-full shadow-lg hover:brightness-105 active:scale-95 transition text-sm md:text-base font-semibold tracking-wide"
+          className="ai-fab flex h-12 w-12 items-center justify-center overflow-hidden rounded-full shadow-lg transition hover:brightness-105 active:scale-95 md:h-16 md:w-16"
           onClick={handleAiToggle}
-          aria-label="Abrir asistente"
+          aria-label="Abrir asistente financiero con IA"
+          title="Asistente financiero con IA"
         >
-          IA
+          <img
+            src="/logo-finanzas-en-familia.png"
+            alt=""
+            className="h-full w-full object-cover"
+          />
         </button>
       ) : (
         <div className="ai-panel w-[min(90vw,360px)] rounded-2xl border border-[color:var(--border)] bg-[color:var(--surface-1)] shadow-[var(--shadow)] p-4 space-y-3">
           <div className="flex items-center justify-between">
-            <div className="text-sm font-semibold">Asistente</div>
+            <div className="text-sm font-semibold">Asistente financiero</div>
             <button
               type="button"
               className="text-xs text-[color:var(--text-muted)] hover:text-[color:var(--text)]"
@@ -696,15 +747,56 @@ export default function App() {
               Cerrar
             </button>
           </div>
+          <p className="text-[11px] leading-relaxed text-[color:var(--text-muted)]">
+            Tu consulta y un resumen financiero agregado se procesan con Gemini.
+            No se envían nombres ni descripciones individuales.
+          </p>
+          {!appCheckConfigured && (
+            <p className="rounded-lg bg-[color:var(--warning)]/15 px-2 py-1.5 text-[11px] text-[color:var(--warning)]">
+              Para habilitar Gemini, configura App Check y
+              VITE_FIREBASE_APP_CHECK_SITE_KEY.
+            </p>
+          )}
+          {aiMessages.length > 0 && (
+            <div
+              className="max-h-64 space-y-2 overflow-y-auto rounded-lg bg-[color:var(--surface-2)]/50 p-2"
+              aria-live="polite"
+              aria-label="Conversación con el asistente"
+            >
+              {aiMessages.map((message, index) => (
+                <div
+                  key={`${message.role}-${index}`}
+                  className={`max-w-[90%] whitespace-pre-wrap rounded-xl px-3 py-2 text-xs ${
+                    message.role === 'user'
+                      ? 'ml-auto bg-[color:var(--primary)] text-[color:var(--primary-contrast)]'
+                      : 'bg-[color:var(--surface-1)] text-[color:var(--text)]'
+                  }`}
+                >
+                  {message.text}
+                </div>
+              ))}
+              {aiSending && (
+                <div className="text-xs text-[color:var(--text-muted)]">
+                  Pensando…
+                </div>
+              )}
+            </div>
+          )}
           <textarea
             className="w-full rounded-lg border border-[color:var(--border)] bg-transparent px-3 py-2 text-sm"
             rows={3}
-            placeholder="Escribe tu solicitud (o pega la transcripción aquí)"
+            placeholder="Pregunta por tus finanzas o escribe una acción para revisar"
             value={aiText}
             onChange={(e) => {
               setAiText(e.target.value);
               setAiStatus('');
               setAiPlan(null);
+            }}
+            onKeyDown={(event) => {
+              if (event.key === 'Enter' && !event.shiftKey) {
+                event.preventDefault();
+                handleAiSendText();
+              }
             }}
           />
           <div className="flex flex-wrap items-center gap-2">
@@ -776,9 +868,9 @@ export default function App() {
               type="button"
               className="flex-1 px-3 py-2 text-xs rounded-lg border text-[color:var(--text-muted)] hover:bg-[color:var(--surface-2)] disabled:opacity-60"
               onClick={handleAiSendText}
-              disabled={!aiText.trim()}
+              disabled={!aiText.trim() || aiSending}
             >
-              Enviar texto
+              Preguntar
             </button>
           </div>
         </div>

@@ -37,26 +37,42 @@ Requiere Node 22.
 
 En **Movimientos → Gmail**, la app puede buscar los 100 avisos más recientes de
 `notificaciones@correo.bancoestado.cl` y `noreply@correo.bancoestado.cl`. El
-análisis de monto, fecha y tipo se hace localmente en el navegador; revisa y
-confirma cada propuesta antes de guardarla. No se envían correos a una IA y el
-ID de Gmail se conserva en el movimiento únicamente para evitar duplicados.
+elige qué avisos enviar a Firebase AI Logic (Gemini Developer API) para extraer
+monto, fecha, tipo y descripción. Nombres, RUT, correos y números de cuenta
+detectables se ocultan localmente antes del envío. Revisa cada propuesta y confirma antes
+de guardarla. No se conservan cuerpos de correo ni tokens; el ID de Gmail se
+guarda únicamente para evitar duplicados.
 
 Para habilitarlo:
 
-1. En Google Cloud Console, habilita Gmail API y crea un cliente OAuth de tipo
+1. En Firebase Console → AI Services → AI Logic, configura Gemini Developer API.
+   El SDK `firebase` ya está instalado; no hace falta volver a instalarlo ni
+   copiar una clave de Gemini al frontend.
+2. Registra la app web en Firebase App Check con reCAPTCHA v3 y configura los
+   dominios autorizados. Agrega la clave de sitio pública a `.env.local` como
+   `VITE_FIREBASE_APP_CHECK_SITE_KEY=...`.
+3. En Google Cloud Console, habilita Gmail API y crea un cliente OAuth de tipo
    **Aplicación web**. Agrega los orígenes autorizados de desarrollo y producción.
-2. Configura la pantalla de consentimiento y agrega el alcance
+4. Configura la pantalla de consentimiento y agrega el alcance
    `https://www.googleapis.com/auth/gmail.readonly`.
-3. Agrega el ID del cliente a `.env.local` como
+5. Agrega el ID del cliente a `.env.local` como
    `VITE_GOOGLE_OAUTH_CLIENT_ID=...` y reinicia Vite.
-4. Publica el cambio de Content Security Policy incluido en `firebase.json`.
+6. Reconstruye y publica la app para aplicar las variables y Content Security
+   Policy de `firebase.json`.
+
+El botón flotante con el logo abre el asistente Gemini. Las consultas de texto
+reciben contexto agregado del periodo y presupuestos cargados, sin nombres ni
+descripciones individuales. Para crear/editar/eliminar movimientos y asignar
+presupuestos se conserva el parser de acciones existente y siempre se muestra
+una confirmación antes de escribir en Firestore.
 
 Google solicita permiso de lectura del buzón, aunque esta función consulta solo
 los dos remitentes anteriores. No se guardan tokens ni cuerpos de correo. Google
 puede exigir verificación OAuth para publicar la aplicación con ese alcance.
-Solo se importan automáticamente avisos con monto y fecha reconocibles; revisa
-también el tipo y la categoría antes de confirmar. La función consulta hasta los
-100 avisos más recientes por búsqueda.
+Gemini procesa únicamente los avisos que selecciones; si no puede extraer los
+campos o no coinciden con el monto y fecha explícitos del correo, no propone el
+movimiento. Las compras con tarjeta de crédito se excluyen por el criterio de
+base caja de la app. La consulta se limita a los 100 avisos más recientes.
 
 ## Estructura
 

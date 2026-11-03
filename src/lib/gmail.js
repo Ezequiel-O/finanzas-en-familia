@@ -105,7 +105,10 @@ function extractText(payload) {
   }
   const html = htmlParts.map(decodeBase64Url).join('\n');
   if (!html) return '';
-  const withBreaks = html.replace(/<(br|\/p|\/div|\/tr|\/li)\b[^>]*>/gi, '\n');
+  const withBreaks = html.replace(
+    /<(?:br|\/(?:p|div|tr|li|td|th)|(?:p|div|tr|td|th)\b)[^>]*>/gi,
+    '\n',
+  );
   return new DOMParser().parseFromString(withBreaks, 'text/html').body.textContent || '';
 }
 

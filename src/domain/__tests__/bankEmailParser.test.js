@@ -1,5 +1,9 @@
 import { describe, expect, it } from 'vitest';
-import { parseBankEmail } from '../bankEmailParser.js';
+import {
+  parseBankEmail,
+  sanitizeBankEmailForAI,
+  validateAiBankEmailMovement,
+} from '../bankEmailParser.js';
 
 describe('parseBankEmail', () => {
   it('extracts an outgoing CuentaRUT transfer without using account numbers as amounts', () => {
@@ -56,5 +60,64 @@ Producto: CuentaRUT`,
     expect(
       parseBankEmail({ body: 'Monto transferido: $1.200 31/02/2026' }),
     ).toBeNull();
+  });
+
+  it('redacts account identifiers from the text sent to AI', () => {
+    const text = sanitizeBankEmailForAI({
+      subject: 'Aviso para user@example.com',
+      body: 'Monto transferido: $1.200.000 Nombre: Fulana N° de cuenta: 123456789 RUT: 12.345.678-9 Fecha: 29/10/2026',
+    });
+
+    expect(text).toContain('$1.200.000');
+    expect(text).toContain('29/10/2026');
+    expect(text).not.toContain('Fulana');
+    expect(text).not.toContain('user@example.com');
+    expect(text).not.toContain('123456789');
+    expect(text).not.toContain('12.345.678-9');
+  });
+
+  it('accepts AI fields only when amount and date are present in the email', () => {
+    const email = {
+      body: 'Monto transferido: $1.200.000\nFecha y Hora de TEF: 29/10/2026 08:26:31',
+    };
+
+    expect(
+      validateAiBankEmailMovement(
+        email,
+        {
+          hasMovement: true,
+          type: 'gasto',
+          amount: 1200000,
+          date: '2026-10-29',
+          description: 'Transferencia',
+          category: 'Otros',
+        },
+        ['Otros'],
+      ),
+    ).toEqual({
+      type: 'gasto',
+      amount: 1200000,
+      date: '2026-10-29',
+      description: 'Transferencia',
+      suggestedCategory: 'Otros',
+    });
+    expect(() =>
+      validateAiBankEmailMovement(email, {
+        hasMovement: true,
+        type: 'gasto',
+        amount: 1200001,
+        date: '2026-10-29',
+        description: 'Transferencia',
+      }),
+    ).toThrow('no coinciden');
+    expect(() =>
+      validateAiBankEmailMovement(email, {
+        hasMovement: true,
+        type: 'gasto',
+        amount: 1200000,
+        date: '2026-10-28',
+        description: 'Transferencia',
+      }),
+    ).toThrow('no coinciden');
   });
 });

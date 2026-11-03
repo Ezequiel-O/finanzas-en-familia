@@ -1,6 +1,7 @@
 import { initializeApp, getApps, getApp } from 'firebase/app';
 import { getAuth } from 'firebase/auth';
 import { getFirestore } from 'firebase/firestore';
+import { initializeAppCheck, ReCaptchaV3Provider } from 'firebase/app-check';
 
 // For Firebase JS SDK v7.20.0 and later, measurementId is optional
 const firebaseConfig = {
@@ -16,8 +17,18 @@ const app = getApps().length ? getApp() : initializeApp(firebaseConfig);
 const secondaryApp =
   getApps().find((existing) => existing.name === 'secondary') ||
   initializeApp(firebaseConfig, 'secondary');
+const appCheckSiteKey = String(
+  import.meta.env.VITE_FIREBASE_APP_CHECK_SITE_KEY || '',
+).trim();
 
 export const auth = getAuth(app);
 export const db = getFirestore(app);
+export const appCheckConfigured = !!appCheckSiteKey;
+export const appCheck = appCheckConfigured
+  ? initializeAppCheck(app, {
+      provider: new ReCaptchaV3Provider(appCheckSiteKey),
+      isTokenAutoRefreshEnabled: true,
+    })
+  : null;
 export const secondaryAuth = getAuth(secondaryApp);
 export const secondaryDb = getFirestore(secondaryApp);

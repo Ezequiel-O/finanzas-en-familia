@@ -1,7 +1,7 @@
 import { useEffect, useState } from 'react';
 import { collection, getDocs, query, where } from 'firebase/firestore';
-import { parseBankEmail } from '../../domain/bankEmailParser.js';
-import { db } from '../../firebase';
+import { extractBankTransaction } from '../../ai/bankTransactionExtractor.js';
+import { appCheckConfigured, db } from '../../firebase';
 import {
   prepareGmailAuthorization,
   readBancoEstadoEmails,
@@ -54,10 +54,12 @@ export function GmailImportModal({
   addTransaction,
 }) {
   const [loading, setLoading] = useState(false);
+  const [extracting, setExtracting] = useState(false);
   const [saving, setSaving] = useState(false);
   const [googleReady, setGoogleReady] = useState(false);
   const [error, setError] = useState('');
   const [notice, setNotice] = useState('');
+  const [emails, setEmails] = useState([]);
   const [candidates, setCandidates] = useState([]);
   const [scanInfo, setScanInfo] = useState('');
 
@@ -100,40 +102,29 @@ export function GmailImportModal({
     setLoading(true);
     setError('');
     setNotice('');
+    setEmails([]);
     setCandidates([]);
     setScanInfo('');
     try {
       const { messages, truncated } = await readBancoEstadoEmails(GOOGLE_CLIENT_ID);
-      const parsed = messages
-        .map((message) => {
-          const movement = parseBankEmail(message);
-          return movement
-            ? {
-                id: message.id,
-                subject: message.subject,
-                ...movement,
-                selected: true,
-                category: '',
-                description: movement.description.slice(0, 500),
-              }
-            : null;
-        })
-        .filter(Boolean);
       const importedIds = await findImportedMessageIds(
         householdId,
-        parsed.map((message) => message.id),
+        messages.map((message) => message.id),
       );
-      const pending = parsed.filter((message) => !importedIds.has(message.id));
-      const duplicates = parsed.length - pending.length;
-      const skipped = messages.length - parsed.length;
-      setCandidates(pending);
+      const pending = messages
+        .filter((message) => !importedIds.has(message.id))
+        .map((message) => ({ ...message, selected: false }));
+      const duplicates = messages.length - pending.length;
+      setEmails(pending);
       setScanInfo(
-        `${messages.length} correos revisados; ${pending.length} movimientos para revisar; ${duplicates} ya importados; ${skipped} sin monto o fecha reconocible.${
+        `${messages.length} avisos revisados; ${pending.length} disponibles para seleccionar; ${duplicates} ya importados.${
           truncated ? ' Se revisaron los 100 avisos más recientes.' : ''
         }`,
       );
       if (!messages.length) {
         setNotice('No se encontraron avisos de movimiento de los remitentes configurados.');
+      } else if (!pending.length) {
+        setNotice('Todos los avisos encontrados ya se habían importado.');
       }
     } catch (readError) {
       console.error('No se pudieron leer los avisos de BancoEstado:', {
@@ -143,6 +134,67 @@ export function GmailImportModal({
     } finally {
       setLoading(false);
     }
+  }
+
+  async function handleExtractSelected() {
+    const selected = emails.filter((email) => email.selected);
+    if (!selected.length) {
+      setError('Selecciona al menos un aviso para extraer con Gemini.');
+      return;
+    }
+    if (!appCheckConfigured) {
+      setError(
+        'Registra esta app web en Firebase App Check y configura VITE_FIREBASE_APP_CHECK_SITE_KEY antes de usar Gemini.',
+      );
+      return;
+    }
+
+    setExtracting(true);
+    setError('');
+    setNotice('');
+    setCandidates([]);
+    const extracted = [];
+    const finishedIds = new Set();
+    let ignored = 0;
+    let failed = 0;
+    for (let index = 0; index < selected.length; index += 1) {
+      const email = selected[index];
+      setScanInfo(`Gemini está analizando el aviso ${index + 1} de ${selected.length}…`);
+      try {
+        const movement = await extractBankTransaction(email, expenseCategories);
+        finishedIds.add(email.id);
+        if (movement) {
+          extracted.push({
+            id: email.id,
+            subject: email.subject,
+            ...movement,
+            selected: true,
+            category: movement.suggestedCategory,
+          });
+        } else {
+          ignored += 1;
+        }
+      } catch (extractError) {
+        failed += 1;
+        console.error('No se pudo analizar un aviso bancario con Gemini:', {
+          id: email.id,
+          code: extractError?.code || 'unknown',
+        });
+      }
+    }
+    setCandidates(extracted);
+    setEmails((current) => current.filter((email) => !finishedIds.has(email.id)));
+    setScanInfo(
+      `${selected.length} avisos procesados: ${extracted.length} movimientos propuestos, ${ignored} sin movimiento importable${
+        failed ? ` y ${failed} con error` : ''
+      }.`,
+    );
+    if (failed) {
+      setError(
+        'Algunos avisos no pudieron procesarse. Puedes volver a seleccionarlos e intentar otra vez.',
+      );
+    }
+    setExtracting(false);
   }
 
   async function handleImport() {
@@ -242,17 +294,18 @@ export function GmailImportModal({
             type="button"
             className="text-sm text-[color:var(--text-muted)] hover:text-[color:var(--text)]"
             onClick={onClose}
-            disabled={loading || saving}
+            disabled={loading || extracting || saving}
           >
             Cerrar
           </button>
         </div>
 
         <p className="mb-3 text-sm text-[color:var(--text-muted)]">
-          Gmail solicita permiso de lectura del buzón, pero esta función consulta
-          únicamente los dos remitentes de BancoEstado indicados. El texto se
-          analiza en tu navegador y no se envía a una IA. La app no envía ni
-          elimina correos.
+          Gmail solicita permiso de lectura del buzón. Al seleccionar un aviso y
+          pulsar “Extraer con Gemini”, se enviarán su asunto y cuerpo a Firebase
+          AI Logic para procesarlo. Antes de enviarlo, la app oculta RUT, correos
+          y números de cuenta detectables. Revisa cada resultado; nunca se guarda
+          automáticamente.
         </p>
         {!GOOGLE_CLIENT_ID && (
           <p className="mb-3 rounded-lg border border-[color:var(--warning)]/30 bg-[color:var(--warning)]/15 px-3 py-2 text-sm text-[color:var(--warning)]">
@@ -260,11 +313,17 @@ export function GmailImportModal({
             Gmail en el README para habilitar la conexión.
           </p>
         )}
+        {!appCheckConfigured && (
+          <p className="mb-3 rounded-lg border border-[color:var(--warning)]/30 bg-[color:var(--warning)]/15 px-3 py-2 text-sm text-[color:var(--warning)]">
+            Registra la app web en Firebase App Check y configura su clave
+            reCAPTCHA v3 para habilitar Gemini.
+          </p>
+        )}
         <button
           type="button"
           className="rounded-lg bg-[color:var(--success)] px-4 py-2 text-sm text-[color:var(--primary-contrast)] hover:brightness-110 disabled:cursor-not-allowed disabled:opacity-60"
           onClick={handleReadEmails}
-          disabled={loading || saving || !GOOGLE_CLIENT_ID || !googleReady}
+          disabled={loading || extracting || saving || !GOOGLE_CLIENT_ID || !googleReady}
         >
           {loading
             ? 'Buscando avisos…'
@@ -283,6 +342,50 @@ export function GmailImportModal({
         )}
         {notice && (
           <p className="mt-3 text-sm text-[color:var(--success)]">{notice}</p>
+        )}
+
+        {emails.length > 0 && (
+          <div className="mt-4 max-h-56 space-y-2 overflow-y-auto rounded-xl border border-[color:var(--border)] p-3">
+            <p className="text-xs text-[color:var(--text-muted)]">
+              Selecciona solo los avisos que deseas enviar a Gemini.
+            </p>
+            {emails.map((email) => (
+              <label
+                key={email.id}
+                className="flex items-start gap-2 text-sm"
+              >
+                <input
+                  type="checkbox"
+                  checked={email.selected}
+                  disabled={extracting}
+                  onChange={(event) =>
+                    setEmails((current) =>
+                      current.map((item) =>
+                        item.id === email.id
+                          ? { ...item, selected: event.target.checked }
+                          : item,
+                      ),
+                    )
+                  }
+                />
+                <span>{email.subject || '(Aviso sin asunto)'}</span>
+              </label>
+            ))}
+            <button
+              type="button"
+              className="w-full rounded-lg border px-3 py-2 text-sm hover:bg-[color:var(--surface-2)] disabled:cursor-not-allowed disabled:opacity-60"
+              onClick={handleExtractSelected}
+              disabled={
+                extracting ||
+                loading ||
+                saving ||
+                !appCheckConfigured ||
+                !emails.some((email) => email.selected)
+              }
+            >
+              {extracting ? 'Extrayendo movimientos…' : 'Extraer avisos seleccionados con Gemini'}
+            </button>
+          </div>
         )}
 
         {candidates.length > 0 && (
