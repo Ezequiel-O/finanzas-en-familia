@@ -1144,6 +1144,7 @@ export default function App() {
                   }}
                   actions={actions}
                   activeUser={activeUser}
+                  householdId={selectedHid}
                   monthKeyStr={selectedMonth}
                   budgetCutDay={data.budgetCutDay}
                 />

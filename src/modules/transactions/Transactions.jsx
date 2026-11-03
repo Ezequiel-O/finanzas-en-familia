@@ -22,6 +22,7 @@ import { Card } from '../../components/ui/Card.jsx';
 import { SectionTitle } from '../../components/ui/SectionTitle.jsx';
 import { Money } from '../../components/ui/Money.jsx';
 import { CATEGORIES, DEBT_CATEGORY, SAVINGS_CATEGORY } from '../../constants.js';
+import { GmailImportModal } from '../../features/transactions/GmailImportModal.jsx';
 
 // SheetJS (~400 KB) y fflate solo se descargan al exportar o importar Excel.
 let XLSX = null;
@@ -39,6 +40,7 @@ export function Transactions({
   data,
   actions,
   activeUser,
+  householdId,
   monthKeyStr,
   budgetCutDay,
 }) {
@@ -98,6 +100,7 @@ export function Transactions({
   const [amountEditedByUser, setAmountEditedByUser] = useState(false);
   const [ownerUserId, setOwnerUserId] = useState('');
   const [showExcelModal, setShowExcelModal] = useState(false);
+  const [showGmailModal, setShowGmailModal] = useState(false);
   const [infoTx, setInfoTx] = useState(null);
   const [showFiltersModal, setShowFiltersModal] = useState(false);
   const [isDraggingFile, setIsDraggingFile] = useState(false);
@@ -3978,6 +3981,16 @@ export function Transactions({
                 <path d="M14.5 14.5l-5-5" />
               </svg>
             </button>
+            <button
+              type="button"
+              className="h-8 rounded-lg border border-[color:var(--success)]/30 bg-[color:var(--success)]/15 px-2 text-xs font-medium text-[color:var(--success)] transition hover:border-[color:var(--success)]/40 hover:bg-[color:var(--success)]/20 disabled:cursor-not-allowed disabled:opacity-50"
+              onClick={() => setShowGmailModal(true)}
+              disabled={!canImport || !householdId}
+              data-tooltip="Leer avisos de BancoEstado"
+              aria-label="Leer avisos de BancoEstado"
+            >
+              Gmail
+            </button>
           </div>
           <span className="text-xs text-[color:var(--text-muted)]">
             {filtered.length} movimiento{filtered.length === 1 ? '' : 's'}
@@ -4656,6 +4669,17 @@ export function Transactions({
             </div>
           </div>
         </div>
+      )}
+
+      {showGmailModal && (
+        <GmailImportModal
+          onClose={() => setShowGmailModal(false)}
+          householdId={householdId}
+          activeUser={activeUser}
+          categories={categories}
+          householdUsers={usersList}
+          addTransaction={addTransaction}
+        />
       )}
 
       {/* Modal ingreso/gasto */}
@@ -5344,8 +5368,6 @@ export function Transactions({
     </div>
   );
 }
-
-
 
 
 

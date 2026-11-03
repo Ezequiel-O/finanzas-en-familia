@@ -33,6 +33,31 @@ npm run build
 
 Requiere Node 22.
 
+### Importar avisos de BancoEstado desde Gmail
+
+En **Movimientos → Gmail**, la app puede buscar los 100 avisos más recientes de
+`notificaciones@correo.bancoestado.cl` y `noreply@correo.bancoestado.cl`. El
+análisis de monto, fecha y tipo se hace localmente en el navegador; revisa y
+confirma cada propuesta antes de guardarla. No se envían correos a una IA y el
+ID de Gmail se conserva en el movimiento únicamente para evitar duplicados.
+
+Para habilitarlo:
+
+1. En Google Cloud Console, habilita Gmail API y crea un cliente OAuth de tipo
+   **Aplicación web**. Agrega los orígenes autorizados de desarrollo y producción.
+2. Configura la pantalla de consentimiento y agrega el alcance
+   `https://www.googleapis.com/auth/gmail.readonly`.
+3. Agrega el ID del cliente a `.env.local` como
+   `VITE_GOOGLE_OAUTH_CLIENT_ID=...` y reinicia Vite.
+4. Publica el cambio de Content Security Policy incluido en `firebase.json`.
+
+Google solicita permiso de lectura del buzón, aunque esta función consulta solo
+los dos remitentes anteriores. No se guardan tokens ni cuerpos de correo. Google
+puede exigir verificación OAuth para publicar la aplicación con ese alcance.
+Solo se importan automáticamente avisos con monto y fecha reconocibles; revisa
+también el tipo y la categoría antes de confirmar. La función consulta hasta los
+100 avisos más recientes por búsqueda.
+
 ## Estructura
 
 ```
