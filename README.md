@@ -48,9 +48,12 @@ Para habilitarlo:
 1. En Firebase Console → AI Services → AI Logic, configura Gemini Developer API.
    El SDK `firebase` ya está instalado; no hace falta volver a instalarlo ni
    copiar una clave de Gemini al frontend.
-2. Registra la app web en Firebase App Check con reCAPTCHA v3 y configura los
-   dominios autorizados. Agrega la clave de sitio pública a `.env.local` como
-   `VITE_FIREBASE_APP_CHECK_SITE_KEY=...`.
+2. En Google Cloud Console → Fraud Defense (reCAPTCHA Enterprise), crea una
+   clave de tipo **Sitio web** con los dominios de la app (incluido `localhost`
+   para desarrollo). Registra la app web en Firebase App Check con el proveedor
+   **Fraud Defense** usando esa clave. Agrega la clave (ID de clave, pública) a
+   `.env.local` como `VITE_FIREBASE_APP_CHECK_SITE_KEY=...`. reCAPTCHA Classic
+   (v3) está obsoleto y no es compatible con el código actual.
 3. En Google Cloud Console, habilita Gmail API y crea un cliente OAuth de tipo
    **Aplicación web**. Agrega los orígenes autorizados de desarrollo y producción.
 4. Configura la pantalla de consentimiento y agrega el alcance

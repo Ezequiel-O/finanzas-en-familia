@@ -1,7 +1,10 @@
 import { initializeApp, getApps, getApp } from 'firebase/app';
 import { getAuth } from 'firebase/auth';
 import { getFirestore } from 'firebase/firestore';
-import { initializeAppCheck, ReCaptchaV3Provider } from 'firebase/app-check';
+import {
+  initializeAppCheck,
+  ReCaptchaEnterpriseProvider,
+} from 'firebase/app-check';
 
 // For Firebase JS SDK v7.20.0 and later, measurementId is optional
 const firebaseConfig = {
@@ -26,7 +29,9 @@ export const db = getFirestore(app);
 export const appCheckConfigured = !!appCheckSiteKey;
 export const appCheck = appCheckConfigured
   ? initializeAppCheck(app, {
-      provider: new ReCaptchaV3Provider(appCheckSiteKey),
+      // reCAPTCHA Classic (v3) está obsoleto en App Check; se usa
+      // Fraud Defense (reCAPTCHA Enterprise).
+      provider: new ReCaptchaEnterpriseProvider(appCheckSiteKey),
       isTokenAutoRefreshEnabled: true,
     })
   : null;
