@@ -1140,6 +1140,7 @@ export default function App() {
                         budgetCutDay: data.budgetCutDay,
                         debts: data.debts,
                         savings: data.savings,
+                        expectedIncome: data.expectedIncome,
                       }}
                       actions={actions}
                       activeUser={activeUser}

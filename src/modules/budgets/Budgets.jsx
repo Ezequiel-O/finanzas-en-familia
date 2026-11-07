@@ -1,5 +1,5 @@
 import { plannedForSavingPeriod } from '../../domain/commitments.js';
-import { categorySpent, isAdjustment, txDateKey } from '../../domain/ledger.js';
+import { categorySpent, isAdjustment, periodLedger, txDateKey } from '../../domain/ledger.js';
 import { PeriodOutlook } from '../../features/plan/PeriodOutlook.jsx';
 import { DueDayInput } from '../../components/ui/DueDayInput.jsx';
 import { dueDayKey } from '../../domain/paymentPlan.js';
@@ -308,6 +308,7 @@ export function Budgets({ data, actions, activeUser = null, monthKeyStr, beforeC
     budgetCutDay = 1,
     debts = [],
     savings = [],
+    expectedIncome = 0,
   } = data || {};
 
   const baseCats = categories && categories.length ? categories : CATEGORIES;
@@ -318,6 +319,16 @@ export function Budgets({ data, actions, activeUser = null, monthKeyStr, beforeC
   const cutDay = budgetCutDay;
 
   const debtsArray = Array.isArray(debts) ? debts : [];
+  const ledger = useMemo(
+    () =>
+      periodLedger({
+        transactions,
+        periodKey: mk,
+        cutDay,
+        debts: Array.isArray(debts) ? debts : [],
+      }),
+    [transactions, mk, cutDay, debts],
+  );
   const savingsArray = Array.isArray(savings) ? savings : [];
   const monthTx = useMemo(
     () =>
@@ -1328,9 +1339,95 @@ export function Budgets({ data, actions, activeUser = null, monthKeyStr, beforeC
     setEditBreakdownByCat((prev) => ({ ...prev, [cat]: {} }));
   }
 
+  // --- NÚMEROS DEL PRESUPUESTO (libro único, base caja) ---
+  // saldo final = saldo anterior + ingresos + reembolsos + retiros de ahorro
+  //               − consumo − cuotas − aportes ± ajustes. Traspasos no cuentan.
+  const ingresosPeriodo = ledger.income;
+  const ingresoEsperado = Number(expectedIncome || 0);
+  // Para planificar se usa el ingreso esperado mientras no haya llegado todo.
+  const ingresoBase = Math.max(ingresoEsperado, ingresosPeriodo);
+  // Salidas reales: consumo + suscripciones + cuotas + aportes, menos reembolsos.
+  const gastosPeriodo = ledger.outflows - ledger.refunds;
+  const totalFunded = rows.reduce((a, r) => a + r.funded, 0);
+  const restanteSinAsignar = ledger.opening + ingresoBase + ledger.savingWithdrawals - totalFunded;
+  const presupuestoMenosGastado = totalFunded - gastosPeriodo;
+  const pctBudgetUsed = totalFunded > 0 ? (gastosPeriodo / totalFunded) * 100 : 0;
+  const overspentCategoryList = rows
+    .filter((r) => {
+      if (r.spent > r.funded && r.spent > 0) return true;
+      return Number(unassignedSpentByCategory[r.c] || 0) > 0;
+    })
+    .map((r) => r.c);
+
   return (
     <>
       <div className="grid gap-4">
+      {totalFunded > 0 && (
+        <Card>
+          <SectionTitle>Números del presupuesto</SectionTitle>
+          <p className="-mt-1 text-sm text-[color:var(--text-muted)]">
+            Te quedan{' '}
+            <strong className={presupuestoMenosGastado < 0 ? 'text-[color:var(--danger)]' : 'text-[color:var(--text)]'}>
+              <Money n={presupuestoMenosGastado} />
+            </strong>{' '}
+            de <Money n={totalFunded} /> presupuestados · llevas el {Math.round(pctBudgetUsed)}% gastado.
+          </p>
+          <div className="mt-2">
+            <Progress value={Math.min(100, pctBudgetUsed)} mode="flat" danger={pctBudgetUsed > 100} />
+          </div>
+          <div className="mt-3 grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
+            <div className="rounded-xl bg-[color:var(--surface-2)] p-3">
+              <div className="text-[11px] uppercase text-[color:var(--text-muted)]">Disponible</div>
+              <div className={`text-xl font-bold ${ledger.closing < 0 ? 'text-[color:var(--danger)]' : ''}`}>
+                <Money n={ledger.closing} />
+              </div>
+              <div className="text-[11px] text-[color:var(--text-faint)]">
+                Saldo del hogar (incluye lo que sobró antes)
+              </div>
+            </div>
+            <div className="rounded-xl bg-[color:var(--surface-2)] p-3">
+              <div className="text-[11px] uppercase text-[color:var(--text-muted)]">Presupuesto</div>
+              <div className="text-xl font-bold">
+                <Money n={totalFunded} />
+              </div>
+              <div className="text-[11px] text-[color:var(--text-faint)]">
+                Ingreso {ingresoEsperado > ingresosPeriodo ? 'esperado' : 'recibido'} <Money n={ingresoBase} />
+              </div>
+            </div>
+            <div className="rounded-xl bg-[color:var(--surface-2)] p-3">
+              <div className="text-[11px] uppercase text-[color:var(--text-muted)]">Sin asignar</div>
+              <div className={`text-xl font-bold ${restanteSinAsignar < 0 ? 'text-[color:var(--danger)]' : ''}`}>
+                <Money n={restanteSinAsignar} />
+              </div>
+              <div className="text-[11px] text-[color:var(--text-faint)]">
+                Saldo anterior + ingreso − presupuesto
+              </div>
+            </div>
+            <div className="rounded-xl bg-[color:var(--surface-2)] p-3 text-xs text-[color:var(--text-muted)]">
+              <div className="text-[11px] uppercase">Gastos del periodo</div>
+              <div className="mt-1 flex justify-between gap-2">
+                <span>Gastado hasta ahora</span>
+                <strong className="text-[color:var(--text)]">
+                  <Money n={gastosPeriodo} />
+                </strong>
+              </div>
+              <div className="flex justify-between gap-2">
+                <span>Presupuesto − gastado</span>
+                <strong className={presupuestoMenosGastado < 0 ? 'text-[color:var(--danger)]' : 'text-[color:var(--text)]'}>
+                  <Money n={presupuestoMenosGastado} />
+                </strong>
+              </div>
+            </div>
+          </div>
+          {overspentCategoryList.length > 0 && (
+            <div className="mt-3 rounded-lg border border-[color:var(--warning)]/40 bg-[color:var(--warning)]/10 px-3 py-2 text-xs text-[color:var(--warning)]">
+              <span className="font-semibold">Superan su presupuesto o tienen gastos no presupuestados:</span>{' '}
+              {overspentCategoryList.join(', ')}.
+            </div>
+          )}
+        </Card>
+      )}
+
       {/* Sin presupuesto en el periodo: ofrece copiar el del periodo anterior. */}
       {spendFunded <= 0 && (
         <PeriodOutlook

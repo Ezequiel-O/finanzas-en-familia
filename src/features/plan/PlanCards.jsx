@@ -186,6 +186,30 @@ function SpendCheck({ summary, categories }) {
   );
 }
 
+// Cifras exactas de las reglas, siempre visibles junto al texto de Gemini.
+function TodayNumbers({ summary }) {
+  const items = [
+    { label: 'Puedes gastar hoy', value: summary.safeToday, tone: summary.level },
+    summary.level === 'red'
+      ? { label: `Te faltan el ${formatShortDate(summary.shortDate)}`, value: summary.shortfall, tone: 'red' }
+      : null,
+    { label: 'Fuera del presupuesto', value: Math.max(0, summary.margin), tone: summary.monthLevel },
+    { label: 'Plata hoy', value: summary.cash },
+  ].filter(Boolean);
+  return (
+    <div className="mt-3 grid grid-cols-2 gap-2 sm:grid-cols-4">
+      {items.map((item) => (
+        <div key={item.label} className="rounded-xl bg-[color:var(--surface-1)]/70 px-3 py-2">
+          <div className="text-[11px] text-[color:var(--text-muted)]">{item.label}</div>
+          <div className={`text-base font-bold ${item.tone ? TEXT_TONE[item.tone] : ''}`}>
+            <Money n={item.value} />
+          </div>
+        </div>
+      ))}
+    </div>
+  );
+}
+
 // Tarjeta 1 – "Hoy".
 export function TodayCard({ summary, advice }) {
   const tight = summary.tightest;
@@ -205,6 +229,7 @@ export function TodayCard({ summary, advice }) {
               ))}
             </ul>
           )}
+          <TodayNumbers summary={summary} />
         </>
       ) : summary.level === 'red' ? (
         <>
