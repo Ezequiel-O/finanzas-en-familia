@@ -384,7 +384,9 @@ export function PlanScreen({ data, budgetsTable, commitments, closing, advise })
   const summary = useSafeSpend(data);
   const advice = usePlanAdvice(summary, advise);
   return (
-    <div className="grid gap-4">
+    // grid-cols-1 (= minmax(0, 1fr)): las tablas anchas hacen scroll dentro de su
+    // tarjeta en vez de ensanchar la columna más allá de la pantalla del teléfono.
+    <div className="grid grid-cols-1 gap-4">
       <TodayCard summary={summary} advice={advice} />
       <PayScheduleCard summary={summary} />
       <MonthEndCard summary={summary} advice={advice} />

@@ -1361,7 +1361,7 @@ export function Budgets({ data, actions, activeUser = null, monthKeyStr, beforeC
 
   return (
     <>
-      <div className="grid gap-4">
+      <div className="grid grid-cols-1 gap-4">
       {totalFunded > 0 && (
         <Card>
           <SectionTitle>Números del presupuesto</SectionTitle>
