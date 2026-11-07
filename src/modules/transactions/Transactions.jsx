@@ -1,9 +1,15 @@
 // src/modules/transactions/Transactions.jsx
-import { isAdjustment, periodBalances, periodLedger, txDateKey } from '../../domain/ledger.js';
+import {
+  isAdjustment,
+  periodBalances,
+  periodLedger,
+  TRANSFER_CATEGORY,
+  txDateKey,
+} from '../../domain/ledger.js';
 import { extractDebtQuotaIds, plannedForSavingPeriod } from '../../domain/commitments.js';
 import { toast, confirmDialog } from '../../components/feedback/feedback.js';
 import { confirmWithinCash } from '../../features/cash/confirmWithinCash.js';
-import { todayKey, toLocalDateKey } from '../../domain/dates.js';
+import { formatShortDate, todayKey, toLocalDateKey } from '../../domain/dates.js';
 import React, { useState, useMemo, useEffect, useRef } from 'react';
 import {
   monthKey,
@@ -1149,6 +1155,8 @@ export function Transactions({
 
   function isDefaultUnbudgetedTx(tx) {
     if (!tx || tx.type !== 'gasto') return false;
+    // Un traspaso (entre miembros o entre cuentas) solo cambia la plata de bolsillo.
+    if (tx.meta?.kind === 'transfer' || tx.category === TRANSFER_CATEGORY) return false;
     const label = getSubcategoryLabel(tx);
     if (label && label.trim().toLowerCase() === DEFAULT_UNBUDGETED_KEY) {
       return true;
@@ -4060,10 +4068,10 @@ export function Transactions({
               <table className="min-w-full text-sm">
                 <thead>
                   <tr className="border-b text-xs text-[color:var(--text-muted)]">
-                    <th className="px-2 py-2 text-left">Subgasto</th>
-                    <th className="px-2 py-2 text-right">Editar</th>
-                    <th className="px-2 py-2 text-right">Eliminar</th>
-                    <th className="px-2 py-2 text-right">Info</th>
+                    <th className="px-2 py-2 text-left">Movimiento</th>
+                    <th className="px-1 py-2 text-right" colSpan={3}>
+                      <span className="sr-only">Acciones</span>
+                    </th>
                   </tr>
                 </thead>
                 <tbody>
@@ -4073,24 +4081,48 @@ export function Transactions({
                     const displaySubcategory = isDefaultUnbudgeted
                       ? DEFAULT_UNBUDGETED_LABEL
                       : subcategoryLabel;
+                    const isTransferTx =
+                      tx.meta?.kind === 'transfer' || tx.category === TRANSFER_CATEGORY;
+                    const amountTone = isDefaultUnbudgeted
+                      ? 'text-[color:var(--danger)]'
+                      : tx.type === 'ingreso'
+                      ? 'text-[color:var(--success)]'
+                      : isTransferTx
+                      ? 'text-[color:var(--text-muted)]'
+                      : '';
+                    const details = [
+                      formatShortDate(txDateKey(tx)),
+                      tx.category || (tx.type === 'ingreso' ? 'Ingreso' : ''),
+                      txAccountLabel(tx),
+                    ].filter(Boolean);
                     return (
                       <tr key={tx.id} className="border-b last:border-0">
                         <td className="px-2 py-2 align-top">
-                          {displaySubcategory ? (
-                            <span
-                              className={
+                          <div className="font-medium leading-snug [overflow-wrap:anywhere]">
+                            {tx.description || tx.category || 'Sin descripción'}
+                          </div>
+                          <div className="mt-0.5 flex items-baseline justify-between gap-2">
+                            <span className="min-w-0 text-[11px] leading-snug text-[color:var(--text-muted)]">
+                              {details.join(' · ')}
+                            </span>
+                            <span className={`shrink-0 font-semibold ${amountTone}`}>
+                              {tx.type === 'ingreso' ? '+' : isTransferTx ? '' : '−'}
+                              <Money n={tx.amount} />
+                            </span>
+                          </div>
+                          {displaySubcategory && (
+                            <div
+                              className={`text-[11px] leading-snug ${
                                 isDefaultUnbudgeted
-                                  ? 'text-[color:var(--danger)] font-semibold'
-                                  : ''
-                              }
+                                  ? 'font-semibold text-[color:var(--danger)]'
+                                  : 'text-[color:var(--text-faint)]'
+                              }`}
                             >
                               {displaySubcategory}
-                            </span>
-                          ) : (
-                            <span className="text-[color:var(--text-faint)]">-</span>
+                            </div>
                           )}
                         </td>
-                        <td className="px-2 py-2 align-top text-right">
+                        <td className="px-0.5 py-2 align-top text-right">
                           {updateTransaction ? (
                             <button
                               className="inline-flex h-7 w-7 items-center justify-center rounded-md border border-[color:var(--divider)] text-[color:var(--text-muted)] hover:text-[color:var(--text)]"
@@ -4114,7 +4146,7 @@ export function Transactions({
                             <span className="text-[color:var(--text-faint)]">-</span>
                           )}
                         </td>
-                        <td className="px-2 py-2 align-top text-right">
+                        <td className="px-0.5 py-2 align-top text-right">
                           {removeTransaction ? (
                             <button
                               className="inline-flex h-7 w-7 items-center justify-center rounded-md border border-[color:var(--divider)] text-[color:var(--text-muted)] hover:text-[color:var(--text)]"
@@ -4144,7 +4176,7 @@ export function Transactions({
                             <span className="text-[color:var(--text-faint)]">-</span>
                           )}
                         </td>
-                        <td className="px-2 py-2 align-top text-right">
+                        <td className="px-0.5 py-2 align-top text-right">
                           <button
                             className="inline-flex h-7 w-7 items-center justify-center rounded-md border border-[color:var(--divider)] text-[color:var(--text-muted)] hover:text-[color:var(--text)]"
                             aria-label="Ver detalle del movimiento"
