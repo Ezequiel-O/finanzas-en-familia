@@ -23,6 +23,7 @@ import { SectionTitle } from '../../components/ui/SectionTitle.jsx';
 import { Money } from '../../components/ui/Money.jsx';
 import { CATEGORIES, DEBT_CATEGORY, SAVINGS_CATEGORY } from '../../constants.js';
 import { GmailImportModal } from '../../features/transactions/GmailImportModal.jsx';
+import { subscribePendingBankInbox } from '../../lib/bankInbox.js';
 
 // SheetJS (~400 KB) y fflate solo se descargan al exportar o importar Excel.
 let XLSX = null;
@@ -101,6 +102,7 @@ export function Transactions({
   const [ownerUserId, setOwnerUserId] = useState('');
   const [showExcelModal, setShowExcelModal] = useState(false);
   const [showGmailModal, setShowGmailModal] = useState(false);
+  const [bankInboxItems, setBankInboxItems] = useState([]);
   const [infoTx, setInfoTx] = useState(null);
   const [showFiltersModal, setShowFiltersModal] = useState(false);
   const [isDraggingFile, setIsDraggingFile] = useState(false);
@@ -108,6 +110,25 @@ export function Transactions({
   const [importError, setImportError] = useState('');
   const fileInputRef = useRef(null);
   const [contextMenu, setContextMenu] = useState(null);
+
+  // Avisos bancarios que llegaron solos y esperan que el usuario decida dónde cargarlos.
+  useEffect(() => {
+    if (!householdId) return undefined;
+    const unsubscribe = subscribePendingBankInbox(
+      householdId,
+      setBankInboxItems,
+      (inboxError) => {
+        console.error('No se pudo leer la bandeja de avisos bancarios:', {
+          code: inboxError?.code || 'unknown',
+        });
+        setBankInboxItems([]);
+      },
+    );
+    return () => {
+      unsubscribe();
+      setBankInboxItems([]);
+    };
+  }, [householdId]);
   const [showDateRangePicker, setShowDateRangePicker] = useState(false);
   const [draftFromDate, setDraftFromDate] = useState('');
   const [draftToDate, setDraftToDate] = useState('');
@@ -3953,6 +3974,21 @@ export function Transactions({
       </Card>
       </div>
 
+      {bankInboxItems.length > 0 && canImport && (
+        <button
+          type="button"
+          className="flex w-full items-center justify-between gap-3 rounded-xl border border-[color:var(--success)]/30 bg-[color:var(--success)]/15 px-4 py-3 text-left text-sm text-[color:var(--success)] transition hover:bg-[color:var(--success)]/20"
+          onClick={() => setShowGmailModal(true)}
+        >
+          <span>
+            {bankInboxItems.length === 1
+              ? 'Llegó 1 aviso del banco. ¿Dónde lo cargamos?'
+              : `Llegaron ${bankInboxItems.length} avisos del banco. ¿Dónde los cargamos?`}
+          </span>
+          <span className="shrink-0 font-medium">Revisar</span>
+        </button>
+      )}
+
       {/* Tabla de movimientos */}
       <Card>
         <div className="flex justify-between items-center mb-3">
@@ -3986,10 +4022,14 @@ export function Transactions({
               className="h-8 rounded-lg border border-[color:var(--success)]/30 bg-[color:var(--success)]/15 px-2 text-xs font-medium text-[color:var(--success)] transition hover:border-[color:var(--success)]/40 hover:bg-[color:var(--success)]/20 disabled:cursor-not-allowed disabled:opacity-50"
               onClick={() => setShowGmailModal(true)}
               disabled={!canImport || !householdId}
-              data-tooltip="Leer avisos de BancoEstado"
-              aria-label="Leer avisos de BancoEstado"
+              data-tooltip="Avisos de BancoEstado"
+              aria-label={
+                bankInboxItems.length
+                  ? `Avisos de BancoEstado: ${bankInboxItems.length} por revisar`
+                  : 'Avisos de BancoEstado'
+              }
             >
-              Gmail
+              Gmail{bankInboxItems.length ? ` · ${bankInboxItems.length}` : ''}
             </button>
           </div>
           <span className="text-xs text-[color:var(--text-muted)]">
@@ -4679,6 +4719,7 @@ export function Transactions({
           categories={categories}
           householdUsers={usersList}
           addTransaction={addTransaction}
+          inboxItems={bankInboxItems}
         />
       )}
 

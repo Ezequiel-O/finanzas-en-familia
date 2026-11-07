@@ -120,4 +120,65 @@ Producto: CuentaRUT`,
       }),
     ).toThrow('no coinciden');
   });
+
+  it('accepts amounts in tables and dates written in words or taken from reception', () => {
+    const fare = {
+      subject: 'Notificación de cobro pasaje',
+      body: 'Se realizó un cobro de pasaje\nMonto\n$1.790\nTarjeta CuentaRUT',
+      receivedAt: '2026-11-05T09:45:00.000Z',
+    };
+    expect(
+      validateAiBankEmailMovement(fare, {
+        hasMovement: true,
+        type: 'gasto',
+        amount: 1790,
+        date: '2026-11-05',
+        description: 'Pasaje Red',
+      }),
+    ).toMatchObject({ amount: 1790, date: '2026-11-05', description: 'Pasaje Red' });
+
+    const purchase = {
+      body: 'Compra en UNIMARC SAN JOAQUIN por $12.290,00 el 7 de noviembre de 2026',
+    };
+    expect(
+      validateAiBankEmailMovement(purchase, {
+        hasMovement: true,
+        type: 'gasto',
+        amount: 12290,
+        date: '2026-11-07',
+        description: 'Compra UNIMARC SAN JOAQUIN',
+      }),
+    ).toMatchObject({ amount: 12290, date: '2026-11-07' });
+    expect(() =>
+      validateAiBankEmailMovement(purchase, {
+        hasMovement: true,
+        type: 'gasto',
+        amount: 12290,
+        date: '2026-11-06',
+        description: 'Compra',
+      }),
+    ).toThrow('no coinciden');
+  });
+
+  it('names the transfer recipient without sending it to AI', () => {
+    const email = {
+      subject: 'Aviso de envío o recepción de dinero',
+      body: `Monto transferido: $20.000
+Fecha y Hora de TEF : 04/11/2026 21:50:10
+Hacia:
+Nombre : Fulana Pérez
+Banco : Banco Santander
+N° de cuenta : 74930000`,
+    };
+    expect(sanitizeBankEmailForAI(email)).not.toContain('Fulana');
+    expect(
+      validateAiBankEmailMovement(email, {
+        hasMovement: true,
+        type: 'gasto',
+        amount: 20000,
+        date: '2026-11-04',
+        description: 'Transferencia Electronica a tercero',
+      }).description,
+    ).toBe('Transferencia a Fulana Pérez');
+  });
 });

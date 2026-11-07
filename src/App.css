@@ -104,7 +104,86 @@
 
 .ai-panel {
   transform-origin: bottom right;
-  animation: ai-panel-in 200ms ease-out;
+  animation: ai-sheet-in 220ms ease-out;
+}
+
+@media (min-width: 768px) {
+  .ai-panel {
+    animation: ai-panel-in 200ms ease-out;
+  }
+}
+
+/* Panel translúcido: deja ver la app detrás, difuminada. Las burbujas quedan
+   casi opacas para que el texto se lea bien sobre cualquier fondo. */
+.ai-glass {
+  background: color-mix(in srgb, var(--surface-1) 72%, transparent);
+  -webkit-backdrop-filter: blur(20px) saturate(160%);
+  backdrop-filter: blur(20px) saturate(160%);
+  box-shadow: 0 18px 48px rgba(2, 6, 23, 0.22);
+}
+
+.ai-bubble {
+  background: color-mix(in srgb, var(--surface-2) 88%, transparent);
+}
+
+@supports not ((backdrop-filter: blur(1px)) or (-webkit-backdrop-filter: blur(1px))) {
+  .ai-glass {
+    background: var(--surface-1);
+  }
+}
+
+@media (prefers-reduced-transparency: reduce) {
+  .ai-glass {
+    background: var(--surface-1);
+    -webkit-backdrop-filter: none;
+    backdrop-filter: none;
+  }
+}
+
+@keyframes ai-sheet-in {
+  from {
+    transform: translateY(100%);
+  }
+  to {
+    transform: translateY(0);
+  }
+}
+
+.ai-typing span {
+  width: 6px;
+  height: 6px;
+  border-radius: 999px;
+  background: var(--text-muted);
+  animation: ai-typing 1s ease-in-out infinite;
+}
+
+.ai-typing span:nth-child(2) {
+  animation-delay: 150ms;
+}
+
+.ai-typing span:nth-child(3) {
+  animation-delay: 300ms;
+}
+
+@keyframes ai-typing {
+  0%,
+  60%,
+  100% {
+    opacity: 0.3;
+    transform: translateY(0);
+  }
+  30% {
+    opacity: 1;
+    transform: translateY(-3px);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .ai-fab,
+  .ai-panel,
+  .ai-typing span {
+    animation: none;
+  }
 }
 
 @keyframes ai-fab-in {

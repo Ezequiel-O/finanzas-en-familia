@@ -61,6 +61,59 @@ Para habilitarlo:
 6. Reconstruye y publica la app para aplicar las variables y Content Security
    Policy de `firebase.json`.
 
+### Recepción automática de avisos
+
+Con esto, los avisos de BancoEstado llegan solos a **Movimientos**, que muestra
+“Llegaron N avisos del banco. ¿Dónde los cargamos?”. Al abrir la bandeja,
+Gemini propone tipo, monto y categoría, y tú confirmas, cambias o descartas
+cada uno. Nada se guarda sin tu confirmación.
+
+```
+Gmail (tu cuenta) ──Apps Script cada 10 min──▶ Cloud Function ingestBankEmail
+                                                  │ valida clave y remitente,
+                                                  │ oculta RUT/cuentas/correos
+                                                  ▼
+                              households/{hid}/bankInbox (pendiente)
+                                                  ▼
+                              la app pregunta → movimiento confirmado
+```
+
+- El Apps Script corre en la cuenta de Google de cada miembro, con permiso
+  **solo de lectura** de Gmail. La app nunca recibe tokens de Gmail.
+- Cada miembro tiene su propia clave. Firestore guarda solo su hash SHA-256 y
+  se puede revocar o regenerar desde la app.
+- El aviso se guarda sin nombres, RUT, correos ni números de cuenta. Al
+  confirmarlo o descartarlo se borran el asunto y el cuerpo, y queda solo el ID
+  para no repetirlo. Los pendientes vencen a los 30 días (`expiresAt`).
+- Si el correo no pasa DKIM de `bancoestado.cl`, la app lo marca como no
+  verificado antes de que lo confirmes.
+
+Para habilitarlo (requiere plan Blaze):
+
+1. Despliega la función y las reglas:
+   ```bash
+   cd functions-inbox && npm install && cd ..
+   firebase deploy --only functions:inbox,firestore:rules
+   ```
+   Usa `functions:inbox`. La carpeta `functions/` es código antiguo con un job
+   que **borra hogares inactivos**, y no debe desplegarse.
+2. En Google Cloud Console → Firestore → TTL, crea una política sobre el campo
+   `expiresAt` del grupo de colecciones `bankInbox`.
+3. En la app: **Movimientos → Gmail → Recepción automática → Generar clave de
+   conexión**. Copia `FF_ENDPOINT` y `FF_TOKEN`. La clave se muestra una sola vez.
+   Si la función no está en `us-central1`, define `VITE_BANK_INBOX_URL`.
+4. En [script.google.com](https://script.google.com) crea un proyecto nuevo con
+   la misma cuenta de Gmail que recibe los avisos:
+   - Pega `scripts/apps-script/avisos-bancoestado.gs` en `Código.gs`.
+   - En Configuración del proyecto, activa “Mostrar el archivo de manifiesto
+     appsscript.json” y reemplázalo por `scripts/apps-script/appsscript.json`.
+   - En Configuración del proyecto → Propiedades del script, agrega
+     `FF_ENDPOINT` y `FF_TOKEN`.
+   - Ejecuta `instalarActivador` una vez y acepta los permisos.
+
+Para desconectar, ejecuta `desinstalarActivador` en el script y pulsa
+**Desconectar** en la app.
+
 El botón flotante con el logo abre el asistente Gemini. Las consultas de texto
 reciben contexto agregado del periodo y presupuestos cargados, sin nombres ni
 descripciones individuales. Para crear/editar/eliminar movimientos y asignar
@@ -86,7 +139,8 @@ src/
   hooks/         useHouseholdData: suscripciones y escrituras a Firestore.
   components/    UI compartida, avisos (toasts / confirmación) y navegación.
   navigation/    Pestañas sincronizadas con la URL (#inicio, #plan, …).
-functions/       Cloud Functions (invitaciones, inactividad, correos).
+functions/       Cloud Functions antiguas (invitaciones, inactividad). No desplegar.
+functions-inbox/ Cloud Function ingestBankEmail (codebase "inbox").
 scripts/         Migraciones con firebase-admin (dry-run por defecto).
 ```
 

@@ -234,9 +234,36 @@ service cloud.firestore {
       allow delete: if false;
     }
 
+    // Avisos bancarios que llegan solos: solo la Cloud Function ingestBankEmail los crea.
+    // Un miembro solo puede resolverlos una vez, borrando el asunto y el cuerpo.
+    match /households/{hid}/bankInbox/{messageId} {
+      allow read: if isMember(hid);
+      allow update: if isMember(hid) &&
+        resource.data.status == 'pending' &&
+        request.resource.data.status in ['imported', 'dismissed'] &&
+        request.resource.data.resolvedBy == request.auth.uid &&
+        request.resource.data.resolvedAt == request.time &&
+        !('subject' in request.resource.data) &&
+        !('body' in request.resource.data) &&
+        request.resource.data.diff(resource.data).affectedKeys()
+          .hasOnly(['status', 'resolvedBy', 'resolvedAt', 'subject', 'body']);
+      allow create, delete: if false;
+    }
+
+    // Hash de la clave con la que el Apps Script de cada miembro envía avisos.
+    match /households/{hid}/bankInboxTokens/{uid} {
+      allow read, delete: if isMember(hid) && request.auth.uid == uid;
+      allow create, update: if isMember(hid) && request.auth.uid == uid &&
+        request.resource.data.keys().hasOnly(['tokenHash', 'createdAt']) &&
+        request.resource.data.tokenHash is string &&
+        request.resource.data.tokenHash.matches('^[a-f0-9]{64}$') &&
+        request.resource.data.createdAt == request.time;
+    }
+
     match /households/{hid}/{col}/{doc} {
       allow read, write: if isMember(hid) &&
-        !(col in ['invites', 'joinRequests', 'transactions', 'auditLog', 'closings']);
+        !(col in ['invites', 'joinRequests', 'transactions', 'auditLog', 'closings',
+          'bankInbox', 'bankInboxTokens']);
     }
   }
 }

@@ -1,10 +1,7 @@
-import { getApp } from 'firebase/app';
-import { getAI, getGenerativeModel, GoogleAIBackend } from 'firebase/ai';
 import { categoryBudgetStatus } from '../domain/budgetHealth.js';
 import { periodLedger } from '../domain/ledger.js';
 import { appCheckConfigured } from '../firebase.js';
-
-const MODEL_NAME = 'gemini-3.7-flash';
+import { GEMINI_MODEL, generateWithRetry } from './generate.js';
 
 export function createAssistantContext({
   periodKey,
@@ -67,9 +64,8 @@ export async function askFinancialAssistant({
     );
   }
 
-  const ai = getAI(getApp(), { backend: new GoogleAIBackend() });
-  const model = getGenerativeModel(ai, {
-    model: MODEL_NAME,
+  const modelParams = {
+    model: GEMINI_MODEL,
     systemInstruction: [
       'Eres el asistente de Finanzas en Familia. Habla en español claro y breve, en pesos chilenos.',
       'Ayuda a entender presupuestos, gastos, ingresos, ahorro y el uso de la aplicación.',
@@ -79,7 +75,7 @@ export async function askFinancialAssistant({
       'No ejecutas cambios ni operaciones: para registrar movimientos, ofrece instrucciones. Las acciones de la app requieren revisión y confirmación explícitas.',
       'No des asesoría financiera, legal ni tributaria profesional; presenta sugerencias generales y prudentes.',
     ].join(' '),
-  });
+  };
   const context = createAssistantContext({
     periodKey,
     transactions,
@@ -102,7 +98,7 @@ export async function askFinancialAssistant({
       ],
     },
   ];
-  const result = await model.generateContent({ contents });
+  const result = await generateWithRetry(modelParams, { contents });
   const answer = String(result.response.text() || '').trim();
   if (!answer) throw new Error('El asistente no devolvió una respuesta.');
   return answer;

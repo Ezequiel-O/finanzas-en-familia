@@ -20,6 +20,7 @@ export default defineConfig({
   },
   test: {
     environment: 'node',
-    include: ['src/**/*.test.{js,jsx}'],
+    include: ['src/**/*.test.{js,jsx}', 'functions-inbox/**/*.test.js'],
+    exclude: ['**/node_modules/**'],
   },
 })

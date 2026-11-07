@@ -1,11 +1,13 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import { collection, getDocs, query, where } from 'firebase/firestore';
 import { extractBankTransaction } from '../../ai/bankTransactionExtractor.js';
 import { appCheckConfigured, db } from '../../firebase';
+import { resolveBankInboxItem } from '../../lib/bankInbox.js';
 import {
   prepareGmailAuthorization,
   readBancoEstadoEmails,
 } from '../../lib/gmail.js';
+import { BankInboxSetup } from './BankInboxSetup.jsx';
 import {
   CATEGORIES,
   DEBT_CATEGORY,
@@ -45,6 +47,60 @@ async function findImportedMessageIds(householdId, messageIds) {
   return imported;
 }
 
+// Envía cada aviso a Gemini en orden. Los que fallan quedan para reintentar.
+async function extractEmails(emails, categories, onProgress) {
+  const extracted = [];
+  const ignored = [];
+  const failed = [];
+  for (let index = 0; index < emails.length; index += 1) {
+    const email = emails[index];
+    onProgress?.(index + 1, emails.length);
+    try {
+      const movement = await extractBankTransaction(email, categories);
+      if (movement) {
+        extracted.push({
+          id: email.id,
+          subject: email.subject,
+          fromInbox: !!email.fromInbox,
+          senderVerified: email.senderVerified !== false,
+          ...movement,
+          selected: true,
+          category: movement.suggestedCategory,
+        });
+      } else {
+        ignored.push(email);
+      }
+    } catch (extractError) {
+      const reason = failureReason(extractError);
+      console.error('No se pudo analizar un aviso bancario con Gemini:', {
+        id: email.id,
+        code: extractError?.code || 'unknown',
+      });
+      // Gemini sin cuota o saturado: los demás quedan pendientes sin gastar más llamadas.
+      if (extractError?.code === 'ai-unavailable') {
+        failed.push(...emails.slice(index).map((item) => ({ ...item, reason })));
+        break;
+      }
+      failed.push({ ...email, reason });
+    }
+  }
+  return { extracted, ignored, failed };
+}
+
+// Solo se muestran los mensajes propios (en español y sin detalles internos).
+function failureReason(error) {
+  const message = String(error?.message || '');
+  return String(error?.code || '').startsWith('ai-') ||
+    /^(Gemini|Configura App Check)/.test(message)
+    ? message
+    : '';
+}
+
+function failedMessage(failed, fallback) {
+  const reason = failed.find((email) => email.reason)?.reason;
+  return reason ? `${fallback} Motivo: ${reason}` : fallback;
+}
+
 export function GmailImportModal({
   onClose,
   householdId,
@@ -52,26 +108,106 @@ export function GmailImportModal({
   categories,
   householdUsers,
   addTransaction,
+  inboxItems = [],
 }) {
   const [loading, setLoading] = useState(false);
   const [extracting, setExtracting] = useState(false);
+  const [reviewingInbox, setReviewingInbox] = useState(false);
   const [saving, setSaving] = useState(false);
   const [googleReady, setGoogleReady] = useState(false);
   const [error, setError] = useState('');
   const [notice, setNotice] = useState('');
   const [emails, setEmails] = useState([]);
   const [candidates, setCandidates] = useState([]);
+  const [unimportable, setUnimportable] = useState([]);
   const [scanInfo, setScanInfo] = useState('');
+  const reviewedInboxIds = useRef(new Set());
+  const mountedRef = useRef(true);
+  const busy = loading || extracting || reviewingInbox || saving;
 
-  const categorySource =
-    Array.isArray(categories) && categories.length ? categories : CATEGORIES;
-  const expenseCategories = categorySource.filter(
-    (category) =>
-      category !== DEBT_CATEGORY &&
-      category !== SAVINGS_CATEGORY &&
-      category !== TRANSFER_CATEGORY,
-  );
+  const expenseCategories = useMemo(() => {
+    const categorySource =
+      Array.isArray(categories) && categories.length ? categories : CATEGORIES;
+    return categorySource.filter(
+      (category) =>
+        category !== DEBT_CATEGORY &&
+        category !== SAVINGS_CATEGORY &&
+        category !== TRANSFER_CATEGORY,
+    );
+  }, [categories]);
   const members = Array.isArray(householdUsers) ? householdUsers : [];
+
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+    };
+  }, []);
+
+  // Los avisos que llegaron solos se analizan apenas se abre la bandeja.
+  useEffect(() => {
+    if (!appCheckConfigured || !householdId) return;
+    const fresh = inboxItems.filter((item) => !reviewedInboxIds.current.has(item.id));
+    if (!fresh.length) return;
+    fresh.forEach((item) => reviewedInboxIds.current.add(item.id));
+
+    setReviewingInbox(true);
+    (async () => {
+      try {
+        const importedIds = await findImportedMessageIds(
+          householdId,
+          fresh.map((item) => item.id),
+        );
+        await Promise.all(
+          Array.from(importedIds, (id) =>
+            resolveBankInboxItem(householdId, id, 'imported').catch((resolveError) => {
+              console.error('No se pudo cerrar un aviso ya importado:', {
+                id,
+                code: resolveError?.code || 'unknown',
+              });
+            }),
+          ),
+        );
+        const toReview = fresh
+          .filter((item) => !importedIds.has(item.id))
+          .map((item) => ({ ...item, fromInbox: true }));
+        const { extracted, ignored, failed } = await extractEmails(
+          toReview,
+          expenseCategories,
+          (current, total) => {
+            if (mountedRef.current) {
+              setScanInfo(`Gemini está revisando el aviso nuevo ${current} de ${total}…`);
+            }
+          },
+        );
+        if (!mountedRef.current) return;
+        setCandidates((current) => [...current, ...extracted]);
+        setUnimportable((current) => [...current, ...ignored]);
+        setScanInfo(
+          `${toReview.length} aviso${toReview.length === 1 ? '' : 's'} nuevo${
+            toReview.length === 1 ? '' : 's'
+          }: ${extracted.length} por confirmar, ${ignored.length} sin movimiento importable${
+            failed.length ? ` y ${failed.length} con error` : ''
+          }.`,
+        );
+        if (failed.length) {
+          setError(
+            failedMessage(
+              failed,
+              'Algunos avisos no pudieron analizarse. Se reintentarán la próxima vez que abras la bandeja.',
+            ),
+          );
+        }
+      } catch (reviewError) {
+        console.error('No se pudo revisar la bandeja de avisos:', {
+          code: reviewError?.code || 'unknown',
+        });
+        if (mountedRef.current) setError('No se pudo revisar la bandeja de avisos.');
+      } finally {
+        if (mountedRef.current) setReviewingInbox(false);
+      }
+    })();
+  }, [inboxItems, householdId, expenseCategories]);
 
   useEffect(() => {
     if (!GOOGLE_CLIENT_ID) return undefined;
@@ -103,7 +239,6 @@ export function GmailImportModal({
     setError('');
     setNotice('');
     setEmails([]);
-    setCandidates([]);
     setScanInfo('');
     try {
       const { messages, truncated } = await readBancoEstadoEmails(GOOGLE_CLIENT_ID);
@@ -111,8 +246,12 @@ export function GmailImportModal({
         householdId,
         messages.map((message) => message.id),
       );
+      // Los que ya están en la bandeja se revisan allí; no se duplican.
       const pending = messages
-        .filter((message) => !importedIds.has(message.id))
+        .filter(
+          (message) =>
+            !importedIds.has(message.id) && !reviewedInboxIds.current.has(message.id),
+        )
         .map((message) => ({ ...message, selected: false }));
       const duplicates = messages.length - pending.length;
       setEmails(pending);
@@ -152,46 +291,28 @@ export function GmailImportModal({
     setExtracting(true);
     setError('');
     setNotice('');
-    setCandidates([]);
-    const extracted = [];
-    const finishedIds = new Set();
-    let ignored = 0;
-    let failed = 0;
-    for (let index = 0; index < selected.length; index += 1) {
-      const email = selected[index];
-      setScanInfo(`Gemini está analizando el aviso ${index + 1} de ${selected.length}…`);
-      try {
-        const movement = await extractBankTransaction(email, expenseCategories);
-        finishedIds.add(email.id);
-        if (movement) {
-          extracted.push({
-            id: email.id,
-            subject: email.subject,
-            ...movement,
-            selected: true,
-            category: movement.suggestedCategory,
-          });
-        } else {
-          ignored += 1;
-        }
-      } catch (extractError) {
-        failed += 1;
-        console.error('No se pudo analizar un aviso bancario con Gemini:', {
-          id: email.id,
-          code: extractError?.code || 'unknown',
-        });
-      }
-    }
-    setCandidates(extracted);
-    setEmails((current) => current.filter((email) => !finishedIds.has(email.id)));
+    const { extracted, ignored, failed } = await extractEmails(
+      selected,
+      expenseCategories,
+      (current, total) =>
+        setScanInfo(`Gemini está analizando el aviso ${current} de ${total}…`),
+    );
+    const failedIds = new Set(failed.map((email) => email.id));
+    setCandidates((current) => [...current, ...extracted]);
+    setEmails((current) =>
+      current.filter((email) => !email.selected || failedIds.has(email.id)),
+    );
     setScanInfo(
-      `${selected.length} avisos procesados: ${extracted.length} movimientos propuestos, ${ignored} sin movimiento importable${
-        failed ? ` y ${failed} con error` : ''
+      `${selected.length} avisos procesados: ${extracted.length} movimientos propuestos, ${ignored.length} sin movimiento importable${
+        failed.length ? ` y ${failed.length} con error` : ''
       }.`,
     );
-    if (failed) {
+    if (failed.length) {
       setError(
-        'Algunos avisos no pudieron procesarse. Puedes volver a seleccionarlos e intentar otra vez.',
+        failedMessage(
+          failed,
+          'Algunos avisos no pudieron procesarse. Puedes volver a seleccionarlos e intentar otra vez.',
+        ),
       );
     }
     setExtracting(false);
@@ -224,7 +345,7 @@ export function GmailImportModal({
 
     setSaving(true);
     setError('');
-    let saved = 0;
+    const savedIds = new Set();
     let failed = 0;
     for (const candidate of selected) {
       try {
@@ -260,8 +381,22 @@ export function GmailImportModal({
           createdAt: new Date().toISOString(),
           sourceGmailId: candidate.id,
         });
-        if (id) saved += 1;
-        else failed += 1;
+        if (!id) {
+          failed += 1;
+          continue;
+        }
+        savedIds.add(candidate.id);
+        if (candidate.fromInbox) {
+          // Si esto falla, el aviso se cierra solo la próxima vez (ya tiene sourceGmailId).
+          await resolveBankInboxItem(householdId, candidate.id, 'imported').catch(
+            (resolveError) => {
+              console.error('No se pudo cerrar un aviso importado:', {
+                id: candidate.id,
+                code: resolveError?.code || 'unknown',
+              });
+            },
+          );
+        }
       } catch (saveError) {
         console.error('No se pudo guardar un movimiento de Gmail:', {
           message: saveError?.message,
@@ -270,12 +405,30 @@ export function GmailImportModal({
       }
     }
     setSaving(false);
+    const saved = savedIds.size;
     setNotice(
       `${saved} movimiento${saved === 1 ? '' : 's'} guardado${saved === 1 ? '' : 's'}${
         failed ? `; ${failed} no se pudo guardar` : ''
       }.`,
     );
-    if (!failed) setCandidates((current) => current.filter((item) => !item.selected));
+    setCandidates((current) => current.filter((item) => !savedIds.has(item.id)));
+  }
+
+  async function handleDismiss(ids) {
+    setError('');
+    try {
+      await Promise.all(
+        ids.map((id) => resolveBankInboxItem(householdId, id, 'dismissed')),
+      );
+      const dismissed = new Set(ids);
+      setCandidates((current) => current.filter((item) => !dismissed.has(item.id)));
+      setUnimportable((current) => current.filter((item) => !dismissed.has(item.id)));
+    } catch (dismissError) {
+      console.error('No se pudo descartar un aviso de la bandeja:', {
+        code: dismissError?.code || 'unknown',
+      });
+      setError('No se pudo descartar el aviso. Intenta otra vez.');
+    }
   }
 
   return (
@@ -288,7 +441,7 @@ export function GmailImportModal({
       >
         <div className="mb-4 flex items-center justify-between gap-3">
           <h3 id="gmail-import-title" className="text-lg font-semibold">
-            Leer avisos de BancoEstado
+            Avisos de BancoEstado
           </h3>
           <button
             type="button"
@@ -301,16 +454,15 @@ export function GmailImportModal({
         </div>
 
         <p className="mb-3 text-sm text-[color:var(--text-muted)]">
-          Gmail solicita permiso de lectura del buzón. Al seleccionar un aviso y
-          pulsar “Extraer con Gemini”, se enviarán su asunto y cuerpo a Firebase
-          AI Logic para procesarlo. Antes de enviarlo, la app oculta RUT, correos
-          y números de cuenta detectables. Revisa cada resultado; nunca se guarda
-          automáticamente.
+          Los avisos que llegan solos (recepción automática) se analizan con
+          Gemini al abrir esta bandeja.
+          {GOOGLE_CLIENT_ID && ' También puedes buscar en Gmail y elegir qué avisos enviar.'}{' '}
+          Antes de enviarlos, la app oculta RUT, correos y números de cuenta
+          detectables. Revisa cada resultado; nunca se guarda automáticamente.
         </p>
-        {!GOOGLE_CLIENT_ID && (
-          <p className="mb-3 rounded-lg border border-[color:var(--warning)]/30 bg-[color:var(--warning)]/15 px-3 py-2 text-sm text-[color:var(--warning)]">
-            Falta configurar VITE_GOOGLE_OAUTH_CLIENT_ID. Consulta la sección de
-            Gmail en el README para habilitar la conexión.
+        {reviewingInbox && (
+          <p className="mb-3 text-sm text-[color:var(--text-muted)]">
+            Revisando avisos nuevos…
           </p>
         )}
         {!appCheckConfigured && (
@@ -319,18 +471,21 @@ export function GmailImportModal({
             y configura su clave de sitio para habilitar Gemini.
           </p>
         )}
-        <button
-          type="button"
-          className="rounded-lg bg-[color:var(--success)] px-4 py-2 text-sm text-[color:var(--primary-contrast)] hover:brightness-110 disabled:cursor-not-allowed disabled:opacity-60"
-          onClick={handleReadEmails}
-          disabled={loading || extracting || saving || !GOOGLE_CLIENT_ID || !googleReady}
-        >
-          {loading
-            ? 'Buscando avisos…'
-            : googleReady
-            ? 'Conectar y buscar avisos'
-            : 'Preparando Google…'}
-        </button>
+        {/* La búsqueda manual solo aparece si está configurado el cliente OAuth de Google. */}
+        {GOOGLE_CLIENT_ID && (
+          <button
+            type="button"
+            className="rounded-lg bg-[color:var(--success)] px-4 py-2 text-sm text-[color:var(--primary-contrast)] hover:brightness-110 disabled:cursor-not-allowed disabled:opacity-60"
+            onClick={handleReadEmails}
+            disabled={busy || !googleReady}
+          >
+            {loading
+              ? 'Buscando avisos…'
+              : googleReady
+              ? 'Buscar avisos en Gmail'
+              : 'Preparando Google…'}
+          </button>
+        )}
 
         {scanInfo && (
           <p className="mt-3 text-xs text-[color:var(--text-muted)]">{scanInfo}</p>
@@ -376,9 +531,7 @@ export function GmailImportModal({
               className="w-full rounded-lg border px-3 py-2 text-sm hover:bg-[color:var(--surface-2)] disabled:cursor-not-allowed disabled:opacity-60"
               onClick={handleExtractSelected}
               disabled={
-                extracting ||
-                loading ||
-                saving ||
+                busy ||
                 !appCheckConfigured ||
                 !emails.some((email) => email.selected)
               }
@@ -405,8 +558,29 @@ export function GmailImportModal({
                       })
                     }
                   />
-                  <span>{candidate.subject || candidate.description}</span>
+                  <span className="flex-1">
+                    {candidate.subject || candidate.description}
+                  </span>
+                  {candidate.fromInbox && (
+                    <button
+                      type="button"
+                      className="text-xs font-normal text-[color:var(--text-muted)] hover:text-[color:var(--danger)] disabled:opacity-60"
+                      onClick={(event) => {
+                        event.preventDefault();
+                        handleDismiss([candidate.id]);
+                      }}
+                      disabled={saving}
+                    >
+                      Descartar
+                    </button>
+                  )}
                 </label>
+                {!candidate.senderVerified && (
+                  <p className="text-xs text-[color:var(--warning)]">
+                    No se pudo verificar que este correo venga de BancoEstado.
+                    Revísalo antes de confirmarlo.
+                  </p>
+                )}
                 <div className="grid gap-3 sm:grid-cols-2">
                   <label className="grid gap-1 text-xs text-[color:var(--text-muted)]">
                     Tipo
@@ -543,6 +717,40 @@ export function GmailImportModal({
             {saving ? 'Guardando movimientos…' : 'Confirmar movimientos seleccionados'}
           </button>
         )}
+
+        {unimportable.length > 0 && (
+          <div className="mt-4 space-y-2 rounded-xl border border-[color:var(--border)] p-3">
+            <div className="flex items-center justify-between gap-2">
+              <p className="text-xs text-[color:var(--text-muted)]">
+                Avisos sin movimiento importable (por ejemplo, compras con
+                tarjeta de crédito).
+              </p>
+              <button
+                type="button"
+                className="shrink-0 text-xs text-[color:var(--text-muted)] hover:text-[color:var(--danger)]"
+                onClick={() => handleDismiss(unimportable.map((item) => item.id))}
+                disabled={saving}
+              >
+                Descartar todos
+              </button>
+            </div>
+            {unimportable.map((item) => (
+              <div key={item.id} className="flex items-start justify-between gap-2 text-sm">
+                <span>{item.subject || '(Aviso sin asunto)'}</span>
+                <button
+                  type="button"
+                  className="shrink-0 text-xs text-[color:var(--text-muted)] hover:text-[color:var(--danger)]"
+                  onClick={() => handleDismiss([item.id])}
+                  disabled={saving}
+                >
+                  Descartar
+                </button>
+              </div>
+            ))}
+          </div>
+        )}
+
+        {householdId && <BankInboxSetup householdId={householdId} />}
       </section>
     </div>
   );

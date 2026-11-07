@@ -23,6 +23,7 @@ import { appCheckConfigured, auth, db } from './firebase';
 // Layout y avisos
 import { Header } from './components/layout/Header.jsx';
 import { BottomNav } from './components/layout/BottomNav.jsx';
+import { AssistantPanel } from './features/assistant/AssistantPanel.jsx';
 import { Money } from './components/ui/Money.jsx';
 import { ErrorBoundary } from './components/feedback/ErrorBoundary.jsx';
 import { FeedbackHost } from './components/feedback/FeedbackHost.jsx';
@@ -444,8 +445,8 @@ export default function App() {
     fetchAuditLog: h.fetchAuditLog,
   };
 
-  const handleAiSendText = useCallback(async () => {
-    const input = aiText.trim();
+  const handleAiSendText = useCallback(async (suggestion) => {
+    const input = (typeof suggestion === 'string' ? suggestion : aiText).trim();
     if (!input || aiSending) return;
     const userMessage = { role: 'user', text: input };
     const nextMessages = [...aiMessages, userMessage];
@@ -720,162 +721,37 @@ export default function App() {
   }
 
   const aiFloating = (
-    <div className="fixed bottom-[calc(5.5rem+env(safe-area-inset-bottom))] md:bottom-4 right-4 left-auto z-[9999]">
-      {!aiOpen ? (
-        <button
-          type="button"
-          className="ai-fab flex h-12 w-12 items-center justify-center overflow-hidden rounded-full shadow-lg transition hover:brightness-105 active:scale-95 md:h-16 md:w-16"
-          onClick={handleAiToggle}
-          aria-label="Abrir asistente financiero con IA"
-          title="Asistente financiero con IA"
-        >
-          <img
-            src="/logo-finanzas-en-familia.png"
-            alt=""
-            className="h-full w-full object-cover"
-          />
-        </button>
-      ) : (
-        <div className="ai-panel w-[min(90vw,360px)] rounded-2xl border border-[color:var(--border)] bg-[color:var(--surface-1)] shadow-[var(--shadow)] p-4 space-y-3">
-          <div className="flex items-center justify-between">
-            <div className="text-sm font-semibold">Asistente financiero</div>
-            <button
-              type="button"
-              className="text-xs text-[color:var(--text-muted)] hover:text-[color:var(--text)]"
-              onClick={handleAiToggle}
-            >
-              Cerrar
-            </button>
-          </div>
-          <p className="text-[11px] leading-relaxed text-[color:var(--text-muted)]">
-            Tu consulta y un resumen financiero agregado se procesan con Gemini.
-            No se envían nombres ni descripciones individuales.
-          </p>
-          {!appCheckConfigured && (
-            <p className="rounded-lg bg-[color:var(--warning)]/15 px-2 py-1.5 text-[11px] text-[color:var(--warning)]">
-              Para habilitar Gemini, configura App Check con reCAPTCHA
-              Enterprise y VITE_FIREBASE_APP_CHECK_SITE_KEY.
-            </p>
-          )}
-          {aiMessages.length > 0 && (
-            <div
-              className="max-h-64 space-y-2 overflow-y-auto rounded-lg bg-[color:var(--surface-2)]/50 p-2"
-              aria-live="polite"
-              aria-label="Conversación con el asistente"
-            >
-              {aiMessages.map((message, index) => (
-                <div
-                  key={`${message.role}-${index}`}
-                  className={`max-w-[90%] whitespace-pre-wrap rounded-xl px-3 py-2 text-xs ${
-                    message.role === 'user'
-                      ? 'ml-auto bg-[color:var(--primary)] text-[color:var(--primary-contrast)]'
-                      : 'bg-[color:var(--surface-1)] text-[color:var(--text)]'
-                  }`}
-                >
-                  {message.text}
-                </div>
-              ))}
-              {aiSending && (
-                <div className="text-xs text-[color:var(--text-muted)]">
-                  Pensando…
-                </div>
-              )}
-            </div>
-          )}
-          <textarea
-            className="w-full rounded-lg border border-[color:var(--border)] bg-transparent px-3 py-2 text-sm"
-            rows={3}
-            placeholder="Pregunta por tus finanzas o escribe una acción para revisar"
-            value={aiText}
-            onChange={(e) => {
-              setAiText(e.target.value);
-              setAiStatus('');
-              setAiPlan(null);
-            }}
-            onKeyDown={(event) => {
-              if (event.key === 'Enter' && !event.shiftKey) {
-                event.preventDefault();
-                handleAiSendText();
-              }
-            }}
-          />
-          <div className="flex flex-wrap items-center gap-2">
-            {aiListening ? (
-              <button
-                type="button"
-                className="px-3 py-1.5 text-xs rounded-lg border border-[color:var(--danger)]/40 text-[color:var(--danger)] hover:bg-[color:var(--danger)]/10"
-                onClick={stopAiDictation}
-              >
-                Detener dictado
-              </button>
-            ) : (
-              <button
-                type="button"
-                className="px-3 py-1.5 text-xs rounded-lg border text-[color:var(--text-muted)] hover:bg-[color:var(--surface-2)]"
-                onClick={startAiDictation}
-              >
-                Dictar
-              </button>
-            )}
-          </div>
-          {aiListening && (
-            <div className="flex items-center gap-2 text-xs text-[color:var(--text-muted)]">
-              <span className="ai-listening-dot" />
-              Escuchando...
-            </div>
-          )}
-          {aiInterim && (
-            <div className="text-xs text-[color:var(--text-muted)]">
-              {aiInterim}
-            </div>
-          )}
-          {aiError && (
-            <div className="text-xs text-[color:var(--danger)]">{aiError}</div>
-          )}
-          {aiStatus && (
-            <div className="text-xs text-[color:var(--text-muted)]">
-              {aiStatus}
-            </div>
-          )}
-          {aiPlan && (
-            <div className="rounded-lg border border-[color:var(--border)] bg-[color:var(--surface-2)]/60 p-3 text-xs space-y-2">
-              <div className="font-semibold text-[color:var(--text)]">
-                Confirmar acción
-              </div>
-              <div className="text-[color:var(--text-muted)]">
-                {aiPlan.summary}
-              </div>
-              <div className="flex gap-2">
-                <button
-                  type="button"
-                  className="flex-1 px-3 py-2 text-xs rounded-lg border bg-[color:var(--primary)] text-[color:var(--primary-contrast)] disabled:opacity-60"
-                  onClick={handleAiConfirm}
-                >
-                  Confirmar
-                </button>
-                <button
-                  type="button"
-                  className="flex-1 px-3 py-2 text-xs rounded-lg border text-[color:var(--text-muted)] hover:bg-[color:var(--surface-2)]"
-                  onClick={handleAiCancelPlan}
-                >
-                  Cancelar
-                </button>
-              </div>
-            </div>
-          )}
-          <div className="flex gap-2">
-            <button
-              type="button"
-              className="flex-1 px-3 py-2 text-xs rounded-lg border text-[color:var(--text-muted)] hover:bg-[color:var(--surface-2)] disabled:opacity-60"
-              onClick={handleAiSendText}
-              disabled={!aiText.trim() || aiSending}
-            >
-              Preguntar
-            </button>
-          </div>
-        </div>
-      )}
-    </div>
+    <AssistantPanel
+      open={aiOpen}
+      hidden={quickAddOpen}
+      onToggle={handleAiToggle}
+      onNewChat={() => {
+        setAiMessages([]);
+        setAiPlan(null);
+        setAiError('');
+        setAiStatus('');
+        setAiText('');
+      }}
+      messages={aiMessages}
+      sending={aiSending}
+      text={aiText}
+      onTextChange={(value) => {
+        setAiText(value);
+        setAiStatus('');
+        setAiPlan(null);
+      }}
+      onSend={handleAiSendText}
+      listening={aiListening}
+      onStartDictation={startAiDictation}
+      onStopDictation={stopAiDictation}
+      interim={aiInterim}
+      error={aiError}
+      status={aiStatus}
+      plan={aiPlan}
+      onConfirmPlan={handleAiConfirm}
+      onCancelPlan={handleAiCancelPlan}
+      aiReady={appCheckConfigured}
+    />
   );
 
   return (

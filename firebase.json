@@ -2,6 +2,14 @@
   "firestore": {
     "rules": "firestore.rules"
   },
+  "functions": [
+    {
+      "source": "functions-inbox",
+      "codebase": "inbox",
+      "runtime": "nodejs22",
+      "ignore": ["node_modules", "__tests__", ".git", "*.local"]
+    }
+  ],
   "hosting": {
     "public": "dist",
     "ignore": [
