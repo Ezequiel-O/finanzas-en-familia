@@ -121,7 +121,7 @@ export function BankInboxSetup({ householdId }) {
       <div className="mt-3 space-y-3">
         <p className="text-xs text-[color:var(--text-muted)]">
           Un Apps Script en tu cuenta de Google revisa cada 10 minutos los avisos
-          de BancoEstado y los envía a esta bandeja, sin datos de cuenta ni RUT.
+          de BancoEstado y Santander y los envía a esta bandeja, sin datos de cuenta ni RUT.
           Copia <code>{SCRIPT_PATH}</code> en script.google.com y guarda estos
           dos valores en sus propiedades como <code>FF_ENDPOINT</code> y{' '}
           <code>FF_TOKEN</code>.

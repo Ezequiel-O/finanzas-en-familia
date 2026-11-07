@@ -14,6 +14,10 @@ import {
   SAVINGS_CATEGORY,
 } from '../../constants.js';
 import { TRANSFER_CATEGORY } from '../../domain/ledger.js';
+import { formatShortDate } from '../../domain/dates.js';
+import { formatCLP } from '../../domain/money.js';
+import { findSimilarTransactions } from '../../domain/similarTransactions.js';
+import { accountForSender } from '../../domain/accounts.js';
 
 const GOOGLE_CLIENT_ID = String(
   import.meta.env.VITE_GOOGLE_OAUTH_CLIENT_ID || '',
@@ -62,6 +66,8 @@ async function extractEmails(emails, categories, onProgress) {
           id: email.id,
           subject: email.subject,
           fromInbox: !!email.fromInbox,
+          sender: email.sender || '',
+          receivedAt: email.receivedAt || '',
           senderVerified: email.senderVerified !== false,
           ...movement,
           selected: true,
@@ -109,6 +115,8 @@ export function GmailImportModal({
   householdUsers,
   addTransaction,
   inboxItems = [],
+  transactions = [],
+  accounts = [],
 }) {
   const [loading, setLoading] = useState(false);
   const [extracting, setExtracting] = useState(false);
@@ -124,6 +132,28 @@ export function GmailImportModal({
   const reviewedInboxIds = useRef(new Set());
   const mountedRef = useRef(true);
   const busy = loading || extracting || reviewingInbox || saving;
+  const transactionsRef = useRef(transactions);
+  transactionsRef.current = transactions;
+
+  const accountsRef = useRef(accounts);
+  accountsRef.current = accounts;
+
+  // La cuenta sale del banco que envió el aviso. Un posible duplicado de algo ya
+  // registrado llega desmarcado.
+  const addCandidates = (extracted) =>
+    setCandidates((current) => [
+      ...current,
+      ...extracted.map((candidate) => ({
+        ...candidate,
+        account: accountForSender(accountsRef.current, candidate.sender)?.id || '',
+        ...(findSimilarTransactions(candidate, transactionsRef.current).length
+          ? { selected: false }
+          : {}),
+      })),
+    ]);
+  const accountOf = (id) => accounts.find((account) => account.id === id) || null;
+  const memberAccount = (memberId) =>
+    accounts.find((account) => account.ownerId && account.ownerId === memberId)?.id || '';
 
   const expenseCategories = useMemo(() => {
     const categorySource =
@@ -181,7 +211,7 @@ export function GmailImportModal({
           },
         );
         if (!mountedRef.current) return;
-        setCandidates((current) => [...current, ...extracted]);
+        addCandidates(extracted);
         setUnimportable((current) => [...current, ...ignored]);
         setScanInfo(
           `${toReview.length} aviso${toReview.length === 1 ? '' : 's'} nuevo${
@@ -298,7 +328,7 @@ export function GmailImportModal({
         setScanInfo(`Gemini está analizando el aviso ${current} de ${total}…`),
     );
     const failedIds = new Set(failed.map((email) => email.id));
-    setCandidates((current) => [...current, ...extracted]);
+    addCandidates(extracted);
     setEmails((current) =>
       current.filter((email) => !email.selected || failedIds.has(email.id)),
     );
@@ -352,6 +382,15 @@ export function GmailImportModal({
         const isTransfer = candidate.type === 'traspaso';
         const fromMember = members.find((member) => member.id === candidate.fromUserId);
         const toMember = members.find((member) => member.id === candidate.toUserId);
+        // El movimiento es de quien es dueño de la cuenta (p. ej. Santander → Daniela).
+        const accountOwner = members.find(
+          (member) => member.id === accountOf(candidate.account)?.ownerId,
+        );
+        const owner = isTransfer ? fromMember : accountOwner || activeUser;
+        // Traspaso entre miembros: si cada uno tiene su cuenta, la plata cambia de cuenta.
+        // La cuenta del aviso puede ser la que envía o la que recibe: mandan las de cada miembro.
+        const fromAccount = isTransfer ? memberAccount(fromMember?.id) : '';
+        const toAccount = isTransfer ? memberAccount(toMember?.id) : '';
         const id = await addTransaction({
           type: isTransfer ? 'gasto' : candidate.type,
           amount: Number(candidate.amount),
@@ -364,21 +403,25 @@ export function GmailImportModal({
                   fromUserName: fromMember?.name || fromMember?.email || 'Miembro',
                   toUserId: candidate.toUserId,
                   toUserName: toMember?.name || toMember?.email || 'Miembro',
+                  ...(fromAccount && toAccount && fromAccount !== toAccount
+                    ? { fromAccount, toAccount }
+                    : {}),
                 },
               }
-            : candidate.type === 'gasto'
-            ? { category: candidate.category }
-            : {}),
+            : {
+                ...(candidate.type === 'gasto' ? { category: candidate.category } : {}),
+                account: candidate.account || null,
+              }),
           description: candidate.description.trim(),
           date: candidate.date,
-          ownerId: isTransfer ? fromMember?.id || null : activeUser?.id || null,
-          ownerName: isTransfer
-            ? fromMember?.name || fromMember?.email || null
-            : activeUser?.name || null,
-          ownerEmail: isTransfer
-            ? fromMember?.email || null
-            : activeUser?.email || null,
+          ownerId: owner?.id || null,
+          ownerName: owner?.name || owner?.email || null,
+          ownerEmail: owner?.email || null,
           createdAt: new Date().toISOString(),
+          // Hora del aviso: el saldo real anotado antes de confirmarlo ya lo incluye.
+          ...(Number.isNaN(Date.parse(candidate.receivedAt || ''))
+            ? {}
+            : { occurredAt: new Date(candidate.receivedAt).toISOString() }),
           sourceGmailId: candidate.id,
         });
         if (!id) {
@@ -441,7 +484,7 @@ export function GmailImportModal({
       >
         <div className="mb-4 flex items-center justify-between gap-3">
           <h3 id="gmail-import-title" className="text-lg font-semibold">
-            Avisos de BancoEstado
+            Avisos del banco
           </h3>
           <button
             type="button"
@@ -577,11 +620,58 @@ export function GmailImportModal({
                 </label>
                 {!candidate.senderVerified && (
                   <p className="text-xs text-[color:var(--warning)]">
-                    No se pudo verificar que este correo venga de BancoEstado.
+                    No se pudo verificar que este correo venga del banco.
                     Revísalo antes de confirmarlo.
                   </p>
                 )}
+                {(() => {
+                  const similar = findSimilarTransactions(candidate, transactions);
+                  if (!similar.length) return null;
+                  return (
+                    <div className="rounded-lg border border-[color:var(--warning)] px-3 py-2 text-xs text-[color:var(--warning)]">
+                      <p className="font-semibold">
+                        Posible duplicado: ya hay {similar.length === 1 ? 'un movimiento' : 'movimientos'} con
+                        el mismo monto en fechas cercanas.
+                      </p>
+                      <ul className="mt-1 list-disc pl-4">
+                        {similar.map((transaction) => (
+                          <li key={transaction.id || `${transaction.date}-${transaction.description}`}>
+                            {formatShortDate(transaction.date)} · {formatCLP(transaction.amount)}
+                            {transaction.description ? ` · ${transaction.description}` : ''}
+                            {transaction.category ? ` (${transaction.category})` : ''}
+                          </li>
+                        ))}
+                      </ul>
+                      <p className="mt-1">
+                        Quedó desmarcado. Márcalo solo si es un movimiento distinto; si ya
+                        está registrado, pulsa Descartar.
+                      </p>
+                    </div>
+                  );
+                })()}
                 <div className="grid gap-3 sm:grid-cols-2">
+                  {accounts.length > 0 && candidate.type !== 'traspaso' && (
+                    <label className="grid gap-1 text-xs text-[color:var(--text-muted)] sm:col-span-2">
+                      Cuenta
+                      <select
+                        className="rounded-lg border bg-[color:var(--surface-1)] px-2 py-2 text-sm text-[color:var(--text)]"
+                        value={candidate.account || ''}
+                        onChange={(event) =>
+                          updateCandidate(candidate.id, { account: event.target.value })
+                        }
+                      >
+                        <option value="">Sin indicar</option>
+                        {accounts.map((account) => (
+                          <option key={account.id} value={account.id}>
+                            {account.name}
+                            {account.ownerId
+                              ? ` · ${members.find((member) => member.id === account.ownerId)?.name || ''}`
+                              : ''}
+                          </option>
+                        ))}
+                      </select>
+                    </label>
+                  )}
                   <label className="grid gap-1 text-xs text-[color:var(--text-muted)]">
                     Tipo
                     <select

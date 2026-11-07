@@ -160,6 +160,58 @@ Producto: CuentaRUT`,
     ).toThrow('no coinciden');
   });
 
+  it('handles Santander transfer receipts without colons', () => {
+    const email = {
+      subject: 'Comprobante Transferencia de fondos',
+      body: `Te informamos que, con fecha 04/11/2026 se ha realizado una transferencia.
+Monto transferido
+$ 60.000
+Datos de origen
+Nombre
+Persona Origen
+Nº de cuenta
+0-000-12-34567-8
+Datos de destino
+Nombre
+Fulana Pérez
+RUT
+12.345.678-9
+Banco
+Banco BICE
+Nº de cuenta 987654321
+Comentario
+almuerzo`,
+    };
+
+    const forAI = sanitizeBankEmailForAI(email);
+    expect(forAI).toContain('$ 60.000');
+    expect(forAI).toContain('04/11/2026');
+    expect(forAI).not.toContain('Fulana');
+    expect(forAI).not.toContain('Persona Origen');
+    expect(forAI).not.toContain('34567');
+    expect(forAI).not.toContain('987654321');
+    expect(forAI).not.toContain('12.345.678-9');
+
+    expect(
+      validateAiBankEmailMovement(email, {
+        hasMovement: true,
+        type: 'gasto',
+        amount: 60000,
+        date: '2026-11-04',
+        description: 'Transferencia a Banco BICE',
+      }),
+    ).toMatchObject({ amount: 60000, description: 'Transferencia a Fulana Pérez' });
+    expect(
+      validateAiBankEmailMovement(email, {
+        hasMovement: true,
+        type: 'ingreso',
+        amount: 60000,
+        date: '2026-11-04',
+        description: 'Transferencia recibida',
+      }).description,
+    ).toBe('Transferencia de Persona Origen');
+  });
+
   it('names the transfer recipient without sending it to AI', () => {
     const email = {
       subject: 'Aviso de envío o recepción de dinero',

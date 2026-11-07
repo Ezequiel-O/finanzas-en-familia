@@ -1,8 +1,8 @@
 /**
- * Finanzas en Familia — envío automático de avisos de BancoEstado.
+ * Finanzas en Familia — envío automático de avisos bancarios (BancoEstado, Santander).
  *
  * Corre en tu propia cuenta de Google (script.google.com). Cada 10 minutos
- * busca avisos nuevos de BancoEstado con permiso de solo lectura y los envía a
+ * busca avisos nuevos de tus bancos con permiso de solo lectura y los envía a
  * la bandeja de la app, donde eliges dónde cargarlos. Instrucciones en el README
  * (sección "Recepción automática de avisos").
  *
@@ -14,7 +14,10 @@
 const SENDERS = [
   'notificaciones@correo.bancoestado.cl',
   'noreply@correo.bancoestado.cl',
+  'mensajeria@santander.cl',
 ];
+// Los estados de cuenta traen los movimientos en un PDF cifrado: no se envían.
+const EXCLUDED_SUBJECTS = '-subject:("Estado de Cuenta")';
 // Margen para recuperar avisos si el envío falla varios días; FF_SENT_IDS evita duplicados.
 const LOOKBACK = '7d';
 const MAX_PER_RUN = 20;
@@ -59,7 +62,7 @@ function enviarAvisosBancarios() {
     const sent = JSON.parse(props.getProperty('FF_SENT_IDS') || '[]');
     const sentIds = new Set(sent);
     const list = Gmail.Users.Messages.list('me', {
-      q: `from:(${SENDERS.join(' OR ')}) newer_than:${LOOKBACK}`,
+      q: `from:(${SENDERS.join(' OR ')}) ${EXCLUDED_SUBJECTS} newer_than:${LOOKBACK}`,
       maxResults: 50,
     });
     const refs = (list.messages || []).filter((ref) => !sentIds.has(ref.id)).reverse();
@@ -132,10 +135,17 @@ function toPayload(message) {
     subject: header('subject').slice(0, MAX_SUBJECT_LENGTH),
     body,
     receivedAt: new Date(Number(message.internalDate)).toISOString(),
-    senderVerified: /\bdkim=pass\b[^;]*header\.(?:d|i)=@?(?:[\w-]+\.)*bancoestado\.cl\b/i.test(
-      header('authentication-results'),
-    ),
+    senderVerified: dkimPasses(header('authentication-results'), sender),
   };
+}
+
+// DKIM válido firmado por el dominio del banco remitente (por ejemplo santander.cl).
+function dkimPasses(results, sender) {
+  const domain = sender.split('@')[1].split('.').slice(-2).join('.');
+  const escaped = domain.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  return new RegExp(`\\bdkim=pass\\b[^;]*header\\.(?:d|i)=@?(?:[\\w-]+\\.)*${escaped}\\b`, 'i').test(
+    results,
+  );
 }
 
 function extractText(payload) {

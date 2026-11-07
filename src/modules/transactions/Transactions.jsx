@@ -54,9 +54,18 @@ export function Transactions({
     budgetsAll = {},
     fixedCategories = {},
     householdUsers = [],
+    accounts = [],
   } = data || {};
 
   const debtsArray = Array.isArray(debts) ? debts : [];
+  // Cuenta sugerida: la del dueño del movimiento (p. ej. su banco).
+  const defaultAccountFor = (userId) =>
+    accounts.find((account) => account.ownerId && account.ownerId === userId)?.id || '';
+  const accountName = (id) => accounts.find((account) => account.id === id)?.name || '';
+  const txAccountLabel = (tx) =>
+    tx?.meta?.fromAccount || tx?.meta?.toAccount
+      ? `${accountName(tx.meta.fromAccount) || '?'} → ${accountName(tx.meta.toAccount) || '?'}`
+      : accountName(tx?.account);
   const savingsArray = Array.isArray(savings) ? savings : [];
 
   const currentPeriodKey = useMemo(
@@ -100,6 +109,7 @@ export function Transactions({
   const [selectedSubcategoryIds, setSelectedSubcategoryIds] = useState([]);
   const [amountEditedByUser, setAmountEditedByUser] = useState(false);
   const [ownerUserId, setOwnerUserId] = useState('');
+  const [accountId, setAccountId] = useState('');
   const [showExcelModal, setShowExcelModal] = useState(false);
   const [showGmailModal, setShowGmailModal] = useState(false);
   const [bankInboxItems, setBankInboxItems] = useState([]);
@@ -1613,6 +1623,7 @@ export function Transactions({
     if (resolvedType === 'ingreso') {
       setOwnerUserId(activeUser?.id || usersList[0]?.id || '');
     }
+    setAccountId(defaultAccountFor(activeUser?.id));
     if (resolvedType === 'ingreso') setShowIngresoModal(true);
     if (resolvedType === 'gasto') setShowGastoModal(true);
   }
@@ -1658,6 +1669,7 @@ export function Transactions({
     if (baseType === 'ingreso') {
       setOwnerUserId(tx.ownerId || activeUser?.id || usersList[0]?.id || '');
     }
+    setAccountId(tx.account || '');
     if (baseType === 'ingreso') setShowIngresoModal(true);
     else setShowGastoModal(true);
   }
@@ -1696,6 +1708,7 @@ export function Transactions({
       ownerId: owner?.id ?? null,
       ownerName: owner?.name ?? null,
       ownerEmail: owner?.email ?? null,
+      account: accountId || null,
     };
 
     const baseMeta = editingTx?.meta ? { ...editingTx.meta } : {};
@@ -4022,11 +4035,11 @@ export function Transactions({
               className="h-8 rounded-lg border border-[color:var(--success)]/30 bg-[color:var(--success)]/15 px-2 text-xs font-medium text-[color:var(--success)] transition hover:border-[color:var(--success)]/40 hover:bg-[color:var(--success)]/20 disabled:cursor-not-allowed disabled:opacity-50"
               onClick={() => setShowGmailModal(true)}
               disabled={!canImport || !householdId}
-              data-tooltip="Avisos de BancoEstado"
+              data-tooltip="Avisos del banco"
               aria-label={
                 bankInboxItems.length
-                  ? `Avisos de BancoEstado: ${bankInboxItems.length} por revisar`
-                  : 'Avisos de BancoEstado'
+                  ? `Avisos del banco: ${bankInboxItems.length} por revisar`
+                  : 'Avisos del banco'
               }
             >
               Gmail{bankInboxItems.length ? ` · ${bankInboxItems.length}` : ''}
@@ -4214,6 +4227,9 @@ export function Transactions({
                         </td>
                         <td className="px-2 py-1 align-top text-xs text-[color:var(--text-muted)]">
                           {getOwnerName(tx)}
+                          {txAccountLabel(tx) && (
+                            <div className="text-[color:var(--text-faint)]">{txAccountLabel(tx)}</div>
+                          )}
                         </td>
                         <td className="px-2 py-1 align-top text-right">
                           <div className="flex justify-end gap-3 text-xs">
@@ -4399,6 +4415,12 @@ export function Transactions({
                     <span className="text-[color:var(--text-muted)]">Usuario</span>
                     <span className="font-medium text-right">{getOwnerName(infoTx)}</span>
                   </div>
+                  {txAccountLabel(infoTx) && (
+                    <div className="flex justify-between gap-4">
+                      <span className="text-[color:var(--text-muted)]">Cuenta</span>
+                      <span className="font-medium text-right">{txAccountLabel(infoTx)}</span>
+                    </div>
+                  )}
                 </div>
               </div>
             </div>
@@ -4720,6 +4742,8 @@ export function Transactions({
           householdUsers={usersList}
           addTransaction={addTransaction}
           inboxItems={bankInboxItems}
+          transactions={transactions}
+          accounts={accounts}
         />
       )}
 
@@ -4746,6 +4770,25 @@ export function Transactions({
               </div>
 
               <form onSubmit={handleAdd} className="grid gap-3">
+                {accounts.length > 0 && (
+                  <div className="flex flex-col gap-1">
+                    <label className="text-xs text-[color:var(--text-muted)]">
+                      {type === 'ingreso' ? '¿A qué cuenta entró?' : '¿De qué cuenta salió?'}
+                    </label>
+                    <select
+                      className="border rounded-lg px-2 py-1 text-sm"
+                      value={accountId}
+                      onChange={(e) => setAccountId(e.target.value)}
+                    >
+                      <option value="">Sin indicar</option>
+                      {accounts.map((account) => (
+                        <option key={account.id} value={account.id}>
+                          {account.name}
+                        </option>
+                      ))}
+                    </select>
+                  </div>
+                )}
                 {type === 'ingreso' && (
                   <>
                     <div className="flex flex-col gap-1">
@@ -4753,7 +4796,10 @@ export function Transactions({
                       <select
                         className="border rounded-lg px-2 py-1 text-sm"
                         value={ownerUserId}
-                        onChange={(e) => setOwnerUserId(e.target.value)}
+                        onChange={(e) => {
+                          setOwnerUserId(e.target.value);
+                          if (!editingTx) setAccountId(defaultAccountFor(e.target.value) || accountId);
+                        }}
                       >
                         {usersList.map((u) => (
                           <option key={u.id} value={u.id}>

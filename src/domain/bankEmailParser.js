@@ -91,16 +91,30 @@ function dateEvidence(body, receivedAt) {
 // Nombre del destinatario (gasto) o de quien envía (ingreso) en una transferencia.
 export function transferCounterpart(body, type) {
   const text = String(body || '');
+  // BancoEstado: "Desde:" / "Hacia:". Santander: "Datos de origen" / "Datos de destino".
+  const from = /Desde\s*:|Datos\s+de\s+origen/i;
+  const to = /Hacia\s*:|Datos\s+de\s+destino/i;
   const section =
     type === 'ingreso'
-      ? text.split(/Desde\s*:/i)[1]?.split(/Hacia\s*:/i)[0] || ''
-      : text.split(/Hacia\s*:/i)[1] || '';
+      ? text.split(from)[1]?.split(to)[0] || ''
+      : text.split(to)[1]?.split(from)[0] || '';
   const name = section
     .match(
-      /Nombre\s*:\s*(.+?)(?=\s+(?:RUT|Banco|N[°º]\s+de\s+cuenta|Producto|E-mail|Comentario)\s*:|\r?\n|$)/i,
+      /Nombre[ \t]*:?[ \t]*(?:\r?\n[ \t]*)?(\S[^\r\n]*?)(?=\s+(?:RUT|Banco|N[°º]\s*de\s+cuenta|Producto|E-mail|Comentario)\b|\r?\n|$)/i,
     )?.[1]
     ?.trim();
   return name && !/oculto/i.test(name) ? name.slice(0, 120) : '';
+}
+
+// Números de cuenta u operación sin etiqueta "N° de cuenta:": 7+ dígitos, con o sin
+// guiones, que no sean montos ($ 1.200.000) ni fechas (04-11-2026).
+// Igual que en functions-inbox/payload.js.
+// Repetición acotada ({5,40}) para que un correo armado no dispare backtracking largo.
+const LONG_NUMBER = /(?<!(?:\$|CLP)\s{0,2}|[\d.,])\b\d[\d-]{5,40}\d\b(?![.,]\d)/gi;
+function hideLongNumber(match) {
+  if (match.replace(/-/g, '').length < 7) return match;
+  if (/^(?:\d{1,2}-\d{1,2}-\d{2,4}|\d{4}-\d{2}-\d{2})$/.test(match)) return match;
+  return '[número oculto]';
 }
 
 export function sanitizeBankEmailForAI({ subject = '', body = '' } = {}) {
@@ -110,7 +124,10 @@ export function sanitizeBankEmailForAI({ subject = '', body = '' } = {}) {
       /((?:N[°º]\s*(?:de\s*)?(?:cuenta|TEF)|RUT|E-?mail|correo|Nombre)\s*:\s*).*?(?=\s+(?:N[°º]\s*(?:de\s*)?(?:cuenta|TEF)|RUT|E-?mail|correo|Fecha|Monto|Desde|Hacia|Producto|Banco|Comentario|Nombre)\s*:|[\r\n]|$)/gi,
       '$1[oculto]',
     )
+    // Nombre sin dos puntos o en la línea siguiente (formato Santander).
+    .replace(/(\bNombre\b[ \t]*(?:\r?\n[ \t]*)?)(?![:\s[])[^\r\n]+/gi, '$1[oculto]')
     .replace(/\b\d{1,2}\.?\d{3}\.?\d{3}-[\dkK]\b/g, '[RUT oculto]')
+    .replace(LONG_NUMBER, hideLongNumber)
     .replace(/\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b/gi, '[correo oculto]');
   const sanitizedBody = sanitize(body).slice(0, 12000);
   return `Asunto: ${sanitize(subject).slice(0, 300)}\n${sanitizedBody}`;

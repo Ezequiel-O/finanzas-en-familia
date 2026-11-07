@@ -53,7 +53,7 @@ describe('coherencia entre pantallas', () => {
     expect(screen.getAllByText(closing).length).toBeGreaterThan(0);
     cleanup();
 
-    // En Plan, el saldo está en el cierre del periodo (dentro de "Ver detalle").
+    // En Plan, el saldo está en el cierre del periodo.
     render(<PeriodClosingCard data={{ transactions, debts, budgetCutDay: 1 }} actions={actions} periodKey={pk} />);
     expect(screen.getAllByText(closing).length).toBeGreaterThan(0);
     cleanup();

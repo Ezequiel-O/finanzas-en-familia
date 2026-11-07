@@ -18,6 +18,10 @@ const transactionFields = {
   ownerId: z.string().max(128).nullable().optional(),
   ownerName: z.string().max(200).nullable().optional(),
   ownerEmail: z.string().max(320).nullable().optional(),
+  // Cuenta donde entró o de donde salió la plata (ver domain/accounts.js).
+  account: z.string().regex(/^[a-z0-9-]{1,40}$/, 'Cuenta inválida').nullable().optional(),
+  // Hora real del movimiento (la del aviso bancario), distinta de cuándo se registró.
+  occurredAt: z.string().max(40).optional(),
   meta: z.record(z.string(), z.unknown()).optional(),
 };
 

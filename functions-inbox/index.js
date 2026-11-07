@@ -36,7 +36,7 @@ async function isAuthorized(token) {
   );
 }
 
-// Recibe avisos de BancoEstado enviados por el Apps Script de cada miembro
+// Recibe avisos bancarios (BancoEstado, Santander) enviados por el Apps Script de cada miembro
 // (scripts/apps-script) y los deja pendientes en households/{hid}/bankInbox.
 export const ingestBankEmail = onRequest(
   {

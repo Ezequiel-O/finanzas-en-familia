@@ -63,7 +63,8 @@ Para habilitarlo:
 
 ### Recepción automática de avisos
 
-Con esto, los avisos de BancoEstado llegan solos a **Movimientos**, que muestra
+Con esto, los avisos de BancoEstado (`notificaciones@`, `noreply@correo.bancoestado.cl`)
+y Santander (`mensajeria@santander.cl`) llegan solos a **Movimientos**, que muestra
 “Llegaron N avisos del banco. ¿Dónde los cargamos?”. Al abrir la bandeja,
 Gemini propone tipo, monto y categoría, y tú confirmas, cambias o descartas
 cada uno. Nada se guarda sin tu confirmación.
@@ -82,11 +83,14 @@ Gmail (tu cuenta) ──Apps Script cada 10 min──▶ Cloud Function ingestBa
   **solo de lectura** de Gmail. La app nunca recibe tokens de Gmail.
 - Cada miembro tiene su propia clave. Firestore guarda solo su hash SHA-256 y
   se puede revocar o regenerar desde la app.
-- El aviso se guarda sin nombres, RUT, correos ni números de cuenta. Al
-  confirmarlo o descartarlo se borran el asunto y el cuerpo, y queda solo el ID
-  para no repetirlo. Los pendientes vencen a los 30 días (`expiresAt`).
-- Si el correo no pasa DKIM de `bancoestado.cl`, la app lo marca como no
+- El aviso se guarda sin RUT, correos ni números de cuenta (con o sin etiqueta).
+  El nombre del destinatario se conserva para la descripción y nunca se envía
+  a Gemini. Al confirmarlo o descartarlo se borran el asunto y el cuerpo, y
+  queda solo el ID para no repetirlo. Los pendientes vencen a los 30 días (`expiresAt`).
+- Si el correo no pasa DKIM del dominio del banco remitente, la app lo marca como no
   verificado antes de que lo confirmes.
+- Los estados de cuenta (PDF cifrado) no se envían. Las compras con tarjeta
+  de crédito no se importan: la app registra el pago de la tarjeta.
 
 Para habilitarlo (requiere plan Blaze):
 

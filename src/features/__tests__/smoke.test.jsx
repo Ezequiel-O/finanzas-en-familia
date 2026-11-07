@@ -111,7 +111,7 @@ describe('pestañas', () => {
     expect(screen.queryByLabelText('Día de vencimiento de Alimentación')).toBeNull();
   });
 
-  it('Plan: tres tarjetas y el detalle plegado', () => {
+  it('Plan: tres tarjetas y el detalle siempre visible', () => {
     render(
       <PlanScreen
         data={{ budgets, budgetsAll: { [pk]: budgets }, transactions, categories, budgetCutDay: 1, debts, savings }}
@@ -121,7 +121,8 @@ describe('pestañas', () => {
     expect(screen.getByText(/¿Puedo gastar esto\?/)).toBeTruthy();
     expect(screen.getByText('Qué pagar y cuándo')).toBeTruthy();
     expect(screen.getByText('Fin de mes')).toBeTruthy();
-    expect(screen.getByText('Ver detalle').closest('details').open).toBe(false);
+    expect(screen.queryByText('Ver detalle')).toBeNull();
+    expect(screen.getByText('tabla-aqui').closest('details')).toBeNull();
     expect(screen.getByText('Detalle de tramos')).toBeTruthy();
   });
 

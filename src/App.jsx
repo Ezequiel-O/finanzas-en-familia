@@ -42,8 +42,10 @@ import { QuickAddSheet } from './features/quick-add/QuickAddSheet.jsx';
 import { CommitmentsPanel } from './features/plan/CommitmentsPanel.jsx';
 import { UpcomingCard } from './features/plan/UpcomingCard.jsx';
 import { PlanScreen } from './features/plan/PlanCards.jsx';
+import { advisePlan } from './ai/planAdvisor.js';
 import { PeriodClosingCard } from './features/plan/PeriodClosingCard.jsx';
 import { FinancialHealthCard } from './features/plan/FinancialHealthCard.jsx';
+import { AccountsCard } from './features/accounts/AccountsCard.jsx';
 
 // Pestañas: se cargan al abrirlas para achicar la descarga inicial
 const named = (loader, name) => lazy(() => loader().then((m) => ({ default: m[name] })));
@@ -404,6 +406,7 @@ export default function App() {
     ownerUid: h.ownerUid,
     budgetCutDay: h.budgetCutDay,
     expectedIncome: h.expectedIncome,
+    accounts: h.accounts || [],
     closings: h.closings,
     trash: h.trash,
     activeUser,
@@ -440,6 +443,7 @@ export default function App() {
     exportFinances: h.exportFinances,
     resetFinances: h.resetFinances,
     setExpectedIncome: h.setExpectedIncome,
+    saveAccounts: h.saveAccounts,
     closePeriod: h.closePeriod,
     reopenPeriod: h.reopenPeriod,
     fetchAuditLog: h.fetchAuditLog,
@@ -755,7 +759,7 @@ export default function App() {
   );
 
   return (
-    <div className="min-h-screen bg-[color:var(--bg)] text-[color:var(--text)] overflow-x-clip">
+    <div className="app-bg min-h-screen text-[color:var(--text)] overflow-x-clip">
       <div>
         <div className="flex min-h-screen flex-col md:flex-row">
           <Header
@@ -1081,6 +1085,7 @@ export default function App() {
                     onOpenPlan={() => setTab('plan')}
                   />
                   <FinancialHealthCard data={data} periodKey={selectedMonth} />
+                  <AccountsCard data={data} actions={actions} activeUser={activeUser} />
                   <Dashboard
                     data={{
                       categories: data.categories,
@@ -1109,6 +1114,7 @@ export default function App() {
                     budgetsAll: data.budgetsAll,
                     fixedCategories: data.fixedCategories,
                     householdUsers: data.householdUsers,
+                    accounts: data.accounts,
                   }}
                   actions={actions}
                   activeUser={activeUser}
@@ -1121,6 +1127,7 @@ export default function App() {
               {tab === 'plan' && (
                 <PlanScreen
                   data={data}
+                  advise={advisePlan}
                   budgetsTable={
                     <Budgets
                       data={{
@@ -1210,6 +1217,7 @@ export default function App() {
           budgetCutDay={data.budgetCutDay || 1}
           fixedCategories={data.fixedCategories || {}}
           householdUsers={data.householdUsers || []}
+          accounts={data.accounts}
           activeUser={activeUser}
           actions={actions}
         />

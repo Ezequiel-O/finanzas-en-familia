@@ -234,8 +234,8 @@ export function Header({
               collapsed ? 'justify-center px-2 py-2.5' : 'px-3 py-2 gap-3'
             } ${
               isActive
-                ? 'bg-blue-700 text-white shadow-sm'
-                : 'text-blue-100 hover:bg-blue-800/60'
+                ? 'bg-white/15 text-white shadow-sm ring-1 ring-white/20'
+                : 'text-blue-100/90 hover:bg-white/10 hover:text-white'
             }`}
             aria-current={isActive ? 'page' : undefined}
             title={collapsed ? item.label : undefined}
@@ -304,7 +304,7 @@ export function Header({
 
       {showNav && mobileOpen && (
         <div className="fixed inset-0 z-50 flex md:hidden">
-          <div className="mobile-drawer w-64 bg-blue-900 text-blue-100 border-r border-blue-800 p-4 shadow-xl">
+          <div className="mobile-drawer w-64 ff-sidebar text-blue-100 border-r border-white/10 p-4 shadow-xl">
             <button
               type="button"
               onClick={() => setMobileOpen(false)}
@@ -331,7 +331,7 @@ export function Header({
       {showNav && (
         <aside
           ref={navRef}
-          className={`hidden md:flex md:flex-col md:shrink-0 md:border-r md:border-blue-800 md:bg-blue-900/95 md:text-blue-100 md:backdrop-blur md:sticky md:top-0 md:h-screen md:self-start md:overflow-y-auto md:transition-all md:duration-300 md:ease-out ${
+          className={`hidden md:flex md:flex-col md:shrink-0 md:border-r md:border-white/10 ff-sidebar md:text-blue-100 md:sticky md:top-0 md:h-screen md:self-start md:overflow-y-auto md:transition-all md:duration-300 md:ease-out ${
             isCollapsed ? 'md:w-16' : 'md:w-64'
           }`}
         >

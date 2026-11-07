@@ -72,6 +72,30 @@ describe('validateBankEmailPayload', () => {
     expect(email.body).not.toContain('user@example.com');
   });
 
+  it('accepts Santander and hides unlabeled account numbers but not amounts or dates', () => {
+    const email = validateBankEmailPayload(
+      payload({
+        sender: 'mensajeria@santander.cl',
+        body: 'con fecha 04/11/2026 (04-11-2026)\nMonto transferido\n$ 1.200.000\nNº de cuenta\n0-000-12-34567-8\nCuenta 987654321\nTotal $1200000',
+      }),
+    );
+
+    expect(email.sender).toBe('mensajeria@santander.cl');
+    expect(email.body).toContain('04/11/2026');
+    expect(email.body).toContain('04-11-2026');
+    expect(email.body).toContain('$ 1.200.000');
+    expect(email.body).toContain('$1200000');
+    expect(email.body).not.toContain('34567');
+    expect(email.body).not.toContain('987654321');
+  });
+
+  it('redacts quickly even with long digit runs crafted to cause backtracking', () => {
+    const body = `${'1-'.repeat(3000)}.5 ${'9'.repeat(5000)},1`;
+    const started = performance.now();
+    validateBankEmailPayload(payload({ body }));
+    expect(performance.now() - started).toBeLessThan(500);
+  });
+
   it('rejects other senders, unknown fields and oversized content', () => {
     expect(validateBankEmailPayload(payload({ sender: 'alguien@otro.cl' }))).toBeNull();
     expect(validateBankEmailPayload({ ...payload(), householdId: 'otro' })).toBeNull();

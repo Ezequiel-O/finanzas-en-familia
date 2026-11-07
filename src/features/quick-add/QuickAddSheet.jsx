@@ -53,10 +53,15 @@ export function QuickAddSheet({
   budgetCutDay = 1,
   fixedCategories = {},
   householdUsers = [],
+  accounts = [],
   activeUser,
   actions,
   initialType = 'gasto',
 }) {
+  // Cuenta sugerida: la del miembro (su banco); si no tiene, sin indicar.
+  const memberAccount = (memberId) =>
+    accounts.find((account) => account.ownerId && account.ownerId === memberId)?.id || '';
+  const [accountId, setAccountId] = useState('');
   const members = (householdUsers || []).filter((u) => u?.id);
   const canTransfer = members.length >= 2;
   const [isRefund, setIsRefund] = useState(false);
@@ -86,6 +91,8 @@ export function QuickAddSheet({
   rankedRef.current = ranked;
   const activeUserIdRef = useRef(activeUser?.id);
   activeUserIdRef.current = activeUser?.id;
+  const memberAccountRef = useRef(memberAccount);
+  memberAccountRef.current = memberAccount;
 
   const periodKey = budgetMonthKeyForDate(date || today, budgetCutDay);
   const subcategories = useMemo(() => {
@@ -107,6 +114,7 @@ export function QuickAddSheet({
     setIsRefund(false);
     setFromUserId(activeUserIdRef.current || '');
     setToUserId('');
+    setAccountId(memberAccountRef.current(activeUserIdRef.current));
     const options = rankedRef.current;
     const lastCat = last.category && options.includes(last.category) ? last.category : options[0] || '';
     setCategory(lastCat);
@@ -160,7 +168,10 @@ export function QuickAddSheet({
       ownerEmail: activeUser?.email || null,
     };
     if (type === 'traspaso') {
-      // No cambia la caja del hogar: no es gasto ni ingreso.
+      // No cambia la caja del hogar: no es gasto ni ingreso. Si cada miembro tiene
+      // su cuenta, la plata pasa de una cuenta a la otra.
+      const fromAccount = memberAccount(fromUserId);
+      const toAccount = memberAccount(toUserId);
       return {
         ...base,
         category: TRANSFER_CATEGORY,
@@ -171,9 +182,11 @@ export function QuickAddSheet({
           fromUserName: memberName(fromUserId),
           toUserId,
           toUserName: memberName(toUserId),
+          ...(fromAccount && toAccount && fromAccount !== toAccount ? { fromAccount, toAccount } : {}),
         },
       };
     }
+    base.account = accountId || null;
     if (type === 'ingreso') {
       // Un reembolso descuenta el gasto de su categoría; no es ingreso.
       return isRefund
@@ -441,6 +454,23 @@ export function QuickAddSheet({
             className="min-h-[44px] rounded-xl border border-[color:var(--border)] bg-[color:var(--input-bg)] px-3 text-sm"
           />
         </div>
+
+        {type !== 'traspaso' && accounts.length > 0 && (
+          <div className="flex flex-wrap gap-2" role="radiogroup" aria-label="Cuenta">
+            {accounts.map((account) => (
+              <button
+                key={account.id}
+                type="button"
+                role="radio"
+                aria-checked={accountId === account.id}
+                className={chip(accountId === account.id)}
+                onClick={() => setAccountId((prev) => (prev === account.id ? '' : account.id))}
+              >
+                {account.name}
+              </button>
+            ))}
+          </div>
+        )}
 
         <input
           value={description}

@@ -4,6 +4,7 @@ import { createHash, timingSafeEqual } from 'node:crypto';
 export const ALLOWED_SENDERS = new Set([
   'notificaciones@correo.bancoestado.cl',
   'noreply@correo.bancoestado.cl',
+  'mensajeria@santander.cl',
 ]);
 export const MAX_SUBJECT_LENGTH = 300;
 export const MAX_BODY_LENGTH = 12000;
@@ -43,7 +44,7 @@ export function secretMatches(secret, storedHash) {
 }
 
 // Misma redacción que sanitizeBankEmailForAI en src/domain/bankEmailParser.js:
-// el aviso se guarda sin nombres, RUT, correos ni números de cuenta.
+// el aviso se guarda sin RUT, correos ni números de cuenta.
 export function redactBankText(value) {
   return String(value)
     .replace(
@@ -53,7 +54,19 @@ export function redactBankText(value) {
       '$1[oculto]',
     )
     .replace(/\b\d{1,2}\.?\d{3}\.?\d{3}-[\dkK]\b/g, '[RUT oculto]')
+    .replace(LONG_NUMBER, hideLongNumber)
     .replace(/\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b/gi, '[correo oculto]');
+}
+
+// Números de cuenta u operación sin etiqueta "N° de cuenta:" (Santander los pone
+// sin dos puntos o en la línea siguiente): 7+ dígitos, con o sin guiones, que no
+// sean montos ($ 1.200.000) ni fechas (04-11-2026).
+// Repetición acotada ({5,40}) para que un correo armado no dispare backtracking largo.
+const LONG_NUMBER = /(?<!(?:\$|CLP)\s{0,2}|[\d.,])\b\d[\d-]{5,40}\d\b(?![.,]\d)/gi;
+function hideLongNumber(match) {
+  if (match.replace(/-/g, '').length < 7) return match;
+  if (/^(?:\d{1,2}-\d{1,2}-\d{2,4}|\d{4}-\d{2}-\d{2})$/.test(match)) return match;
+  return '[número oculto]';
 }
 
 // Devuelve el aviso listo para guardar, o null si no cumple el formato esperado.

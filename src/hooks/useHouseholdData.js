@@ -24,6 +24,7 @@ import { db } from '../firebase';
 import { DEBT_CATEGORY, CATEGORIES, SAVINGS_CATEGORY } from '../constants.js';
 import { budgetMonthKeyForDate, monthKey, shiftMonth } from '../utils/budgetPeriod';
 import { txDateKey } from '../domain/ledger.js';
+import { normalizeAccounts } from '../domain/accounts.js';
 import { filterTransactionsByPeriodAndUser } from '../utils/transactions.js';
 import { getSubcategoryAllocationsForTransaction } from '../utils/subcategoryAllocations.js';
 import { toast } from '../components/feedback/feedback.js';
@@ -269,6 +270,7 @@ export default function useHouseholdData(householdId, authUser, options = {}) {
   const [ownerUid, setOwnerUid] = useState(null);
   const [budgetCutDay, setBudgetCutDayState] = useState(1);
   const [expectedIncome, setExpectedIncomeState] = useState(0);
+  const [accounts, setAccountsState] = useState(() => normalizeAccounts());
   const [closings, setClosings] = useState({});
   const budgetsRef = useRef({});
   const txStateRef = useRef({
@@ -1006,6 +1008,7 @@ export default function useHouseholdData(householdId, authUser, options = {}) {
       setPriorityCategories(data.priorityCategories || {});
       setFixedDueDays(data.fixedDueDays || {});
       setExpectedIncomeState(Math.max(0, Number(data.expectedIncome || 0)));
+      setAccountsState(normalizeAccounts(data.accounts));
     });
     return () => {
       unsub();
@@ -2347,6 +2350,18 @@ export default function useHouseholdData(householdId, authUser, options = {}) {
     setExpectedIncomeState(n);
   }
 
+  // Cuentas donde está la plata (BancoEstado, Santander, Efectivo...).
+  async function saveAccounts(list) {
+    if (!householdId) return;
+    const normalized = normalizeAccounts(list);
+    await setDoc(
+      doc(db, 'households', householdId, META_COLLECTION, META_DOC_ID),
+      { accounts: normalized, ...buildUpdateMeta() },
+      { merge: true },
+    );
+    setAccountsState(normalized);
+  }
+
   // Cierra y concilia un periodo: guarda saldo según la app, saldo real y diferencia.
   async function closePeriod({ periodKey, appBalance, bankBalance, note = '' }) {
     if (!householdId || !periodKey) return;
@@ -2446,6 +2461,8 @@ export default function useHouseholdData(householdId, authUser, options = {}) {
     resetFinances,
     expectedIncome,
     setExpectedIncome,
+    accounts,
+    saveAccounts,
     closings,
     closePeriod,
     reopenPeriod,

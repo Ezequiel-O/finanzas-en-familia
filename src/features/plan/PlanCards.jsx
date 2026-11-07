@@ -1,12 +1,13 @@
 // src/features/plan/PlanCards.jsx
 // Pantalla Plan: "Hoy" (gasto seguro), "Qué pagar y cuándo", "Fin de mes" y el detalle de
 // tramos. Todo se calcula desde hoy con safeSpendPlan (domain/safeSpend.js).
-import { useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import { Card } from '../../components/ui/Card.jsx';
 import { Money } from '../../components/ui/Money.jsx';
 import { addDaysToKey, formatShortDate } from '../../domain/dates.js';
 import { formatAmountInput, parseAmount } from '../../domain/money.js';
 import { canISpend, safeSpendPlan } from '../../domain/safeSpend.js';
+import { planFacts } from '../../domain/planAdvice.js';
 
 const TONE = {
   green: 'border-[color:var(--success)]/40 bg-[color:var(--success)]/10',
@@ -47,6 +48,40 @@ function useSafeSpend(data) {
         expectedIncome,
       }),
     [transactions, debts, savings, budgetsAll, fixedCategories, priorityCategories, fixedDueDays, categories, budgetCutDay, expectedIncome],
+  );
+}
+
+// Avisos redactados por Gemini con los datos del plan. Se vuelven a pedir solo cuando
+// cambian esos datos; mientras tanto (o si Gemini falla) se muestran los textos fijos.
+function usePlanAdvice(summary, advise) {
+  const [advice, setAdvice] = useState(null);
+  // Se compara por contenido (factsKey) para no repetir llamadas en cada render.
+  const factsKey = useMemo(() => JSON.stringify(planFacts(summary)), [summary]);
+  const summaryRef = useRef(summary);
+  summaryRef.current = summary;
+  useEffect(() => {
+    if (!advise) return undefined;
+    let active = true;
+    setAdvice(null);
+    advise(summaryRef.current)
+      .then((result) => {
+        if (active) setAdvice(result || null);
+      })
+      .catch((error) => {
+        console.error('No se pudieron redactar los avisos del Plan:', { code: error?.code || 'unknown' });
+      });
+    return () => {
+      active = false;
+    };
+  }, [factsKey, advise]);
+  return advice;
+}
+
+function GeminiTag() {
+  return (
+    <span className="ml-1 inline-block rounded-full bg-[color:var(--surface-2)] px-2 py-0.5 align-middle text-[10px] font-semibold text-[color:var(--text-muted)]">
+      ✨ Gemini
+    </span>
   );
 }
 
@@ -152,11 +187,26 @@ function SpendCheck({ summary, categories }) {
 }
 
 // Tarjeta 1 – "Hoy".
-export function TodayCard({ summary }) {
+export function TodayCard({ summary, advice }) {
   const tight = summary.tightest;
   return (
     <div className={`rounded-2xl border p-4 shadow-[var(--shadow)] ${TONE[summary.level]}`}>
-      {summary.level === 'red' ? (
+      {advice ? (
+        <>
+          <h2 className={`text-2xl font-bold ${summary.level === 'red' ? TEXT_TONE.red : ''}`}>
+            {advice.hoyTitulo}
+            <GeminiTag />
+          </h2>
+          <p className="mt-1 text-sm">{advice.hoyMensaje}</p>
+          {advice.consejos.length > 0 && (
+            <ul className="mt-2 list-disc space-y-0.5 pl-5 text-sm">
+              {advice.consejos.map((tip) => (
+                <li key={tip}>{tip}</li>
+              ))}
+            </ul>
+          )}
+        </>
+      ) : summary.level === 'red' ? (
         <>
           <h2 className={`text-2xl font-bold ${TEXT_TONE.red}`}>No gastes nada que no sea esencial</h2>
           <p className="mt-1 text-sm">
@@ -218,11 +268,15 @@ export function PayScheduleCard({ summary }) {
 }
 
 // Tarjeta 3 – "Fin de mes".
-export function MonthEndCard({ summary }) {
+export function MonthEndCard({ summary, advice }) {
   const { margin, monthLevel } = summary;
   return (
     <div className={`rounded-2xl border p-4 shadow-[var(--shadow)] ${TONE[monthLevel]}`}>
-      <h2 className="text-lg font-semibold">Fin de mes</h2>
+      <h2 className="text-lg font-semibold">
+        Fin de mes
+        {advice && <GeminiTag />}
+      </h2>
+      {advice && <p className="mt-1 text-sm">{advice.finDeMesMensaje}</p>}
       <p className={`mt-1 text-base font-semibold ${TEXT_TONE[monthLevel]}`}>
         {monthLevel === 'green' && (
           <>
@@ -257,7 +311,7 @@ export function MonthEndCard({ summary }) {
   );
 }
 
-// Detalle de tramos (dentro de "Ver detalle").
+// Detalle de tramos (siempre visible).
 export function TramosDetail({ summary }) {
   return (
     <Card>
@@ -298,24 +352,21 @@ export function TramosDetail({ summary }) {
   );
 }
 
-// Pantalla Plan completa: las tres tarjetas y, plegado, el detalle (tabla de presupuestos,
-// compromisos, tramos y cierre del periodo).
-export function PlanScreen({ data, budgetsTable, commitments, closing }) {
+// Pantalla Plan completa: las tres tarjetas y, siempre visible, el detalle (tabla de
+// presupuestos, compromisos, tramos y cierre del periodo).
+// `advise` (opcional) pide a Gemini que redacte los avisos con los datos del plan.
+export function PlanScreen({ data, budgetsTable, commitments, closing, advise }) {
   const summary = useSafeSpend(data);
+  const advice = usePlanAdvice(summary, advise);
   return (
     <div className="grid gap-4">
-      <TodayCard summary={summary} />
+      <TodayCard summary={summary} advice={advice} />
       <PayScheduleCard summary={summary} />
-      <MonthEndCard summary={summary} />
-      <details className="rounded-2xl border border-[color:var(--border)] bg-[color:var(--surface-1)] p-4">
-        <summary className="cursor-pointer font-semibold">Ver detalle</summary>
-        <div className="mt-4 grid gap-4">
-          {budgetsTable}
-          {commitments}
-          <TramosDetail summary={summary} />
-          {closing}
-        </div>
-      </details>
+      <MonthEndCard summary={summary} advice={advice} />
+      {budgetsTable}
+      {commitments}
+      <TramosDetail summary={summary} />
+      {closing}
     </div>
   );
 }
