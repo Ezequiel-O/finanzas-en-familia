@@ -4776,6 +4776,8 @@ export function Transactions({
           inboxItems={bankInboxItems}
           transactions={transactions}
           accounts={accounts}
+          budgetsAll={budgetsAll}
+          budgetCutDay={budgetCutDay}
         />
       )}
 

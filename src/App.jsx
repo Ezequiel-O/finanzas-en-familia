@@ -34,6 +34,7 @@ import { askFinancialAssistant } from './ai/financialAssistant.js';
 // Dominio y navegación
 import { buildDebtPaidIndex, debtProgress } from './domain/commitments.js';
 import { todayKey } from './domain/dates.js';
+import { balanceAdjustment } from './domain/assistantActions.js';
 import { useHashTab } from './navigation/tabs.js';
 
 // Siempre visibles al entrar
@@ -476,7 +477,7 @@ export default function App() {
       }
       setAiSending(true);
       setAiStatus('Consultando al asistente…');
-      const answer = await askFinancialAssistant({
+      const { answer, actions: proposed } = await askFinancialAssistant({
         question: input,
         history: aiMessages,
         periodKey: selectedMonth,
@@ -485,8 +486,13 @@ export default function App() {
         categories: data.categories,
         debts: data.debts,
         budgetCutDay: data.budgetCutDay,
+        accounts: data.accounts,
+        members: data.householdUsers,
       });
-      setAiMessages([...nextMessages, { role: 'model', text: answer }]);
+      setAiMessages([
+        ...nextMessages,
+        { role: 'model', text: answer, ...(proposed.length ? { actions: proposed } : {}) },
+      ]);
       setAiStatus('');
     } catch (err) {
       console.error('AI assistant error:', { code: err?.code });
@@ -506,8 +512,74 @@ export default function App() {
     data.budgetsAll,
     data.debts,
     data.budgetCutDay,
+    data.accounts,
+    data.householdUsers,
     selectedMonth,
   ]);
+
+  // Aplica las correcciones que la persona marcó en el panel. Cada una ya fue
+  // validada contra los datos del hogar; el ajuste se calcula después de las demás.
+  const [aiApplying, setAiApplying] = useState(false);
+  const handleAiApplyActions = useCallback(
+    async (messageIndex, keys) => {
+      const message = aiMessages[messageIndex];
+      if (!message?.actions?.length || message.applied || aiApplying) return;
+      const chosen = message.actions.filter((action) => keys.includes(action.key));
+      if (!chosen.length) return;
+      setAiApplying(true);
+      setAiError('');
+      const current = new Map((data.transactions || []).map((t) => [String(t.id), t]));
+      const done = [];
+      let failed = 0;
+      for (const action of chosen.filter((a) => a.kind !== 'ajuste_balance')) {
+        // Fail-closed: si el movimiento ya no existe, no se toca nada.
+        if (!current.has(String(action.id))) {
+          failed += 1;
+          continue;
+        }
+        try {
+          await actions.updateTransaction(action.id, action.patch);
+          done.push(action);
+        } catch (err) {
+          console.error('No se pudo aplicar una corrección del asistente:', { code: err?.code });
+          failed += 1;
+        }
+      }
+      let adjusted = false;
+      if (chosen.some((a) => a.kind === 'ajuste_balance')) {
+        const today = todayKey();
+        const adjustment = balanceAdjustment(done, {
+          transactions: data.transactions,
+          accounts: data.accounts,
+          today,
+        });
+        if (adjustment) {
+          const id = await actions.addTransaction({
+            ...adjustment.transaction,
+            createdAt: new Date().toISOString(),
+            ownerId: activeUser?.id || null,
+            ownerName: activeUser?.name || null,
+            ownerEmail: activeUser?.email || null,
+          });
+          if (id) adjusted = true;
+          else failed += 1;
+        }
+      }
+      const appliedCount = done.length + (adjusted ? 1 : 0);
+      setAiMessages((list) =>
+        list.map((item, index) =>
+          index === messageIndex ? { ...item, applied: { keys, count: appliedCount, failed } } : item,
+        ),
+      );
+      setAiStatus(
+        `${appliedCount} corrección${appliedCount === 1 ? '' : 'es'} aplicada${appliedCount === 1 ? '' : 's'}${
+          failed ? `; ${failed} no se pudo aplicar` : ''
+        }.`,
+      );
+      setAiApplying(false);
+    },
+    [aiMessages, aiApplying, data.transactions, data.accounts, actions, activeUser],
+  );
 
   const handleAiConfirm = useCallback(async () => {
     if (!aiPlan) return;
@@ -737,6 +809,8 @@ export default function App() {
         setAiText('');
       }}
       messages={aiMessages}
+      onApplyActions={handleAiApplyActions}
+      applying={aiApplying}
       sending={aiSending}
       text={aiText}
       onTextChange={(value) => {

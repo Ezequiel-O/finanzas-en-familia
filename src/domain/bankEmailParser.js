@@ -117,9 +117,10 @@ function hideLongNumber(match) {
   return '[número oculto]';
 }
 
-export function sanitizeBankEmailForAI({ subject = '', body = '' } = {}) {
-  const sanitize = (value) =>
-    String(value)
+// Oculta RUT, correos, números de cuenta y nombres etiquetados antes de enviar
+// texto a Gemini.
+export function maskSensitiveText(value) {
+  return String(value ?? '')
     .replace(
       /((?:N[°º]\s*(?:de\s*)?(?:cuenta|TEF)|RUT|E-?mail|correo|Nombre)\s*:\s*).*?(?=\s+(?:N[°º]\s*(?:de\s*)?(?:cuenta|TEF)|RUT|E-?mail|correo|Fecha|Monto|Desde|Hacia|Producto|Banco|Comentario|Nombre)\s*:|[\r\n]|$)/gi,
       '$1[oculto]',
@@ -129,11 +130,16 @@ export function sanitizeBankEmailForAI({ subject = '', body = '' } = {}) {
     .replace(/\b\d{1,2}\.?\d{3}\.?\d{3}-[\dkK]\b/g, '[RUT oculto]')
     .replace(LONG_NUMBER, hideLongNumber)
     .replace(/\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b/gi, '[correo oculto]');
+}
+
+export function sanitizeBankEmailForAI({ subject = '', body = '' } = {}) {
+  const sanitize = maskSensitiveText;
   const sanitizedBody = sanitize(body).slice(0, 12000);
   return `Asunto: ${sanitize(subject).slice(0, 300)}\n${sanitizedBody}`;
 }
 
-export function validateAiBankEmailMovement(email, movement, categories = []) {
+// `subcategories`: { categoría: [nombres] } del periodo del aviso.
+export function validateAiBankEmailMovement(email, movement, categories = [], subcategories = {}) {
   if (!movement || typeof movement !== 'object' || movement.hasMovement !== true) {
     return null;
   }
@@ -160,7 +166,19 @@ export function validateAiBankEmailMovement(email, movement, categories = []) {
   const counterpart = /transferencia|TEF/i.test(`${email?.subject} ${email?.body}`)
     ? transferCounterpart(email?.body, type)
     : '';
+  // Giro en cajero: la plata pasa a efectivo, no es gasto.
+  const cashWithdrawal =
+    type === 'gasto' &&
+    (movement.cashWithdrawal === true ||
+      /\bgiro\b|cajero\s+autom/i.test(`${email?.subject || ''} ${email?.body || ''}`)) &&
+    !/transferencia|\bTEF\b/i.test(`${email?.subject || ''}`);
   const category = String(movement.category || '').trim();
+  const suggestedCategory =
+    type === 'gasto' && !cashWithdrawal && categories.includes(category) ? category : '';
+  const subcategory = String(movement.subcategory || '').trim();
+  const allowedSubcategories = Array.isArray(subcategories?.[suggestedCategory])
+    ? subcategories[suggestedCategory]
+    : [];
   return {
     type,
     amount,
@@ -168,7 +186,10 @@ export function validateAiBankEmailMovement(email, movement, categories = []) {
     description: counterpart
       ? `${type === 'ingreso' ? 'Transferencia de' : 'Transferencia a'} ${counterpart}`
       : description,
-    suggestedCategory: type === 'gasto' && categories.includes(category) ? category : '',
+    cashWithdrawal,
+    suggestedCategory,
+    suggestedSubcategory:
+      suggestedCategory && allowedSubcategories.includes(subcategory) ? subcategory : '',
   };
 }
 

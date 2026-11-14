@@ -185,6 +185,18 @@ export function parseIntent(text, context) {
   const isCreate =
     /(crear|agregar|anadir|añadir|nuevo|registrar|ingresar|sumar|anotar)/.test(norm);
 
+  // Preguntas y pedidos de análisis van al asistente, no a una acción: "¿por qué
+  // tengo un gasto de 15000 en Supermercado?" no es "crear gasto".
+  const isAnalysis = /\b(cuadr|concili|revis|analiz|explica|compar|resum|verific)/.test(norm);
+  const isQuestion =
+    raw.includes('?') ||
+    /^(cuanto|cuanta|cuantos|cuantas|que|por que|porque|como|cuando|donde|cual|cuales|quien|dime|muestrame|muestra)\b/.test(
+      norm,
+    );
+  if (isAnalysis || (isQuestion && !isCreate && !isDelete && !isUpdate)) {
+    return { type: 'question' };
+  }
+
   if (isBudget) {
     const amount = extractAmount(raw);
     const catMatches = findCategoryMatches(raw, categories);

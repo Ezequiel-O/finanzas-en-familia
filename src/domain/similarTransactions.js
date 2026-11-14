@@ -7,8 +7,8 @@ import { daysBetween, parseDateKey } from './dates.js';
 export const SIMILAR_DAYS_WINDOW = 3;
 const MAX_MATCHES = 3;
 
-// Un traspaso entre miembros se guarda como gasto.
-const storedType = (type) => (type === 'traspaso' ? 'gasto' : type);
+// Un traspaso entre miembros o un giro se guarda como gasto.
+const storedType = (type) => (type === 'traspaso' || type === 'giro' ? 'gasto' : type);
 
 export function findSimilarTransactions(candidate, transactions = [], days = SIMILAR_DAYS_WINDOW) {
   const amount = Number(candidate?.amount);

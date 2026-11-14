@@ -18,6 +18,13 @@ import { formatShortDate } from '../../domain/dates.js';
 import { formatCLP } from '../../domain/money.js';
 import { findSimilarTransactions } from '../../domain/similarTransactions.js';
 import { accountForSender } from '../../domain/accounts.js';
+import {
+  classificationExamples,
+  findSubcategoryByName,
+  subcategoriesFor,
+  suggestFromHistory,
+} from '../../domain/categorySuggestion.js';
+import { budgetMonthKeyForDate } from '../../utils/budgetPeriod.js';
 
 const GOOGLE_CLIENT_ID = String(
   import.meta.env.VITE_GOOGLE_OAUTH_CLIENT_ID || '',
@@ -52,7 +59,8 @@ async function findImportedMessageIds(householdId, messageIds) {
 }
 
 // Envía cada aviso a Gemini en orden. Los que fallan quedan para reintentar.
-async function extractEmails(emails, categories, onProgress) {
+// `contextFor(email)` entrega las subcategorías del periodo y ejemplos del historial.
+async function extractEmails(emails, categories, onProgress, contextFor) {
   const extracted = [];
   const ignored = [];
   const failed = [];
@@ -60,7 +68,7 @@ async function extractEmails(emails, categories, onProgress) {
     const email = emails[index];
     onProgress?.(index + 1, emails.length);
     try {
-      const movement = await extractBankTransaction(email, categories);
+      const movement = await extractBankTransaction(email, categories, contextFor?.(email));
       if (movement) {
         extracted.push({
           id: email.id,
@@ -70,8 +78,11 @@ async function extractEmails(emails, categories, onProgress) {
           receivedAt: email.receivedAt || '',
           senderVerified: email.senderVerified !== false,
           ...movement,
+          ...(movement.cashWithdrawal ? { type: 'giro' } : {}),
           selected: true,
           category: movement.suggestedCategory,
+          subcategory: movement.suggestedSubcategory || '',
+          suggestedBy: movement.suggestedCategory ? 'gemini' : '',
         });
       } else {
         ignored.push(email);
@@ -117,6 +128,8 @@ export function GmailImportModal({
   inboxItems = [],
   transactions = [],
   accounts = [],
+  budgetsAll = {},
+  budgetCutDay = 1,
 }) {
   const [loading, setLoading] = useState(false);
   const [extracting, setExtracting] = useState(false);
@@ -137,6 +150,56 @@ export function GmailImportModal({
 
   const accountsRef = useRef(accounts);
   accountsRef.current = accounts;
+  const budgetsRef = useRef({ budgetsAll, budgetCutDay });
+  budgetsRef.current = { budgetsAll, budgetCutDay };
+
+  // Subcategorías de una categoría en el periodo de presupuesto de esa fecha.
+  const subcategoriesOn = (date, category) => {
+    const { budgetsAll: all, budgetCutDay: cutDay } = budgetsRef.current;
+    if (!category || !/^\d{4}-\d{2}-\d{2}$/.test(String(date || ''))) return [];
+    return subcategoriesFor(all, budgetMonthKeyForDate(date, cutDay), category);
+  };
+
+  // El historial manda sobre Gemini: es como la familia ya clasificó ese comercio.
+  const withHistorySuggestion = (candidate) => {
+    if (candidate.type !== 'gasto') return candidate;
+    const fromHistory = suggestFromHistory(
+      candidate,
+      transactionsRef.current,
+      expenseCategoriesRef.current,
+    );
+    const next = fromHistory
+      ? {
+          ...candidate,
+          category: fromHistory.category,
+          subcategory: fromHistory.subcategory,
+          suggestedBy: 'historial',
+        }
+      : candidate;
+    // Solo se conserva una subcategoría que exista en el periodo del movimiento.
+    const match = findSubcategoryByName(
+      subcategoriesOn(next.date, next.category),
+      next.subcategory,
+    );
+    return { ...next, subcategory: match?.name || '' };
+  };
+
+  const extractionContext = (email) => {
+    const date = new Date(email?.receivedAt || '');
+    const dateKey = Number.isNaN(date.getTime())
+      ? ''
+      : date.toLocaleDateString('en-CA', { timeZone: 'America/Santiago' });
+    const categoriesList = expenseCategoriesRef.current;
+    const subcategories = {};
+    categoriesList.forEach((category) => {
+      const names = subcategoriesOn(dateKey, category).map((item) => item.name);
+      if (names.length) subcategories[category] = names;
+    });
+    return {
+      subcategories,
+      examples: classificationExamples(transactionsRef.current, categoriesList),
+    };
+  };
 
   // La cuenta sale del banco que envió el aviso. Un posible duplicado de algo ya
   // registrado llega desmarcado.
@@ -144,14 +207,22 @@ export function GmailImportModal({
     setCandidates((current) => [
       ...current,
       ...extracted.map((candidate) => ({
-        ...candidate,
+        ...withHistorySuggestion(candidate),
         account: accountForSender(accountsRef.current, candidate.sender)?.id || '',
+        ...(candidate.type === 'giro' ? giroAccounts(candidate.sender) : {}),
         ...(findSimilarTransactions(candidate, transactionsRef.current).length
           ? { selected: false }
           : {}),
       })),
     ]);
   const accountOf = (id) => accounts.find((account) => account.id === id) || null;
+  // Giro: sale de la cuenta del banco que avisó y entra al efectivo.
+  const giroAccounts = (sender) => {
+    const list = accountsRef.current || [];
+    const fromAccount = accountForSender(list, sender)?.id || list.find((a) => a.kind !== 'cash')?.id || '';
+    const toAccount = list.find((a) => a.kind === 'cash' && a.id !== fromAccount)?.id || '';
+    return { fromAccount, toAccount };
+  };
   const memberAccount = (memberId) =>
     accounts.find((account) => account.ownerId && account.ownerId === memberId)?.id || '';
 
@@ -165,6 +236,8 @@ export function GmailImportModal({
         category !== TRANSFER_CATEGORY,
     );
   }, [categories]);
+  const expenseCategoriesRef = useRef(expenseCategories);
+  expenseCategoriesRef.current = expenseCategories;
   const members = Array.isArray(householdUsers) ? householdUsers : [];
 
   useEffect(() => {
@@ -209,6 +282,7 @@ export function GmailImportModal({
               setScanInfo(`Gemini está revisando el aviso nuevo ${current} de ${total}…`);
             }
           },
+          extractionContext,
         );
         if (!mountedRef.current) return;
         addCandidates(extracted);
@@ -326,6 +400,7 @@ export function GmailImportModal({
       expenseCategories,
       (current, total) =>
         setScanInfo(`Gemini está analizando el aviso ${current} de ${total}…`),
+      extractionContext,
     );
     const failedIds = new Set(failed.map((email) => email.id));
     addCandidates(extracted);
@@ -361,6 +436,10 @@ export function GmailImportModal({
         Number(candidate.amount) <= 0 ||
         !/^\d{4}-\d{2}-\d{2}$/.test(candidate.date) ||
         (candidate.type === 'gasto' && !candidate.category) ||
+        (candidate.type === 'giro' &&
+          (!candidate.fromAccount ||
+            !candidate.toAccount ||
+            candidate.fromAccount === candidate.toAccount)) ||
         (candidate.type === 'traspaso' &&
           (!candidate.fromUserId ||
             !candidate.toUserId ||
@@ -368,7 +447,7 @@ export function GmailImportModal({
     );
     if (invalid) {
       setError(
-        'Completa el tipo, monto, fecha y categoría de cada gasto seleccionado.',
+        'Completa el tipo, monto, fecha y categoría de cada gasto, y las cuentas de cada giro.',
       );
       return;
     }
@@ -380,6 +459,7 @@ export function GmailImportModal({
     for (const candidate of selected) {
       try {
         const isTransfer = candidate.type === 'traspaso';
+        const isGiro = candidate.type === 'giro';
         const fromMember = members.find((member) => member.id === candidate.fromUserId);
         const toMember = members.find((member) => member.id === candidate.toUserId);
         // El movimiento es de quien es dueño de la cuenta (p. ej. Santander → Daniela).
@@ -391,10 +471,26 @@ export function GmailImportModal({
         // La cuenta del aviso puede ser la que envía o la que recibe: mandan las de cada miembro.
         const fromAccount = isTransfer ? memberAccount(fromMember?.id) : '';
         const toAccount = isTransfer ? memberAccount(toMember?.id) : '';
+        const subcategory =
+          candidate.type === 'gasto'
+            ? findSubcategoryByName(
+                subcategoriesOn(candidate.date, candidate.category),
+                candidate.subcategory,
+              )
+            : null;
         const id = await addTransaction({
-          type: isTransfer ? 'gasto' : candidate.type,
+          type: isTransfer || isGiro ? 'gasto' : candidate.type,
           amount: Number(candidate.amount),
-          ...(isTransfer
+          ...(isGiro
+            ? {
+                category: TRANSFER_CATEGORY,
+                meta: {
+                  kind: 'transfer',
+                  fromAccount: candidate.fromAccount,
+                  toAccount: candidate.toAccount,
+                },
+              }
+            : isTransfer
             ? {
                 category: TRANSFER_CATEGORY,
                 meta: {
@@ -410,6 +506,14 @@ export function GmailImportModal({
               }
             : {
                 ...(candidate.type === 'gasto' ? { category: candidate.category } : {}),
+                ...(subcategory
+                  ? {
+                      meta: {
+                        budgetSubcategoryIds: [subcategory.id],
+                        budgetSubcategoryNames: subcategory.name,
+                      },
+                    }
+                  : {}),
                 account: candidate.account || null,
               }),
           description: candidate.description.trim(),
@@ -650,7 +754,7 @@ export function GmailImportModal({
                   );
                 })()}
                 <div className="grid gap-3 sm:grid-cols-2">
-                  {accounts.length > 0 && candidate.type !== 'traspaso' && (
+                  {accounts.length > 0 && !['traspaso', 'giro'].includes(candidate.type) && (
                     <label className="grid gap-1 text-xs text-[color:var(--text-muted)] sm:col-span-2">
                       Cuenta
                       <select
@@ -678,11 +782,21 @@ export function GmailImportModal({
                       className="rounded-lg border bg-[color:var(--surface-1)] px-2 py-2 text-sm text-[color:var(--text)]"
                       value={candidate.type}
                       onChange={(event) =>
-                        updateCandidate(candidate.id, { type: event.target.value })
+                        updateCandidate(candidate.id, {
+                          type: event.target.value,
+                          ...(event.target.value === 'giro' && !candidate.toAccount
+                            ? giroAccounts(candidate.sender)
+                            : {}),
+                        })
                       }
                     >
                       <option value="gasto">Gasto</option>
                       <option value="ingreso">Ingreso</option>
+                      {accounts.length > 1 && (
+                        <option value="giro">
+                          Giro o traspaso entre cuentas (no es gasto)
+                        </option>
+                      )}
                       {members.length > 1 && (
                         <option value="traspaso">
                           Traspaso entre miembros (no afecta saldo)
@@ -714,6 +828,35 @@ export function GmailImportModal({
                       }
                     />
                   </label>
+                  {candidate.type === 'giro' && (
+                    <>
+                      {[
+                        ['fromAccount', 'Desde'],
+                        ['toAccount', 'Hacia'],
+                      ].map(([field, label]) => (
+                        <label key={field} className="grid gap-1 text-xs text-[color:var(--text-muted)]">
+                          {label}
+                          <select
+                            className="rounded-lg border bg-[color:var(--surface-1)] px-2 py-2 text-sm text-[color:var(--text)]"
+                            value={candidate[field] || ''}
+                            onChange={(event) =>
+                              updateCandidate(candidate.id, { [field]: event.target.value })
+                            }
+                          >
+                            <option value="">Seleccionar cuenta</option>
+                            {accounts.map((account) => (
+                              <option key={account.id} value={account.id}>
+                                {account.name}
+                              </option>
+                            ))}
+                          </select>
+                        </label>
+                      ))}
+                      <p className="text-xs text-[color:var(--text-muted)] sm:col-span-2">
+                        Un giro no es gasto: la plata pasa de la cuenta al efectivo.
+                      </p>
+                    </>
+                  )}
                   {candidate.type === 'traspaso' && members.length > 1 && (
                     <>
                       <label className="grid gap-1 text-xs text-[color:var(--text-muted)]">
@@ -765,6 +908,8 @@ export function GmailImportModal({
                         onChange={(event) =>
                           updateCandidate(candidate.id, {
                             category: event.target.value,
+                            subcategory: '',
+                            suggestedBy: '',
                           })
                         }
                       >
@@ -776,6 +921,41 @@ export function GmailImportModal({
                         ))}
                       </select>
                     </label>
+                  )}
+                  {candidate.type === 'gasto' &&
+                    (() => {
+                      const options = subcategoriesOn(candidate.date, candidate.category);
+                      if (!options.length) return null;
+                      const current =
+                        findSubcategoryByName(options, candidate.subcategory)?.name || '';
+                      return (
+                        <label className="grid gap-1 text-xs text-[color:var(--text-muted)]">
+                          Subcategoría
+                          <select
+                            className="rounded-lg border bg-[color:var(--surface-1)] px-2 py-2 text-sm text-[color:var(--text)]"
+                            value={current}
+                            onChange={(event) =>
+                              updateCandidate(candidate.id, {
+                                subcategory: event.target.value,
+                              })
+                            }
+                          >
+                            <option value="">Sin subcategoría</option>
+                            {options.map((option) => (
+                              <option key={option.id} value={option.name}>
+                                {option.name}
+                              </option>
+                            ))}
+                          </select>
+                        </label>
+                      );
+                    })()}
+                  {candidate.type === 'gasto' && candidate.suggestedBy && candidate.category && (
+                    <p className="text-xs text-[color:var(--text-muted)] sm:col-span-2">
+                      {candidate.suggestedBy === 'historial'
+                        ? 'Sugerido según cómo clasificaste antes gastos parecidos.'
+                        : 'Sugerido por Gemini.'}
+                    </p>
                   )}
                   <label className="grid gap-1 text-xs text-[color:var(--text-muted)] sm:col-span-2">
                     Descripción

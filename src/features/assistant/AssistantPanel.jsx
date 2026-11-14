@@ -6,7 +6,7 @@ import { parseBlocks, parseInline } from './richText.js';
 const SUGGESTIONS = [
   '¿Cuánto me queda para gastar este mes?',
   '¿En qué categoría gasté más?',
-  '¿Voy bien con mi presupuesto?',
+  'Cuadra mis cuentas y dime qué falta registrar',
 ];
 
 function Inline({ text }) {
@@ -66,6 +66,57 @@ function RichText({ text }) {
   );
 }
 
+// Correcciones propuestas por el asistente: la persona elige cuáles aplicar.
+function ActionsCard({ actions, applied, applying, onApply }) {
+  const [selected, setSelected] = useState(() => actions.map((action) => action.key));
+  const toggle = (key) =>
+    setSelected((current) =>
+      current.includes(key) ? current.filter((item) => item !== key) : [...current, key],
+    );
+  if (applied) {
+    return (
+      <p className="max-w-[92%] rounded-xl bg-[color:var(--success)]/10 px-3 py-2 text-xs text-[color:var(--success)]">
+        Se aplicaron {applied.count} corrección{applied.count === 1 ? '' : 'es'}
+        {applied.failed ? ` (${applied.failed} no se pudo aplicar)` : ''}.
+      </p>
+    );
+  }
+  return (
+    <div className="max-w-[92%] space-y-2 rounded-2xl border border-[color:var(--border)] p-3 text-sm">
+      <div className="font-semibold">Correcciones propuestas</div>
+      <ul className="space-y-2">
+        {actions.map((action) => (
+          <li key={action.key}>
+            <label className="flex items-start gap-2">
+              <input
+                type="checkbox"
+                className="mt-1"
+                checked={selected.includes(action.key)}
+                onChange={() => toggle(action.key)}
+                disabled={applying}
+              />
+              <span>
+                <span className="block">{action.summary}</span>
+                {action.reason && (
+                  <span className="block text-xs text-[color:var(--text-muted)]">{action.reason}</span>
+                )}
+              </span>
+            </label>
+          </li>
+        ))}
+      </ul>
+      <button
+        type="button"
+        className="w-full rounded-xl bg-[color:var(--primary)] px-3 py-2 text-sm text-[color:var(--primary-contrast)] disabled:opacity-60"
+        onClick={() => onApply(selected)}
+        disabled={applying || !selected.length}
+      >
+        {applying ? 'Aplicando…' : `Aplicar ${selected.length} corrección${selected.length === 1 ? '' : 'es'}`}
+      </button>
+    </div>
+  );
+}
+
 function CloseIcon() {
   return (
     <svg viewBox="0 0 24 24" className="h-5 w-5" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" aria-hidden="true">
@@ -106,6 +157,8 @@ export function AssistantPanel({
   onToggle,
   onNewChat,
   messages,
+  onApplyActions,
+  applying = false,
   sending,
   text,
   onTextChange,
@@ -278,11 +331,18 @@ export function AssistantPanel({
                 {message.text}
               </div>
             ) : (
-              <div
-                key={`model-${index}`}
-                className="ai-bubble max-w-[92%] break-words rounded-2xl rounded-bl-md px-3.5 py-2.5 text-sm leading-relaxed text-[color:var(--text)]"
-              >
-                <RichText text={message.text} />
+              <div key={`model-${index}`} className="space-y-2">
+                <div className="ai-bubble max-w-[92%] break-words rounded-2xl rounded-bl-md px-3.5 py-2.5 text-sm leading-relaxed text-[color:var(--text)]">
+                  <RichText text={message.text} />
+                </div>
+                {message.actions?.length > 0 && onApplyActions && (
+                  <ActionsCard
+                    actions={message.actions}
+                    applied={message.applied}
+                    applying={applying}
+                    onApply={(keys) => onApplyActions(index, keys)}
+                  />
+                )}
               </div>
             ),
           )}
@@ -374,7 +434,7 @@ export function AssistantPanel({
             </button>
           </div>
           <p className="px-1 text-center text-[10px] leading-snug text-[color:var(--text-muted)]">
-            Se envía tu consulta y un resumen agregado, sin nombres ni descripciones.
+            Se envían tu consulta y tus movimientos de los últimos 3 meses, con RUT, correos y números de cuenta ocultos.
           </p>
         </footer>
       </section>

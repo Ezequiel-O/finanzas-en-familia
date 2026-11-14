@@ -99,7 +99,9 @@ Producto: CuentaRUT`,
       amount: 1200000,
       date: '2026-10-29',
       description: 'Transferencia',
+      cashWithdrawal: false,
       suggestedCategory: 'Otros',
+      suggestedSubcategory: '',
     });
     expect(() =>
       validateAiBankEmailMovement(email, {

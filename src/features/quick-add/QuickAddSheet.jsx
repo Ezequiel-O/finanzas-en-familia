@@ -63,7 +63,13 @@ export function QuickAddSheet({
     accounts.find((account) => account.ownerId && account.ownerId === memberId)?.id || '';
   const [accountId, setAccountId] = useState('');
   const members = (householdUsers || []).filter((u) => u?.id);
-  const canTransfer = members.length >= 2;
+  const canTransferMembers = members.length >= 2;
+  const canTransferAccounts = accounts.length >= 2;
+  const canTransfer = canTransferMembers || canTransferAccounts;
+  // Traspaso entre cuentas (giro: BancoEstado → Efectivo) o entre miembros.
+  const [transferMode, setTransferMode] = useState('cuentas');
+  const [fromAccountId, setFromAccountId] = useState('');
+  const [toAccountId, setToAccountId] = useState('');
   const [isRefund, setIsRefund] = useState(false);
   const [fromUserId, setFromUserId] = useState('');
   const [toUserId, setToUserId] = useState('');
@@ -93,6 +99,10 @@ export function QuickAddSheet({
   activeUserIdRef.current = activeUser?.id;
   const memberAccountRef = useRef(memberAccount);
   memberAccountRef.current = memberAccount;
+  const accountsRef = useRef(accounts);
+  accountsRef.current = accounts;
+  const canTransferAccountsRef = useRef(canTransferAccounts);
+  canTransferAccountsRef.current = canTransferAccounts;
 
   const periodKey = budgetMonthKeyForDate(date || today, budgetCutDay);
   const subcategories = useMemo(() => {
@@ -114,7 +124,18 @@ export function QuickAddSheet({
     setIsRefund(false);
     setFromUserId(activeUserIdRef.current || '');
     setToUserId('');
-    setAccountId(memberAccountRef.current(activeUserIdRef.current));
+    const ownAccount = memberAccountRef.current(activeUserIdRef.current);
+    setAccountId(ownAccount);
+    // Lo típico es un giro: de la cuenta del banco al efectivo.
+    const list = accountsRef.current || [];
+    const fromDefault = ownAccount || list.find((a) => a.kind !== 'cash')?.id || list[0]?.id || '';
+    const toDefault =
+      list.find((a) => a.kind === 'cash' && a.id !== fromDefault)?.id ||
+      list.find((a) => a.id !== fromDefault)?.id ||
+      '';
+    setTransferMode(canTransferAccountsRef.current ? 'cuentas' : 'miembros');
+    setFromAccountId(fromDefault);
+    setToAccountId(toDefault);
     const options = rankedRef.current;
     const lastCat = last.category && options.includes(last.category) ? last.category : options[0] || '';
     setCategory(lastCat);
@@ -155,6 +176,8 @@ export function QuickAddSheet({
 
   const usesCategory = type === 'gasto' || (type === 'ingreso' && isRefund);
   const memberName = (id) => members.find((u) => u.id === id)?.name || 'Miembro';
+  const accountName = (id) => accounts.find((a) => a.id === id)?.name || 'Cuenta';
+  const betweenAccounts = type === 'traspaso' && transferMode === 'cuentas';
 
   function buildPayload() {
     const base = {
@@ -167,6 +190,15 @@ export function QuickAddSheet({
       ownerName: activeUser?.name || null,
       ownerEmail: activeUser?.email || null,
     };
+    if (betweenAccounts) {
+      // Giro o traspaso entre cuentas propias: la plata cambia de lugar, no se gasta.
+      return {
+        ...base,
+        category: TRANSFER_CATEGORY,
+        description: base.description || `${accountName(fromAccountId)} → ${accountName(toAccountId)}`,
+        meta: { kind: 'transfer', fromAccount: fromAccountId, toAccount: toAccountId },
+      };
+    }
     if (type === 'traspaso') {
       // No cambia la caja del hogar: no es gasto ni ingreso. Si cada miembro tiene
       // su cuenta, la plata pasa de una cuenta a la otra.
@@ -213,7 +245,11 @@ export function QuickAddSheet({
       toast.warning('Elige una categoría.');
       return;
     }
-    if (type === 'traspaso' && (!fromUserId || !toUserId || fromUserId === toUserId)) {
+    if (betweenAccounts && (!fromAccountId || !toAccountId || fromAccountId === toAccountId)) {
+      toast.warning('Elige la cuenta de origen y la de destino (deben ser distintas).');
+      return;
+    }
+    if (!betweenAccounts && type === 'traspaso' && (!fromUserId || !toUserId || fromUserId === toUserId)) {
       toast.warning('Elige quién envía y quién recibe (deben ser distintos).');
       return;
     }
@@ -245,7 +281,9 @@ export function QuickAddSheet({
     }
 
     const base =
-      type === 'traspaso'
+      betweenAccounts
+        ? `Movidos ${formatCLP(amountValue)} de ${accountName(fromAccountId)} a ${accountName(toAccountId)} (no es gasto).`
+        : type === 'traspaso'
         ? `Traspaso de ${formatCLP(amountValue)} registrado (no cambia el saldo del hogar).`
         : type === 'ingreso'
           ? isRefund
@@ -344,7 +382,61 @@ export function QuickAddSheet({
           </label>
         )}
 
-        {type === 'traspaso' && (
+        {type === 'traspaso' && canTransferAccounts && canTransferMembers && (
+          <div className="flex gap-2" role="radiogroup" aria-label="Tipo de traspaso">
+            {[
+              ['cuentas', 'Entre cuentas (giro)'],
+              ['miembros', 'Entre miembros'],
+            ].map(([mode, label]) => (
+              <button
+                key={mode}
+                type="button"
+                role="radio"
+                aria-checked={transferMode === mode}
+                className={chip(transferMode === mode)}
+                onClick={() => setTransferMode(mode)}
+              >
+                {label}
+              </button>
+            ))}
+          </div>
+        )}
+
+        {betweenAccounts && (
+          <div className="grid grid-cols-2 gap-2">
+            <label className="text-xs text-[color:var(--text-muted)]">
+              Desde
+              <select
+                value={fromAccountId}
+                onChange={(e) => setFromAccountId(e.target.value)}
+                className="mt-1 w-full min-h-[44px] rounded-xl border border-[color:var(--border)] bg-[color:var(--input-bg)] px-2 text-sm text-[color:var(--text)]"
+              >
+                <option value="">Elegir…</option>
+                {accounts.map((a) => (
+                  <option key={a.id} value={a.id}>{a.name}</option>
+                ))}
+              </select>
+            </label>
+            <label className="text-xs text-[color:var(--text-muted)]">
+              Hacia
+              <select
+                value={toAccountId}
+                onChange={(e) => setToAccountId(e.target.value)}
+                className="mt-1 w-full min-h-[44px] rounded-xl border border-[color:var(--border)] bg-[color:var(--input-bg)] px-2 text-sm text-[color:var(--text)]"
+              >
+                <option value="">Elegir…</option>
+                {accounts.map((a) => (
+                  <option key={a.id} value={a.id}>{a.name}</option>
+                ))}
+              </select>
+            </label>
+            <p className="col-span-2 text-xs text-[color:var(--text-faint)]">
+              Un giro en el cajero o un traspaso entre tus cuentas no es gasto: la plata solo cambia de lugar.
+            </p>
+          </div>
+        )}
+
+        {type === 'traspaso' && !betweenAccounts && (
           <div className="grid grid-cols-2 gap-2">
             <label className="text-xs text-[color:var(--text-muted)]">
               De
